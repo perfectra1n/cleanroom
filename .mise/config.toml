@@ -27,6 +27,10 @@ task_output = "prefix"
 # The flake's shellHook sets the full path; this only adds the bit that depends on $PWD.
 LD_LIBRARY_PATH = "{{cwd}}/target/debug:{{cwd}}/target/release:{{env.LD_LIBRARY_PATH | default(value='')}}"
 
+# turbojpeg-sys otherwise builds its own bundled libjpeg-turbo with cmake, which needs
+# nasm and fails without it. The dev shell already provides libturbojpeg 3.1.4.1.
+TURBOJPEG_SOURCE = "pkg-config"
+
 # Fail loudly rather than silently landing on CPU. Mirrors the .error_on_failure() call
 # in the matting backend — the project's no-silent-degradation rule, applied to logs.
 RUST_LOG = "{{env.RUST_LOG | default(value='cleanroom=debug,info')}}"

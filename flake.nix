@@ -103,6 +103,13 @@
             # a bare dollar-brace here would still be Nix antiquotation.)
             export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}:$PWD/target/debug:$PWD/target/release:/run/opengl-driver/lib:$LD_LIBRARY_PATH"
 
+            # turbojpeg-sys defaults to *building* libjpeg-turbo from its bundled source
+            # with cmake, which needs nasm for SIMD and fails without it. We already have
+            # libturbojpeg 3.1.4.1 in the shell, so point the crate at it. Building a
+            # second copy would also be slower than the system one, not faster: nixpkgs
+            # builds it with SIMD enabled.
+            export TURBOJPEG_SOURCE=pkg-config
+
             # The nixpkgs ONNX Runtime, for the `load-dynamic` comparison arm.
             # CPU + OpenVINO only — deliberately NOT the WebGPU path. Verified:
             # `nix eval nixpkgs#onnxruntime.override.__functionArgs` has no webgpuSupport,

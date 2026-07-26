@@ -12,3 +12,8 @@ thiserror = "2"
 tracing.workspace = true
 libc = "0.2"
 nix = { version = "0.30", features = ["ioctl", "poll", "fs"] }
+v4l = "0.14"
+turbojpeg = "1.5"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
