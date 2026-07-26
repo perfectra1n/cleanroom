@@ -34,8 +34,183 @@
           freetype
           stdenv.cc.cc.lib
         ];
+
+        # ONNX Runtime with the WebGPU execution provider, as a fixed-output derivation.
+        #
+        # This is the only way to get it into a sandboxed build. `ort`'s build script
+        # normally downloads this itself, which nix forbids, and nixpkgs' own onnxruntime
+        # is not a substitute: it is built without the WebGPU EP, and there is no Dawn in
+        # the store at all. Pointing at it would give CPU inference that silently misses
+        # the frame budget by 10x.
+        #
+        # Update both the version and the hash together; a stale hash fails the build
+        # loudly, which is the intended behaviour.
+        # ONNX Runtime with the WebGPU execution provider, as a fixed-output derivation.
+        #
+        # This is the exact artefact `ort` would download itself, taken from its own
+        # dist table (ort-sys/build/download/dist.txt, row: feature set "wgpu", target
+        # "x86_64-unknown-linux-gnu"). Matching it exactly matters:
+        #
+        #   * nix sandboxes network access, so ort's build script cannot fetch during a
+        #     build; ORT_LIB_LOCATION points it at this instead.
+        #   * nixpkgs' onnxruntime is NOT a substitute. It is built without the WebGPU EP
+        #     and there is no Dawn in the store at all, so pointing at it gives silent CPU
+        #     inference — the one failure mode this project refuses to ship.
+        #   * neither is Microsoft's own `onnxruntime-linux-x64-gpu` release tarball, which
+        #     is the CUDA/TensorRT build and also has no WebGPU EP. That mistake is
+        #     particularly easy to make because it downloads and builds perfectly.
+        #
+        # The hash is ort's own, straight from the dist table, so it is verified upstream
+        # rather than by us pinning whatever we happened to receive.
+        ortDist = {
+          version = "1.24.2";
+          url = "https://cdn.pyke.io/0/pyke:ort-rs/ms@1.24.2/x86_64-unknown-linux-gnu+wgpu.tar.lzma2";
+          sha256 = "e9aa41101eacde0bf8f832f28c06a8bf3d0f7896a463e0b2d3550563583262b9";
+        };
+
+        ortPrebuilt = pkgs.stdenv.mkDerivation {
+          pname = "onnxruntime-webgpu-prebuilt";
+          version = ortDist.version;
+
+          src = pkgs.fetchurl {
+            inherit (ortDist) url sha256;
+          };
+
+          nativeBuildInputs = with pkgs; [ xz autoPatchelfHook ];
+          buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+
+          # A *raw* LZMA2 stream, not a .lzma or .xz container, so nix's unpackPhase does
+          # not recognise it and `xz --format=auto` reports "File format not recognized".
+          # It needs the filter chain spelled out, and the dictionary size has to match
+          # what it was compressed with — 64 MiB; smaller values fail outright rather than
+          # producing partial output.
+          unpackPhase = ''
+            runHook preUnpack
+            xz --format=raw --lzma2=dict=64MiB --decompress --stdout "$src" > dist.tar
+            tar xf dist.tar
+            runHook postUnpack
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r ./*/ $out/ 2>/dev/null || cp -r . $out/
+            runHook postInstall
+          '';
+        };
+
       in
       {
+        # --- the package --------------------------------------------------------------
+        #
+        # packaging/nix/module.nix declares a mandatory `package` option and nothing
+        # supplied it, so the module could not be used at all. This is that package.
+        packages.cleanroom = pkgs.rustPlatform.buildRustPackage rec {
+          pname = "cleanroom";
+          version = "0.1.0";
+          src = ./.;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # DeepFilterNet is a git dependency: the crates.io `deep_filter` is a different,
+            # useless crate — 0.2.5 from 2022, an HDF5 training dataloader with no DfTract
+            # and no weights.
+            outputHashes = {
+              # Same story as the ort hash: obviously wrong until one real build fills it in.
+              "deep_filter-0.5.6" = "sha256-5bYbfO1kmduNm9YV5niaaPvRIDRmPt4QOX7eKpK+sWY=";
+            };
+          };
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+            llvmPackages.clang
+            rustPlatform.bindgenHook
+            makeWrapper
+          ];
+
+          buildInputs = with pkgs; [
+            pipewire
+            libjpeg_turbo
+            vulkan-loader
+            fontconfig
+            freetype
+            libxkbcommon
+            wayland
+          ];
+
+          # Only the three shipped binaries. The spikes are workspace members — they are
+          # the vendor-neutrality and Slint-interop proofs and belong in the repo — but they
+          # are not products, and building them here just adds a second ORT link and a
+          # second Slint compile to every package build.
+          cargoBuildFlags = [
+            "-p" "cleanroomd"
+            "-p" "cleanroom-ctl"
+            "-p" "cleanroom-gui"
+          ];
+
+          # turbojpeg-sys otherwise builds its own bundled libjpeg-turbo with cmake and
+          # nasm. The system copy is also faster, being built with SIMD enabled.
+          TURBOJPEG_SOURCE = "pkg-config";
+
+          # ort's prebuilt, fetched as a fixed-output derivation.
+          #
+          # It cannot be fetched during the build: nix sandboxes network access, which is
+          # the entire point. And nixpkgs' onnxruntime cannot substitute for it — it is
+          # built WITHOUT the WebGPU execution provider and there is no Dawn anywhere in
+          # the store, so pointing ORT_LIB_LOCATION at it gives silent CPU inference, which
+          # is the one failure mode this project refuses to ship.
+          ORT_LIB_LOCATION = ortPrebuilt;
+          # Stops ort's build script reaching for the network even with the location set.
+          ORT_STRATEGY = "system";
+
+          # The distribution ships libonnxruntime.a alongside libwebgpu_dawn.so, so the
+          # static ONNX Runtime resolves its Dawn symbols only if that shared object is on
+          # the link line. Without this the build gets all the way to linking and then
+          # emits several hundred undefined references to wgpu* symbols.
+          RUSTFLAGS = "-L native=${ortPrebuilt} -l dylib=webgpu_dawn";
+
+          # The prebuilt .so files have no $ORIGIN rpath, and wgpu dlopens libvulkan.so.1
+          # rather than linking it, so neither is found without help.
+          postInstall = ''
+            for bin in cleanroomd cleanroom-ctl cleanroom-gui; do
+              wrapProgram "$out/bin/$bin" \
+                --prefix LD_LIBRARY_PATH : "${ortPrebuilt}:${pkgs.lib.makeLibraryPath runtimeLibs}"
+            done
+
+            install -Dm644 packaging/systemd/cleanroomd.service \
+              "$out/lib/systemd/user/cleanroomd.service"
+            install -Dm644 packaging/systemd/io.github.perfectra1n.Cleanroom.service \
+              "$out/share/dbus-1/services/io.github.perfectra1n.Cleanroom.service"
+            install -Dm644 packaging/desktop/io.github.perfectra1n.Cleanroom.desktop \
+              "$out/share/applications/io.github.perfectra1n.Cleanroom.desktop"
+
+            for size in 16 24 32 48 64 128 256; do
+              install -Dm644 \
+                "packaging/desktop/icons/hicolor/''${size}x''${size}/apps/io.github.perfectra1n.Cleanroom.png" \
+                "$out/share/icons/hicolor/''${size}x''${size}/apps/io.github.perfectra1n.Cleanroom.png"
+            done
+
+            for conf in packaging/wireplumber/*.conf; do
+              install -Dm644 "$conf" "$out/share/wireplumber/wireplumber.conf.d/$(basename "$conf")"
+            done
+          ''
+          ;
+
+          # The model-dependent tests need weights that are deliberately not vendored, and
+          # the GPU tests need a real adapter. Neither exists in the sandbox.
+          doCheck = false;
+
+          meta = with pkgs.lib; {
+            description = "Linux-native webcam and microphone effects";
+            homepage = "https://github.com/perfectra1n/cleanroom";
+            license = licenses.gpl3Only;
+            platforms = platforms.linux;
+            mainProgram = "cleanroomd";
+          };
+        };
+
+        packages.default = self.packages.${system}.cleanroom;
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             # Rust. Pinned via nixpkgs rather than a toolchain file so the shell is
@@ -123,5 +298,19 @@
           '';
         };
       }
-    );
+    )
+    // {
+      # System-independent, so it sits outside eachDefaultSystem.
+      #
+      # The module previously declared a mandatory `package` option with nothing able to
+      # supply it, which made it unusable on its own. It now defaults to this flake's own
+      # package for the evaluating system.
+      nixosModules.cleanroom =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./packaging/nix/module.nix ];
+          services.cleanroom.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.cleanroom;
+        };
+      nixosModules.default = self.nixosModules.cleanroom;
+    };
 }

@@ -1,0 +1,99 @@
+# Maintainer: perf3ct <perf3ct@perfectra1n.com>
+#
+# NOT BUILT OR TESTED. Written on NixOS, where makepkg does not run. Treat the dependency
+# list and the ort handling below as a starting point that needs one real build before it
+# is published to the AUR.
+
+pkgname=cleanroom
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Linux-native webcam and microphone effects: background blur/replace and neural noise suppression"
+arch=('x86_64')
+url="https://github.com/perfectra1n/cleanroom"
+license=('GPL-3.0-only')
+
+depends=(
+  # The kernel module is the whole virtual-camera transport for Chrome, Zoom and OBS.
+  # DKMS rather than a fixed build, because this is the package most exposed to a kernel
+  # upgrade landing before the module is rebuilt.
+  'v4l2loopback-dkms'
+  'pipewire'
+  'libjpeg-turbo'
+  'vulkan-icd-loader'
+  'wireplumber'
+  # Real-time scheduling for the audio thread. Optional in the sense that it degrades
+  # rather than fails, but the degradation is audible under load.
+  'rtkit'
+)
+
+makedepends=('cargo' 'clang' 'pkgconf' 'cmake')
+
+optdepends=(
+  'vulkan-radeon: AMD GPUs'
+  'vulkan-intel: Intel GPUs'
+  'nvidia-utils: NVIDIA GPUs'
+)
+
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')  # replace with the real digest at release time
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Otherwise turbojpeg-sys builds its own bundled libjpeg-turbo with cmake and nasm.
+  # The system copy is also faster, being built with SIMD enabled.
+  export TURBOJPEG_SOURCE=pkg-config
+  # pipewire-sys and v4l2-sys-mit both run bindgen over system headers.
+  export LIBCLANG_PATH="/usr/lib"
+  cargo build --frozen --release --workspace
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 target/release/cleanroomd     "$pkgdir/usr/bin/cleanroomd"
+  install -Dm755 target/release/cleanroom-ctl  "$pkgdir/usr/bin/cleanroom-ctl"
+  install -Dm755 target/release/cleanroom-gui  "$pkgdir/usr/bin/cleanroom-gui"
+
+  # ort downloads a prebuilt ONNX Runtime with the WebGPU EP and drops the shared objects
+  # next to the binary, with no $ORIGIN rpath. nixpkgs' onnxruntime has no WebGPU EP, and
+  # neither does Arch's, so these have to ship.
+  install -Dm644 target/release/libonnxruntime.so   "$pkgdir/usr/lib/cleanroom/libonnxruntime.so"
+  install -Dm644 target/release/libwebgpu_dawn.so   "$pkgdir/usr/lib/cleanroom/libwebgpu_dawn.so"
+
+  install -Dm644 packaging/systemd/cleanroomd.service \
+    "$pkgdir/usr/lib/systemd/user/cleanroomd.service"
+  install -Dm644 "packaging/systemd/io.github.perfectra1n.Cleanroom.service" \
+    "$pkgdir/usr/share/dbus-1/services/io.github.perfectra1n.Cleanroom.service"
+  install -Dm644 "packaging/desktop/io.github.perfectra1n.Cleanroom.desktop" \
+    "$pkgdir/usr/share/applications/io.github.perfectra1n.Cleanroom.desktop"
+
+  for size in 16 24 32 48 64 128 256; do
+    install -Dm644 "packaging/desktop/icons/hicolor/${size}x${size}/apps/io.github.perfectra1n.Cleanroom.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/io.github.perfectra1n.Cleanroom.png"
+  done
+
+  install -Dm644 packaging/wireplumber/50-cleanroom-disable-libcamera.conf \
+    "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/50-cleanroom-disable-libcamera.conf"
+  install -Dm644 packaging/wireplumber/51-cleanroom-camera.conf \
+    "$pkgdir/usr/share/wireplumber/wireplumber.conf.d/51-cleanroom-camera.conf"
+
+  # Deliberately NOT installed into /etc/modprobe.d.
+  #
+  # modprobe merges every options line for a module into ONE argument list, where video_nr,
+  # card_label and exclusive_caps are parallel arrays. Two packages each declaring a device
+  # usually yields neither. Shipped as an example for the user to merge by hand.
+  install -Dm644 packaging/modprobe-v4l2loopback.conf \
+    "$pkgdir/usr/share/doc/$pkgname/modprobe-v4l2loopback.conf.example"
+
+  install -Dm644 README.md   "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 docs/pitfalls.md "$pkgdir/usr/share/doc/$pkgname/pitfalls.md"
+  install -Dm644 LICENSE     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

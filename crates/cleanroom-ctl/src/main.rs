@@ -9,6 +9,8 @@
 //! not even show which app registered a binding. Binding a compositor key to
 //! `cleanroom-ctl set video.background off` is more portable and more predictable.
 
+mod fetch;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cleanroom_ipc::{CleanroomProxy, Health};
@@ -43,6 +45,15 @@ enum Command {
         /// `on` or `off`. Omit to show the current state.
         state: Option<String>,
     },
+    /// Download the model weights. Neither set is bundled; see the licence notes it prints.
+    FetchModels {
+        /// Skip the DeepFilterNet licence prompt. For scripts and packaging.
+        #[arg(long)]
+        yes: bool,
+        /// Re-download even if a file is already present.
+        #[arg(long)]
+        force: bool,
+    },
     /// Check the environment for the things that usually go wrong.
     Doctor,
     /// Re-read the config file, discarding unsaved runtime changes.
@@ -54,6 +65,13 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Handled before connecting, deliberately. Fetching weights is exactly what someone
+    // does on a fresh install, and requiring a daemon for it would mean the one command
+    // that fixes "no weights" needs the thing that is degraded for want of weights.
+    if let Command::FetchModels { yes, force } = cli.command {
+        return fetch::run(yes, force);
+    }
 
     let connection = zbus::Connection::session()
         .await
@@ -76,6 +94,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Devices => devices(&proxy).await?,
+        // Handled above, before the connection was made.
+        Command::FetchModels { .. } => unreachable!(),
         Command::Autostart { state } => autostart(&proxy, state).await?,
         Command::Doctor => {
             for line in proxy.doctor().await? {

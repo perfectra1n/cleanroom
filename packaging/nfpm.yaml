@@ -1,0 +1,85 @@
+# deb and rpm from one definition.
+#
+#   nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+#   nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+#
+# UNBUILT AND UNTESTED: written on NixOS, where neither dpkg nor rpmbuild is available.
+# The file list mirrors the Nix install phase, which *is* exercised, so the layout is
+# right; the dependency names are the part most likely to need correcting per distro.
+#
+# Run `cargo build --release --workspace` first — nfpm packages what is already built.
+
+name: cleanroom
+arch: amd64
+platform: linux
+version: v0.1.0
+section: video
+priority: optional
+maintainer: perf3ct <perf3ct@perfectra1n.com>
+description: |
+  Linux-native webcam and microphone effects.
+  Background blur and replacement plus neural noise suppression, running on any
+  Vulkan GPU with no vendor SDK. Publishes both a v4l2loopback device and a
+  PipeWire Video/Source node, because neither transport alone reaches every app.
+vendor: cleanroom
+homepage: https://github.com/perfectra1n/cleanroom
+license: GPL-3.0-only
+
+depends:
+  # Package names differ across distros; these are the Debian spellings. On rpm distros
+  # the equivalents are pipewire, libjpeg-turbo, vulkan-loader, rtkit.
+  - pipewire
+  - libjpeg-turbo8 | libjpeg-turbo
+  - libvulkan1 | vulkan-loader
+  - rtkit
+
+recommends:
+  # Not a hard dependency on purpose: the PipeWire Video/Source node works without it, so
+  # a missing kernel module degrades coverage rather than breaking the whole package. The
+  # module name varies enough between distros that a hard dep fails to install more often
+  # than it helps.
+  - v4l2loopback-dkms
+
+contents:
+  - src: target/release/cleanroomd
+    dst: /usr/bin/cleanroomd
+  - src: target/release/cleanroom-ctl
+    dst: /usr/bin/cleanroom-ctl
+  - src: target/release/cleanroom-gui
+    dst: /usr/bin/cleanroom-gui
+
+  # ort's prebuilt ONNX Runtime. Neither Debian's nor Fedora's onnxruntime is built with
+  # the WebGPU execution provider, and pointing at one that is not gives silent CPU
+  # inference — the exact failure this project refuses to ship.
+  - src: target/release/libonnxruntime.so
+    dst: /usr/lib/cleanroom/libonnxruntime.so
+  - src: target/release/libwebgpu_dawn.so
+    dst: /usr/lib/cleanroom/libwebgpu_dawn.so
+
+  - src: packaging/systemd/cleanroomd.service
+    dst: /usr/lib/systemd/user/cleanroomd.service
+  - src: packaging/systemd/io.github.perfectra1n.Cleanroom.service
+    dst: /usr/share/dbus-1/services/io.github.perfectra1n.Cleanroom.service
+  - src: packaging/desktop/io.github.perfectra1n.Cleanroom.desktop
+    dst: /usr/share/applications/io.github.perfectra1n.Cleanroom.desktop
+  - src: packaging/desktop/icons/hicolor
+    dst: /usr/share/icons/hicolor
+
+  - src: packaging/wireplumber/50-cleanroom-disable-libcamera.conf
+    dst: /usr/share/wireplumber/wireplumber.conf.d/50-cleanroom-disable-libcamera.conf
+  - src: packaging/wireplumber/51-cleanroom-camera.conf
+    dst: /usr/share/wireplumber/wireplumber.conf.d/51-cleanroom-camera.conf
+
+  # An example, not a config file. modprobe merges every `options` line for a module into
+  # one argument list where video_nr, card_label and exclusive_caps are parallel arrays,
+  # so two packages each declaring a device usually yields neither.
+  - src: packaging/modprobe-v4l2loopback.conf
+    dst: /usr/share/doc/cleanroom/modprobe-v4l2loopback.conf.example
+    type: config|noreplace
+
+  - src: README.md
+    dst: /usr/share/doc/cleanroom/README.md
+  - src: docs/pitfalls.md
+    dst: /usr/share/doc/cleanroom/pitfalls.md
+  - src: LICENSE
+    dst: /usr/share/licenses/cleanroom/LICENSE

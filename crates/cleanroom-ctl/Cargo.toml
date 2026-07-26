@@ -26,3 +26,8 @@ tokio = { version = "1", features = ["rt", "macros"] }
 # coexists fine with our tokio runtime.
 zbus = "5"
 clap = { version = "4", features = ["derive"] }
+
+# Model downloads. rustls rather than native-tls for the same reason ort uses it: the
+# build must not depend on a system OpenSSL that NixOS does not have.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+sha2 = "0.10"
