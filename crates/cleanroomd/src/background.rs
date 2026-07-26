@@ -153,10 +153,13 @@ mod tests {
             (1, 1),       // degenerate but legal
             (1919, 1079), // just under, exercises the ceil
         ] {
-            let out = cover_fit(&img(bw, bh), 1920, 1080);
+            // A small target on purpose. The arithmetic under test is scale-invariant,
+            // and Lanczos3 into 1920x1080 in an unoptimised build made this single test
+            // take most of two minutes — which is paid on every `mise run check`.
+            let out = cover_fit(&img(bw, bh), 320, 180);
             assert_eq!(
                 (out.width(), out.height()),
-                (1920, 1080),
+                (320, 180),
                 "{bw}x{bh} did not cover the frame"
             );
         }

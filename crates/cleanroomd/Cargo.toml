@@ -35,6 +35,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 # zbus does not need the feature: without it, it runs its own small executor, which
 # coexists fine with our tokio runtime.
 zbus = "5"
+# For StreamExt on zbus signal streams. default-features = false keeps it to the core
+# traits rather than pulling an executor in behind zbus's back.
+futures-util = { version = "0.3", default-features = false }
 toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

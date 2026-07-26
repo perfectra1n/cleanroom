@@ -8,6 +8,7 @@ mod background;
 mod doctor;
 mod service;
 mod settings;
+mod sleep;
 mod state;
 mod video_pipeline;
 
@@ -108,6 +109,10 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // Release the camera and the GPU when the system suspends. Best-effort: a machine
+    // with no logind just never fires the signal.
+    tokio::spawn(sleep::watch(shared.clone()));
 
     run_until_shutdown(&shared).await;
 

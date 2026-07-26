@@ -273,6 +273,13 @@ fn run_once(
     // The flag stops a broken path re-logging thirty times a second.
     let mut plate: Option<crate::background::Plate> = None;
     let mut plate_reported: Option<String> = None;
+    // The driver version this pipeline was built against, and when it was last checked.
+    // Read from sysfs rather than from the adapter, because the failure being watched for
+    // is a *userspace* upgrade under a still-loaded kernel module: the context we already
+    // hold keeps working, so the adapter would happily keep reporting the old version.
+    let driver_at_start = crate::sleep::driver_version();
+    let mut driver_checked = Instant::now();
+    let mut driver_reported = false;
 
     while !stop.load(Ordering::Relaxed) {
         // A config change that alters the negotiated mode needs a full restart. Cheap to
@@ -297,6 +304,57 @@ fn run_once(
             ),
             None => now_cfg.video.background,
         };
+
+        // Suspend takes priority over everything else in this loop: there is a bounded
+        // window before the machine goes down regardless of what we are doing.
+        if shared.suspend_requested() {
+            tracing::info!("releasing devices for suspend");
+            cam.stop();
+            // `take()` rather than `= None` so the drop is the statement, not a side
+            // effect of an assignment nothing reads. This releases the wgpu device *and*
+            // its instance; the instance matters, because it retains loader and ICD state,
+            // and carrying one across a suspend is the same hazard as carrying one across
+            // a driver swap.
+            drop(gpu.take());
+            shared.set_video_health(HealthState::idle("devices released for system suspend"));
+            shared.acknowledge_suspend();
+
+            while shared.suspend_requested() && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(IDLE_POLL);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return Ok(Outcome::Stopped);
+            }
+            // Rebuild from scratch rather than resuming in place. A resumed GPU is a new
+            // GPU as far as the driver is concerned, and re-entering run_once is already
+            // the code path that knows how to build one.
+            tracing::info!("resumed; rebuilding the pipeline");
+            return Ok(Outcome::Restart);
+        }
+
+        // Once a minute, not per frame: this is a sysfs read against an event that
+        // happens when someone runs a package manager.
+        if driver_at_start.is_some()
+            && !driver_reported
+            && driver_checked.elapsed() > Duration::from_secs(60)
+        {
+            driver_checked = Instant::now();
+            let now_version = crate::sleep::driver_version();
+            if now_version != driver_at_start {
+                // Not fatal, and deliberately not a restart: the context we hold still
+                // works, and tearing it down is what would actually break the camera. New
+                // contexts will fail with a version mismatch, so the honest thing is to say
+                // that a restart is needed rather than to discover it at the worst moment.
+                driver_reported = true;
+                shared.set_video_health(HealthState::degraded(format!(
+                    "the GPU driver was updated underneath us ({} -> {}); \
+                     effects keep working until cleanroomd restarts, and a restart now \
+                     needs a reboot or a module reload",
+                    driver_at_start.as_deref().unwrap_or("?"),
+                    now_version.as_deref().unwrap_or("gone")
+                )));
+            }
+        }
 
         let consumers = watch.poll(Duration::from_millis(0));
         let wanted = !now_cfg.video.power_save || watch.in_use();

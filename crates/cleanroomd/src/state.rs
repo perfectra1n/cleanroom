@@ -14,6 +14,7 @@
 
 use cleanroom_core::{Config, ConfigPaths};
 use cleanroom_ipc::{Health, PipelineStats, Status};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
 
@@ -70,6 +71,13 @@ pub struct Shared {
     vcam_path: RwLock<String>,
     pw_node: RwLock<String>,
 
+    /// Set by the logind watcher when the system is about to suspend; cleared on resume.
+    /// The video thread polls it and releases its devices.
+    suspend: AtomicBool,
+    /// Set by the video thread once it has actually let go. The watcher waits for this
+    /// before dropping the delay inhibitor, so the machine does not suspend mid-teardown.
+    suspend_ack: AtomicBool,
+
     /// What the PipeWire registry watcher sees. Owned here rather than by the audio
     /// pipeline because the D-Bus side must be able to answer ListMicrophones whether or
     /// not the audio thread happens to be running.
@@ -93,6 +101,8 @@ impl Shared {
             gpu_adapter: RwLock::new("not initialised".into()),
             vcam_path: RwLock::new(String::new()),
             pw_node: RwLock::new(String::new()),
+            suspend: AtomicBool::new(false),
+            suspend_ack: AtomicBool::new(false),
             audio_registry: cleanroom_audio::RegistryView::new(),
             shutdown: Notify::new(),
         })
@@ -165,6 +175,30 @@ impl Shared {
         *self.gpu_adapter.write().expect("gpu lock poisoned") = s.into();
     }
 
+    /// Ask the video thread to release its devices.
+    pub fn request_suspend(&self) {
+        self.suspend_ack.store(false, Ordering::SeqCst);
+        self.suspend.store(true, Ordering::SeqCst);
+    }
+
+    pub fn clear_suspend(&self) {
+        self.suspend.store(false, Ordering::SeqCst);
+        self.suspend_ack.store(false, Ordering::SeqCst);
+    }
+
+    pub fn suspend_requested(&self) -> bool {
+        self.suspend.load(Ordering::SeqCst)
+    }
+
+    /// Called by the video thread once its devices are released.
+    pub fn acknowledge_suspend(&self) {
+        self.suspend_ack.store(true, Ordering::SeqCst);
+    }
+
+    pub fn suspend_acknowledged(&self) -> bool {
+        self.suspend_ack.load(Ordering::SeqCst)
+    }
+
     pub fn set_pw_node(&self, s: impl Into<String>) {
         *self.pw_node.write().expect("pw lock poisoned") = s.into();
     }
@@ -201,6 +235,53 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
+    /// The handshake has to be unambiguous in both directions, because the cost of getting
+    /// it wrong is a machine that suspends with the camera still open — or one that waits
+    /// the full inhibitor timeout on every suspend because the ack never arrives.
+    #[test]
+    fn the_suspend_handshake_is_a_two_way_signal() {
+        let shared = shared();
+
+        assert!(!shared.suspend_requested());
+        assert!(!shared.suspend_acknowledged());
+
+        shared.request_suspend();
+        assert!(shared.suspend_requested(), "the video thread must see it");
+        assert!(
+            !shared.suspend_acknowledged(),
+            "requesting must not pre-acknowledge, or the watcher drops the inhibitor \
+             before anything has been released"
+        );
+
+        shared.acknowledge_suspend();
+        assert!(shared.suspend_acknowledged());
+
+        shared.clear_suspend();
+        assert!(
+            !shared.suspend_requested(),
+            "resume must release the thread"
+        );
+        assert!(
+            !shared.suspend_acknowledged(),
+            "a stale ack would let the next suspend proceed instantly"
+        );
+    }
+
+    /// A second suspend must not inherit the previous cycle's acknowledgement.
+    #[test]
+    fn a_new_request_clears_the_previous_acknowledgement() {
+        let shared = shared();
+        shared.request_suspend();
+        shared.acknowledge_suspend();
+        shared.clear_suspend();
+
+        shared.request_suspend();
+        assert!(
+            !shared.suspend_acknowledged(),
+            "the watcher would suspend immediately, before the GPU was released"
+        );
+    }
+
     use super::*;
 
     fn shared() -> Arc<Shared> {
