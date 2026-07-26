@@ -25,6 +25,37 @@ const OPTIONAL_KEYS: &[&str] = &[
     "gpu.render_node",
 ];
 
+/// Optional keys whose value is a number rather than a string.
+///
+/// Type is normally inferred from the value already in the document — but an *unset*
+/// optional has no value to infer from, and the fallback was "it must be a string". For
+/// `audio.device` that is right. For `video.matte_tighten` it silently produced the TOML
+/// `matte_tighten = "0.35"`, which fails to deserialise into `Option<f32>`, so the whole
+/// `set` was rejected and the slider sprang back to where it started with no error anywhere
+/// the user could see it. An unset optional therefore has to declare its type somewhere,
+/// and this is that somewhere.
+const OPTIONAL_FLOAT_KEYS: &[&str] = &["video.matte_tighten"];
+const OPTIONAL_INT_KEYS: &[&str] = &["video.matting_width", "video.matting_height"];
+
+/// The TOML value an unset optional should be created as.
+fn optional_value(key: &str, value: &str) -> toml::Value {
+    let v = value.trim();
+    if OPTIONAL_FLOAT_KEYS.contains(&key)
+        && let Ok(f) = v.parse::<f64>()
+    {
+        return toml::Value::Float(f);
+    }
+    if OPTIONAL_INT_KEYS.contains(&key)
+        && let Ok(i) = v.parse::<i64>()
+    {
+        return toml::Value::Integer(i);
+    }
+    // Unparseable numbers fall through as strings on purpose: the schema rejects them a
+    // moment later with a message naming the key and the value, which is a better error
+    // than one produced here without that context.
+    toml::Value::String(v.to_string())
+}
+
 /// What `get` prints, and what `set` accepts, for an optional setting with no value.
 pub const UNSET: &str = "(unset)";
 
@@ -85,7 +116,7 @@ pub fn set(config: &Config, key: &str, value: &str) -> Result<Config, SettingsEr
                 remove(&mut root, key);
                 return finish(root, key, value);
             }
-            toml::Value::String(value.trim().to_string())
+            optional_value(key, value)
         }
         None => return Err(SettingsError::UnknownKey(key.to_string())),
     };
@@ -227,6 +258,37 @@ fn collect(v: &toml::Value, prefix: String, out: &mut Vec<(String, String)>) {
 mod tests {
     use super::*;
     use cleanroom_core::{BackgroundMode, VIRTUAL_MIC_NODE};
+
+    /// An unset *numeric* optional has no existing value to infer a type from, and the
+    /// fallback used to be "assume string". That wrote `matte_tighten = "0.35"`, which the
+    /// schema rejects, so the whole `set` failed — and because the GUI writes a value and
+    /// then re-reads it, the slider sprang back to zero with no error shown anywhere. The
+    /// user-visible symptom was a control that simply refused to move.
+    #[test]
+    fn an_unset_numeric_optional_takes_a_number() {
+        let c = set(&Config::default(), "video.matte_tighten", "0.35").unwrap();
+        assert_eq!(c.video.matte_tighten, Some(0.35));
+        // And again now that it holds a value, which is the path that always worked.
+        let c = set(&c, "video.matte_tighten", "0.5").unwrap();
+        assert_eq!(c.video.matte_tighten, Some(0.5));
+
+        let c = set(&Config::default(), "video.matting_width", "384").unwrap();
+        assert_eq!(c.video.matting_width, Some(384));
+    }
+
+    /// `auto` has to keep meaning "decide it for me" rather than becoming the number 0,
+    /// because for `matte_tighten` the two differ: unset is per-mode, 0 is "never tighten".
+    #[test]
+    fn a_numeric_optional_still_clears() {
+        let c = set(&Config::default(), "video.matte_tighten", "0.35").unwrap();
+        let c = set(&c, "video.matte_tighten", "auto").unwrap();
+        assert_eq!(c.video.matte_tighten, None);
+        assert_eq!(get(&c, "video.matte_tighten").unwrap(), UNSET);
+        // Unset resolves per mode; explicit zero does not.
+        assert_eq!(c.video.tighten_for(BackgroundMode::Replace), 0.12);
+        let z = set(&c, "video.matte_tighten", "0").unwrap();
+        assert_eq!(z.video.tighten_for(BackgroundMode::Replace), 0.0);
+    }
 
     #[test]
     fn reads_a_nested_value() {

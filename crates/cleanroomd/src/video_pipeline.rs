@@ -561,7 +561,12 @@ fn run_once(
                 if let Some(pw) = pw_source.as_ref() {
                     pw.slot.put(&processed);
                 }
-                t1.elapsed().as_secs_f64() * 1000.0
+                // Minus the matting, which happens inside this span and is reported on its
+                // own line. Without the subtraction `gpu` is a superset of `matting` and
+                // the two double-count: with CPU matting the GPU column read 10.8 ms
+                // against 0.65 ms of actual GPU work, which reads as a GPU problem and is
+                // really just the network's time being billed twice.
+                t1.elapsed().as_secs_f64() * 1000.0 - matting_ms
             }
             None => {
                 sink.write(&frame.data)?;

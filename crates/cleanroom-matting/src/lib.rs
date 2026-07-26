@@ -279,6 +279,25 @@ pub struct Matter {
 /// It is held across construction only, never across inference.
 static SESSION_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// How many intra-op threads the CPU provider may use.
+///
+/// Not "as many as there are cores". This runs beside a GPU pipeline on the same thread,
+/// and past a handful of threads the extra parallelism buys less than the scheduling
+/// pressure costs — see `build_session`. `CLEANROOM_MATTING_THREADS` overrides it for
+/// anyone measuring on very different hardware.
+fn matting_threads() -> usize {
+    if let Some(n) = std::env::var("CLEANROOM_MATTING_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 4).clamp(2, 6))
+        .unwrap_or(4)
+}
+
 /// Build one session on one provider.
 ///
 /// `.error_on_failure()` on the GPU path is the single most important call here. Without it
@@ -293,9 +312,27 @@ fn build_session(model: &Path, backend: Backend) -> Result<Session, MattingError
 
     let builder = Session::builder().map_err(|e| MattingError::NoGpu(e.to_string()))?;
     let mut builder = match backend {
-        Backend::Cpu => builder
-            .with_execution_providers([CPUExecutionProvider::default().build()])
-            .map_err(|e| MattingError::NoGpu(e.to_string()))?,
+        Backend::Cpu => {
+            let b = builder
+                .with_execution_providers([CPUExecutionProvider::default().build()])
+                .map_err(|e| MattingError::NoGpu(e.to_string()))?;
+
+            // Bound the thread pool, and stop it spinning.
+            //
+            // Not a throughput optimisation — measured on a 24-core machine this is worth
+            // nothing either way, 30 fps and ~11 ms/frame with 6 threads or with 24. It is
+            // about being a reasonable thing to have running in the background: ONNX
+            // Runtime's CPU provider otherwise takes one intra-op thread per core and
+            // *busy-waits* between operators, so an idle-ish video call would sit there
+            // spinning two dozen cores for a 320x180 network. A webcam effect has no
+            // business being the largest consumer of a laptop's battery.
+            let threads = matting_threads();
+            let b = b
+                .with_intra_threads(threads)
+                .map_err(|e| MattingError::NoGpu(e.to_string()))?;
+            b.with_config_entry("session.intra_op.allow_spinning", "0")
+                .map_err(|e| MattingError::NoGpu(e.to_string()))?
+        }
         _ => builder
             .with_execution_providers([WebGPU::default().build().error_on_failure()])
             .map_err(|e| MattingError::NoGpu(e.to_string()))?,

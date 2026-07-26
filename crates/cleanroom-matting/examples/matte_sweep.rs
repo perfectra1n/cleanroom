@@ -5,21 +5,43 @@
 //! Matter`), so a sweep that shares a process would be measuring the crash, not the model.
 //!
 //! ```text
-//! matte_sweep <image> <ep: webgpu|cpu> <ratio> <width> <height>
+//! matte_sweep <image> <ep: webgpu|cpu> <ratio> <width> <height> [passes]
 //! ```
 //!
 //! Prints one line: the fraction of the frame the network calls foreground, and the peak
 //! alpha. For a portrait, `fg>0.5` in the region of 0.10-0.40 with `max` near 1.0 is a
 //! working matte; `fg>0.5 = 0.000` with a low `max` is a network that found no subject.
+//!
+//! ## Environment knobs
+//!
+//! The WebGPU provider gets RVM wrong, and these are the levers for finding out *which
+//! part* of it is wrong. Each maps to a real suspect:
+//!
+//! | var | values | what it tests |
+//! |-----|--------|---------------|
+//! | `CR_LAYOUT` | `nchw`, `nhwc` | the EP's layout conversion. RVM's ONNX is NCHW and the Dawn log is full of `Transpose[0-3-1-2]` programs, so a wrong transpose is a live suspect. |
+//! | `CR_OPT` | `disable`, `1`, `2`, `3` | graph fusion. `ConvAddActivationFusion` and friends rewrite the graph before it reaches the EP. |
+//! | `CR_GRAPHCAP` | `0`, `1` | captured-command-buffer replay, which cannot be right across the changing recurrent-state shapes. |
+//! | `CR_BUFCACHE` | `disabled`, `lazyRelease`, `simple`, `bucket` | buffer reuse handing a kernel memory somebody else wrote. |
+//! | `CR_VALIDATION` | `full`, `basic`, `wgpuOnly`, `disabled` | ask Dawn to complain out loud rather than compute quietly. |
+//!
+//! The passes count matters as much as any of them: the failure is *progressive*, so a
+//! one-pass run cannot see it. Compare pass 1 against pass 10.
 
+use ort::ep::webgpu::{BufferCacheMode, PreferredLayout, ValidationMode};
 use ort::ep::{CPUExecutionProvider, WebGPU};
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
+
+fn env(k: &str) -> Option<String> {
+    std::env::var(k).ok().filter(|s| !s.is_empty())
+}
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.len() < 5 {
-        eprintln!("usage: matte_sweep <image> <webgpu|cpu> <ratio> <w> <h>");
+        eprintln!("usage: matte_sweep <image> <webgpu|cpu> <ratio> <w> <h> [passes]");
         std::process::exit(2);
     }
     let (path, ep, ratio) = (&a[0], &a[1], a[2].parse::<f32>().expect("ratio"));
@@ -35,13 +57,63 @@ fn main() {
 
     let model = cleanroom_matting::find_model().expect("locating the RVM weights");
     let builder = Session::builder().expect("session builder");
+
+    let opt = match env("CR_OPT").as_deref() {
+        Some("disable") => Some(GraphOptimizationLevel::Disable),
+        Some("1") => Some(GraphOptimizationLevel::Level1),
+        Some("2") => Some(GraphOptimizationLevel::Level2),
+        Some("3") => Some(GraphOptimizationLevel::Level3),
+        _ => None,
+    };
+    let builder = match opt {
+        Some(l) => builder
+            .with_optimization_level(l)
+            .expect("optimization level"),
+        None => builder,
+    };
+
     let mut builder = match ep.as_str() {
         "cpu" => builder
             .with_execution_providers([CPUExecutionProvider::default().build()])
             .expect("cpu ep"),
-        _ => builder
-            .with_execution_providers([WebGPU::default().build().error_on_failure()])
-            .expect("webgpu ep"),
+        _ => {
+            let mut gpu = WebGPU::default();
+            if let Some(l) = env("CR_LAYOUT") {
+                gpu = gpu.with_preferred_layout(if l.eq_ignore_ascii_case("nchw") {
+                    PreferredLayout::NCHW
+                } else {
+                    PreferredLayout::NHWC
+                });
+            }
+            if let Some(g) = env("CR_GRAPHCAP") {
+                gpu = gpu.with_enable_graph_capture(g == "1");
+            }
+            if let Some(c) = env("CR_BUFCACHE") {
+                let mode = match c.as_str() {
+                    "disabled" => BufferCacheMode::Disabled,
+                    "lazyRelease" => BufferCacheMode::LazyRelease,
+                    "simple" => BufferCacheMode::Simple,
+                    _ => BufferCacheMode::Bucket,
+                };
+                // All four, because a stale buffer could come from any of the pools.
+                gpu = gpu
+                    .with_storage_buffer_cache_mode(mode)
+                    .with_uniform_buffer_cache_mode(mode)
+                    .with_query_resolve_buffer_cache_mode(mode)
+                    .with_default_buffer_cache_mode(mode);
+            }
+            if let Some(v) = env("CR_VALIDATION") {
+                gpu = gpu.with_validation_mode(match v.as_str() {
+                    "full" => ValidationMode::Full,
+                    "basic" => ValidationMode::Basic,
+                    "wgpuOnly" => ValidationMode::WgpuOnly,
+                    _ => ValidationMode::Disabled,
+                });
+            }
+            builder
+                .with_execution_providers([gpu.build().error_on_failure()])
+                .expect("webgpu ep")
+        }
     };
     // Progress markers on stderr. Session creation and the first inference have very
     // different costs on the WebGPU provider, and a single wall-clock number cannot tell
@@ -117,9 +189,18 @@ fn main() {
     let fg = alpha.iter().filter(|&&v| v > 0.5).count() as f64 / n;
     let mean = alpha.iter().map(|&v| v as f64).sum::<f64>() / n;
     let max = alpha.iter().cloned().fold(f32::MIN, f32::max);
+    // The knobs are echoed on the result line so a sweep's output is self-describing:
+    // a table of numbers whose configuration lives only in shell history is not evidence.
+    let knobs: Vec<String> = ["CR_LAYOUT", "CR_OPT", "CR_GRAPHCAP", "CR_BUFCACHE"]
+        .iter()
+        .filter_map(|k| {
+            env(k).map(|v| format!("{}={v}", k.trim_start_matches("CR_").to_lowercase()))
+        })
+        .collect();
     println!(
-        "ep={ep:<7} ratio={ratio:<6} src={w}x{h:<5} fg>0.5={fg:.3}  mean={mean:.3}  \
-         max={max:.3}  {median:.2} ms/frame"
+        "ep={ep:<7} ratio={ratio:<5} src={w}x{h:<5} passes={passes:<3} fg>0.5={fg:.3}  \
+         mean={mean:.3}  max={max:.3}  {median:.2} ms/f  {}",
+        knobs.join(" ")
     );
 
     // The session owns a Dawn context; dropping it segfaults. Same trade as `Matter`.

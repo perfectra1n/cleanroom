@@ -209,7 +209,36 @@ frames.
 two ORT sessions in one process cannot be torn down. `examples/matte_probe.rs` prints the
 alpha histogram and a spatial map for a single still.
 
+**Every WebGPU EP option was tried, and all give bit-identical wrong output** — `fg>0.5`
+0.000, mean 0.002, max 0.185 across all of:
+
+| knob | values tried |
+|------|--------------|
+| `preferredLayout` | NCHW, NHWC |
+| `GraphOptimizationLevel` | Disable, Level1, default |
+| `enableGraphCapture` | off |
+| buffer cache modes | disabled |
+
+So it is not layout conversion, not a fusion, not command-buffer replay and not buffer
+reuse. Two further avenues are closed too: the model's nodes are **unnamed** (only
+initializers like `decoder.decode4.gru.ih.0.weight` carry names), so
+`forceCpuNodeNames` cannot be used to push a suspect op back to the CPU; and TensorRT is
+already ruled out for this model by the shared symbolic dimension names above.
+
+The strongest remaining suspect is `Resize`. The model carries `pytorch_half_pixel` and
+`cubic_coeff_a` attributes, the Dawn program log is full of `ResizeBilinear[0|2]`, and
+RVM's decoder upsamples at every stage with the recurrent state flowing through — a
+coordinate-transform mode the kernel does not honour would drift exactly the way the
+measurements do. Unconfirmed; confirming it needs graph surgery or a re-export.
+
 Re-test on a new `ort` or a new Dawn before trusting the GPU path again.
+
+### `gpu_ms` used to include `matting_ms`
+
+The GPU timer spanned the whole match arm, which contains the matting block, so the two
+stats double-counted: the GPU column read 10.8 ms against ~0.65 ms of real GPU work and
+looked like a GPU problem. It is subtracted now. Worth remembering before optimising
+anything on the strength of one of these counters.
 
 ### Run the probe *inside* `nix develop`, or it measures nothing
 

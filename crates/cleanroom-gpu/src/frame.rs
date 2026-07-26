@@ -53,7 +53,7 @@ const GUIDED_EPS: f32 = 1e-4;
 #[derive(Debug, Clone, Copy)]
 pub struct Look {
     pub mode: BackgroundMode,
-    /// 0.0..=1.0, mapped to a blur sigma internally.
+    /// 0.0..=1.0, mapped continuously onto pyramid depth plus tap spacing.
     pub blur_strength: f32,
     pub mirror: bool,
     /// Pull the background toward luma, 0.0..=1.0. Background plane only.
@@ -89,11 +89,31 @@ struct GuidedParams {
     eps: f32,
 }
 
-/// How many down/up pairs the blur runs.
+/// Padded to 16 bytes because a uniform buffer binding has to be.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlurParams {
+    offset: f32,
+    _pad: [f32; 3],
+}
+
+/// How deep the blur pyramid can go.
 ///
-/// Each pair roughly doubles the effective radius at constant cost per pass, so this is a
-/// geometric knob: 4 iterations is a heavily blurred room, 1 is a gentle softening.
-const MAX_BLUR_PASSES: u32 = 4;
+/// Each level halves both dimensions, so the effective radius roughly doubles per level:
+/// at 1080p, five levels reach 60x33 and the room behind you is unrecognisable, which is
+/// what the top of the slider ought to mean.
+///
+/// This replaced a fixed *pass count* at a fixed resolution. That arrangement grew the
+/// radius like sqrt(N) rather than 2^N, so the whole slider spanned about one level of the
+/// blur this now reaches at 20%. It was also strictly more work: eight passes at half
+/// resolution against a pyramid that costs half res plus a rapidly shrinking tail.
+const MAX_BLUR_LEVELS: u32 = 5;
+
+/// Smallest pyramid level worth building, per side.
+///
+/// Below roughly this the level is smaller than the compute workgroup and the up-sample
+/// starts to alias visibly rather than smooth.
+const MIN_BLUR_SIDE: u32 = 16;
 
 pub struct FramePipeline {
     gpu: Gpu,
@@ -106,9 +126,12 @@ pub struct FramePipeline {
     composited: wgpu::Texture,
     packed_out: wgpu::Texture,
 
-    /// Half-resolution ping-pong pair for the blur pyramid.
-    blur_a: wgpu::Texture,
-    blur_b: wgpu::Texture,
+    /// The blur pyramid: `[0]` is half the frame, each subsequent level half again. The
+    /// composite reads `[0]`, which is where the up chain lands.
+    blur_levels: Vec<wgpu::Texture>,
+    /// Tap-spacing scale, which is what makes the strength control continuous between
+    /// levels. See [`MAX_BLUR_LEVELS`].
+    blur_params: wgpu::Buffer,
 
     /// A 1x1 fully-opaque matte, used when no matting model is loaded so the composite
     /// pass is identical in both cases rather than branching on the host.
@@ -206,20 +229,41 @@ impl FramePipeline {
             wgpu::TextureFormat::Rgba8Uint,
             true,
         );
-        let blur_a = make_tex(
-            "blur-a",
-            width / 2,
-            height / 2,
-            wgpu::TextureFormat::Rgba8Unorm,
-            true,
-        );
-        let blur_b = make_tex(
-            "blur-b",
-            width / 2,
-            height / 2,
-            wgpu::TextureFormat::Rgba8Unorm,
-            true,
-        );
+        // The pyramid, built once. Stops early on a small frame rather than creating
+        // degenerate levels: at 320x180 there is no useful 10x5 level to make.
+        let mut blur_levels = Vec::new();
+        let (mut lw, mut lh) = (width / 2, height / 2);
+        for _ in 0..MAX_BLUR_LEVELS {
+            if lw < MIN_BLUR_SIDE || lh < MIN_BLUR_SIDE {
+                break;
+            }
+            blur_levels.push(make_tex(
+                "blur-level",
+                lw,
+                lh,
+                wgpu::TextureFormat::Rgba8Unorm,
+                true,
+            ));
+            lw /= 2;
+            lh /= 2;
+        }
+        // A frame too small for even one level still has to composite, so guarantee one.
+        if blur_levels.is_empty() {
+            blur_levels.push(make_tex(
+                "blur-level",
+                (width / 2).max(1),
+                (height / 2).max(1),
+                wgpu::TextureFormat::Rgba8Unorm,
+                true,
+            ));
+        }
+
+        let blur_params = dev.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blur-params"),
+            size: std::mem::size_of::<BlurParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Opaque 1x1 matte: alpha 1 everywhere means "all foreground", so a composite
         // with no model is a passthrough rather than a special case.
@@ -384,8 +428,8 @@ impl FramePipeline {
             rgba,
             composited,
             packed_out,
-            blur_a,
-            blur_b,
+            blur_levels,
+            blur_params,
             matte,
             bg_image,
             has_bg_image: false,
@@ -819,42 +863,64 @@ impl FramePipeline {
         // `passes % 2` and got it wrong by one, so the composite read the *input* to the
         // final pass — the blur ran correctly and was then thrown away, showing up as a
         // barely-there 7% variance drop instead of a real blur.
-        let mut blur_in_a = true;
         if matches!(mode, BackgroundMode::Blur) {
-            // Map 0..1 onto 1..MAX passes. Each down/up pair roughly doubles the radius,
-            // so this is a geometric control rather than a linear one.
-            let passes = 1 + (blur_strength.clamp(0.0, 1.0) * (MAX_BLUR_PASSES - 1) as f32) as u32;
-            let (hw, hh) = (self.width / 2, self.height / 2);
+            // Continuous, not stepped. The old mapping truncated 0..1 onto four integer
+            // pass counts, so two-thirds of the slider's travel changed nothing at all and
+            // the top of the range was reachable only at exactly 1.0. Here the integer part
+            // picks a pyramid depth and the fraction slides the tap spacing from 1.0 to 2.0
+            // within that depth — and 2.0 is what the next level down does at 1.0, so the
+            // two controls meet without a step.
+            let depth = self.blur_levels.len() as f32;
+            let pos = (blur_strength.clamp(0.0, 1.0) * depth).min(depth - 1e-4);
+            let levels = pos.floor() as usize + 1;
+            let offset = 1.0 + pos.fract();
 
-            // First pass reads the full-res frame; the rest ping-pong at half res.
-            self.blur_pass(&mut enc, &self.blur_down, &self.rgba, &self.blur_a, hw, hh);
-            for _ in 1..passes {
-                let (src, dst) = if blur_in_a {
-                    (&self.blur_a, &self.blur_b)
-                } else {
-                    (&self.blur_b, &self.blur_a)
-                };
-                self.blur_pass(&mut enc, &self.blur_down, src, dst, hw, hh);
-                blur_in_a = !blur_in_a;
+            self.gpu.queue.write_buffer(
+                &self.blur_params,
+                0,
+                bytemuck::bytes_of(&BlurParams {
+                    offset,
+                    _pad: [0.0; 3],
+                }),
+            );
+
+            // Down: full frame into level 0, then each level into the next one down. The
+            // halving is what makes the radius grow geometrically.
+            let l0 = &self.blur_levels[0];
+            self.blur_pass(
+                &mut enc,
+                &self.blur_down,
+                &self.rgba,
+                l0,
+                l0.width(),
+                l0.height(),
+            );
+            for i in 1..levels {
+                let (src, dst) = (&self.blur_levels[i - 1], &self.blur_levels[i]);
+                self.blur_pass(
+                    &mut enc,
+                    &self.blur_down,
+                    src,
+                    dst,
+                    dst.width(),
+                    dst.height(),
+                );
             }
-            for _ in 0..passes {
-                let (src, dst) = if blur_in_a {
-                    (&self.blur_a, &self.blur_b)
-                } else {
-                    (&self.blur_b, &self.blur_a)
-                };
-                self.blur_pass(&mut enc, &self.blur_up, src, dst, hw, hh);
-                blur_in_a = !blur_in_a;
+            // Up: back along the same chain, each level reading the smaller one below it.
+            // Overwriting the down result at each level is correct — it has already been
+            // consumed by the level below, and the up tap pattern is what does the
+            // reconstruction.
+            for i in (0..levels.saturating_sub(1)).rev() {
+                let (src, dst) = (&self.blur_levels[i + 1], &self.blur_levels[i]);
+                self.blur_pass(&mut enc, &self.blur_up, src, dst, dst.width(), dst.height());
             }
         }
 
-        // Whichever half of the ping-pong the last pass actually wrote into.
-        let bg = if !matches!(mode, BackgroundMode::Blur) {
-            &self.rgba
-        } else if blur_in_a {
-            &self.blur_a
+        // The up chain always lands in level 0.
+        let bg = if matches!(mode, BackgroundMode::Blur) {
+            &self.blur_levels[0]
         } else {
-            &self.blur_b
+            &self.rgba
         };
 
         // 3. composite
@@ -1020,6 +1086,10 @@ impl FramePipeline {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.blur_params.as_entire_binding(),
                 },
             ],
             w,
