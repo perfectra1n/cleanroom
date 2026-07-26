@@ -150,21 +150,21 @@ fn main() {
     let preseed = env("CR_PRESEED").is_some();
     let mut state: Vec<(Vec<i64>, Vec<f32>)> = if preseed {
         // RVM-mobilenetv3's recurrent channels, at 1/2, 1/4, 1/8 and 1/16 of the input.
-        [(16, 2), (20, 4), (40, 8), (64, 16)]
+        [(16i64, 2i64), (20, 4), (40, 8), (64, 16)]
             .iter()
             .map(|(c, div)| {
                 let (rh, rw) = ((h as i64) / div, (w as i64) / div);
-                (
-                    vec![1, *c as i64, rh, rw],
-                    vec![0.0f32; (c * (rh * rw) as i64) as usize],
-                )
+                (vec![1, *c, rh, rw], vec![0.0f32; (c * rh * rw) as usize])
             })
             .collect()
     } else {
         (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0f32])).collect()
     };
     if env("CR_SHAPES").is_some() {
-        eprintln!("[s] seed shapes {:?}", state.iter().map(|s| &s.0).collect::<Vec<_>>());
+        eprintln!(
+            "[s] seed shapes {:?}",
+            state.iter().map(|s| &s.0).collect::<Vec<_>>()
+        );
     }
 
     // Optional 6th argument: how many frames to run. The default settles the recurrent

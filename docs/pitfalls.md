@@ -169,6 +169,55 @@ and convert with the same matrix — then the error is **0**.
 
 ## ONNX Runtime / matting
 
+### A Conv with C_in divisible by 3 but not by 4 is computed wrong on the WebGPU EP
+
+**This is the root cause of the entry below, found after every whole-model hypothesis had
+been eliminated. Fix first, then read the rest as the trail.**
+
+ONNX Runtime's WebGPU provider returns wrong values from `Conv` when the **input channel
+count is divisible by 3 and not divisible by 4**. Minimal reproducer: one dense 3x3 Conv,
+16 output channels, 16x16 spatial, varying only `C_in`:
+
+| C_in | 3 | 4 | 5 | **6** | 7 | 8 | 12 | 59 | 107 | **171** | 172 |
+|------|---|---|---|-------|---|---|----|----|-----|---------|-----|
+|      | ok | ok | ok | **wrong** | ok | ok | ok | ok | ok | **wrong** | ok |
+
+Across a 1..176 sweep the failing set is exactly `6, 9, 15, 18, 21, 27, 30, 33, 39, 171` —
+17-20% off in L1. Every multiple of 4 is exact. `C_in = 3` is special-cased upstream and
+works. Reproduced identically on ORT **1.24.2 and 1.27.0**.
+
+RVM walks into this once: its decoder concatenates the 3-channel source image onto its skip
+connections, and `Conv_200` (`W = [80, 171, 3, 3]`) lands on 171. **One** conv out of 353
+nodes, and it destroys the whole matte.
+
+**The fix is an exact identity.** Pad the input channels up to the next multiple of 4 with
+an ONNX `Pad`, and zero-pad the weight tensor along `C_in` to match. The appended weights
+are zero, so the appended channels contribute nothing whatever they hold; only the kernel
+path the provider takes changes.
+
+```sh
+python3 tools/onnx/pad_conv_channels.py in.onnx out.onnx    # 171 -> 172
+```
+
+Measured on the same frame, 512x288, 10 passes, RTX 5090:
+
+| model | provider | fg>0.5 | mean | max | ms/frame |
+|-------|----------|--------|------|-----|----------|
+| stock | WebGPU | 0.000 | 0.002 | 0.185 | 6.71 |
+| padded | **WebGPU** | **0.227** | **0.227** | **1.000** | **7.34** |
+| padded | CPU | 0.227 | 0.227 | 1.000 | 41.06 |
+
+Padded-WebGPU matches CPU exactly — the rewrite really is an identity — and is 5.6x faster
+than the CPU provider. GPU matting needs no CUDA and no loss of vendor neutrality.
+
+**How it was found**, because the method generalises: sub-model extraction with
+`onnx.utils.extract_model`, comparing each probe across providers
+(`tools/onnx/extract.py`, `examples/ep_diff.rs`). Every probe matched to ~1e-7 up to and
+including `Concat_199` — the failing conv's own *input* — and then `Conv_200`'s output was
+44% off. One caveat that wasted a pass: compare with a **relative tolerance** (~1e-3).
+Floating-point reassociation alone moves an L1 sum by ~1e-7, so exact equality marks every
+probe as divergent and localises nothing.
+
 ### The WebGPU EP runs RVM fast and returns a matte that decays to nothing
 
 **Symptom:** background blur appears not to work. Look closely and it *is* working — the
