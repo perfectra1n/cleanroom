@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# One in-flight run per ref. The build compiles ONNX Runtime bindings and Slint, so a
+# superseded run is expensive to leave running.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on a warning the same way `mise run lint` does locally.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Everything runs inside the flake's dev shell, because the build genuinely needs
+      # it: pipewire-sys and v4l2-sys-mit both run bindgen over system headers and need
+      # LIBCLANG_PATH, turbojpeg-sys needs TURBOJPEG_SOURCE=pkg-config or it builds its
+      # own libjpeg-turbo with cmake and nasm, and wgpu dlopens libvulkan.so.1 rather than
+      # linking it. Reproducing that by hand in the workflow would be a second, divergent
+      # definition of the build environment.
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: fmt
+        run: nix develop -c cargo fmt --all -- --check
+
+      - name: clippy
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: tests
+        # Hardware- and weight-dependent tests skip themselves rather than failing, so this
+        # is meaningful on a runner with no camera, no microphone and no model files.
+        run: nix develop -c cargo test --workspace
+
+  gpu:
+    name: GPU path on lavapipe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-gpu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-gpu-
+
+      # The whole GPU path is exercisable headlessly. Gpu::pick_best ranks Cpu last
+      # deliberately, so lavapipe is never chosen while real hardware exists but is
+      # available exactly here.
+      #
+      # This is the only job that proves the shaders compile and the passes produce the
+      # right pixels; the unit tests above cannot, because they have no adapter.
+      - name: gpu_check under lavapipe
+        run: |
+          nix develop -c bash -eo pipefail -c '
+            export VK_DRIVER_FILES="$(dirname "$(find /nix/store -name "lvp_icd.x86_64.json" 2>/dev/null | head -1)")/lvp_icd.x86_64.json"
+            echo "using ICD: $VK_DRIVER_FILES"
+            cargo run --release -p cleanroom-gpu --example gpu_check
+          '
+
+  package:
+    name: nix build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # Builds the actual shipped artefact, including the fixed-output derivation for
+      # ort's WebGPU prebuilt. Catches the class of breakage that only shows up outside
+      # the dev shell — a wrong rpath, a missing runtime library, a hash that drifted.
+      - run: nix flake check
+      - run: nix build .#cleanroom
+      - name: the built binaries run
+        run: |
+          ./result/bin/cleanroom-ctl --help > /dev/null
+          ./result/bin/cleanroomd --help > /dev/null || true
