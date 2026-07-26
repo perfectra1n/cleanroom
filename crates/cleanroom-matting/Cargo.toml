@@ -1,0 +1,33 @@
+[package]
+name = "cleanroom-matting"
+description = "Robust Video Matting via ONNX Runtime on a vendor-neutral GPU."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = "2"
+tracing.workspace = true
+
+# The WebGPU execution provider is the whole point: GPU inference on both Nvidia and AMD
+# with no vendor SDK. Confirmed present in ort's linux-x64 prebuilt (docs/spike-results.md),
+# and measured at 4.53 ms/frame on an RTX 5090 and 38.77 ms on a Radeon iGPU.
+#
+# NOTE nixpkgs' onnxruntime is built WITHOUT WebGPU (its override args expose only
+# coreml/cuda/nccl/openvino/rocm, and there is no Dawn in the store), so pointing
+# ORT_DYLIB_PATH at it would silently give CPU inference. The prebuilt is the supported path.
+#
+# tls-rustls, not the default tls-native: the build script downloads over HTTPS and linking
+# that against system OpenSSL fails on NixOS with "libssl.so.3: cannot open shared object
+# file". rustls is pure Rust and works outside the dev shell too.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-24",
+    "webgpu",
+] }

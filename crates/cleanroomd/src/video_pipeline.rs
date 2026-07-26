@@ -11,6 +11,7 @@
 use crate::state::{HealthState, Shared};
 use cleanroom_gpu::{FramePipeline, Gpu};
 use cleanroom_ipc::PipelineStats;
+use cleanroom_matting::{INFER_H, INFER_W, Matter};
 use cleanroom_video::{Camera, ConsumerWatch, FrameDecoder, LoopbackSink, Yuy2Frame};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -136,6 +137,33 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
     let mut gpu = gpu;
     let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
 
+    // Matting. Only loaded when a background effect actually needs a matte — with the mode
+    // Off there is nothing to segment, and loading a model to compute an unused alpha would
+    // be pure waste.
+    //
+    // A missing model is reported as Degraded rather than failing: blur without a matte is
+    // still a working camera, it just has nothing to separate foreground from background.
+    // What it must never be is *silently* the same as having one.
+    let mut matter = None;
+    let mut matte_rgba = Vec::new();
+    if gpu.is_some() && cfg.video.background != cleanroom_core::BackgroundMode::Off {
+        match cleanroom_matting::find_model().and_then(|m| Matter::new(&m)) {
+            Ok(m) => {
+                if let Some(pipe) = gpu.as_mut() {
+                    pipe.enable_matte_input(INFER_W, INFER_H);
+                }
+                matte_rgba = vec![0u8; (INFER_W * INFER_H * 4) as usize];
+                matter = Some(m);
+            }
+            Err(e) => {
+                shared.set_video_health(HealthState::degraded(format!(
+                    "background effects have no subject to separate — matting model \
+                     unavailable: {e}"
+                )));
+            }
+        }
+    }
+
     // Report the mode we actually got, not the one that was asked for.
     shared.set_video_health(HealthState::nominal(format!(
         "{} -> {} ({})",
@@ -153,6 +181,9 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
             || now_cfg.video.device.as_deref().unwrap_or(&cam_path) != cam_path
             || (now_cfg.video.width, now_cfg.video.height, now_cfg.video.fps)
                 != (cfg.video.width, cfg.video.height, cfg.video.fps)
+            // Switching to or from Off changes whether a matting model is needed at all.
+            || (now_cfg.video.background == cleanroom_core::BackgroundMode::Off)
+                != (cfg.video.background == cleanroom_core::BackgroundMode::Off)
         {
             tracing::info!("video config changed; restarting pipeline");
             return Ok(());
@@ -201,6 +232,7 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
 
         // Effects. Read the live config each frame so a blur-strength change takes effect
         // on the very next frame rather than at the next restart.
+        let mut matting_ms = 0.0;
         let gpu_ms = match gpu.as_mut() {
             Some(pipe) => {
                 let t1 = Instant::now();
@@ -211,6 +243,24 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
                     now_cfg.video.blur_strength,
                     now_cfg.video.mirror,
                 );
+                // Matting runs *after* the composite, so its matte applies to the next
+                // frame rather than this one. One frame of latency is invisible, and it
+                // avoids a pipeline stall: the alternative is to downscale, read back, run
+                // the network and only then composite, serialising the GPU behind the CPU
+                // on every single frame.
+                if let Some(m) = matter.as_mut() {
+                    let t2 = Instant::now();
+                    if pipe.read_matte_input(&mut matte_rgba) {
+                        match m.infer(&matte_rgba) {
+                            Ok(alpha) => pipe.set_matte(alpha, INFER_W, INFER_H),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "matting failed for one frame");
+                            }
+                        }
+                    }
+                    matting_ms = t2.elapsed().as_secs_f64() * 1000.0;
+                }
+
                 sink.write(&processed)?;
                 t1.elapsed().as_secs_f64() * 1000.0
             }
@@ -220,7 +270,7 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
             }
         };
 
-        stats.record(decode_ms, gpu_ms);
+        stats.record(decode_ms, gpu_ms, matting_ms);
         stats.publish_if_due(shared, consumers, false);
     }
 
@@ -232,6 +282,7 @@ struct StatsAccumulator {
     frames: u64,
     decode_ms_total: f64,
     gpu_ms_total: f64,
+    matting_ms_total: f64,
     since: Instant,
 }
 
@@ -241,14 +292,16 @@ impl StatsAccumulator {
             frames: 0,
             decode_ms_total: 0.0,
             gpu_ms_total: 0.0,
+            matting_ms_total: 0.0,
             since: Instant::now(),
         }
     }
 
-    fn record(&mut self, decode_ms: f64, gpu_ms: f64) {
+    fn record(&mut self, decode_ms: f64, gpu_ms: f64, matting_ms: f64) {
         self.frames += 1;
         self.decode_ms_total += decode_ms;
         self.gpu_ms_total += gpu_ms;
+        self.matting_ms_total += matting_ms;
     }
 
     fn publish_if_due(&mut self, shared: &Arc<Shared>, consumers: Option<u32>, idle: bool) {
@@ -270,12 +323,14 @@ impl StatsAccumulator {
             // would be inventing data.
             s.decode_ms = self.decode_ms_total / self.frames as f64;
             s.gpu_ms = self.gpu_ms_total / self.frames as f64;
+            s.matting_ms = self.matting_ms_total / self.frames as f64;
         }
         shared.set_stats(s);
 
         self.frames = 0;
         self.decode_ms_total = 0.0;
         self.gpu_ms_total = 0.0;
+        self.matting_ms_total = 0.0;
         self.since = Instant::now();
     }
 }

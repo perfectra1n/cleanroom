@@ -55,6 +55,11 @@ pub struct FramePipeline {
     blur_up: wgpu::ComputePipeline,
     composite: wgpu::ComputePipeline,
 
+    /// Small RGBA texture holding the frame at matting-input size, plus its readback.
+    /// Sized by the caller so this crate does not need to know the network's geometry.
+    matte_input: Option<(wgpu::Texture, wgpu::Buffer, u32, u32, u32)>,
+    downscale: wgpu::ComputePipeline,
+
     /// Staging buffer for the readback. Persistent so the hot path allocates nothing.
     readback: wgpu::Buffer,
     /// Bytes per row after alignment to wgpu's 256-byte requirement.
@@ -207,6 +212,11 @@ impl FramePipeline {
             include_str!("../shaders/composite.wgsl"),
             false,
         );
+        let m_down = module(
+            "downscale",
+            include_str!("../shaders/downscale.wgsl"),
+            false,
+        );
 
         let pipeline = |label: &str, m: &wgpu::ShaderModule, entry: &str| {
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -227,6 +237,8 @@ impl FramePipeline {
             blur_down: pipeline("blur-down", &m_blur, "down"),
             blur_up: pipeline("blur-up", &m_blur, "up"),
             composite: pipeline("composite", &m_comp, "main"),
+            downscale: pipeline("downscale", &m_down, "main"),
+            matte_input: None,
             packed_in,
             rgba,
             composited,
@@ -291,6 +303,126 @@ impl FramePipeline {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Prepare a downscaled RGBA readback at `w`x`h`, for feeding a matting network.
+    ///
+    /// Separate from `new` so this crate never needs to know the network's input geometry,
+    /// and so a pipeline with no matting model pays for neither the texture nor the buffer.
+    pub fn enable_matte_input(&mut self, w: u32, h: u32) {
+        let unpadded = w * 4;
+        let padded = unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+        let tex = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("matte-input"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let buf = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("matte-input-readback"),
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.matte_input = Some((tex, buf, w, h, padded));
+    }
+
+    /// Downscale the current frame and read it back as tightly-packed RGBA8.
+    ///
+    /// Call after [`process`], which is what leaves the unpacked RGBA in place. Returns
+    /// false if [`enable_matte_input`] was never called.
+    ///
+    /// The readback is small on purpose: 512x288 RGBA is 590 KB, where reading back a full
+    /// 1080p frame to downscale on the CPU would be 8 MB and put the scaling on the wrong
+    /// processor.
+    pub fn read_matte_input(&mut self, out: &mut [u8]) -> bool {
+        let Some((tex, buf, w, h, padded)) = self.matte_input.take() else {
+            return false;
+        };
+
+        let v = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        self.dispatch(
+            &mut enc,
+            &self.downscale,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&v(&self.rgba)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&v(&tex)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+            w,
+            h,
+        );
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.gpu.queue.submit([enc.finish()]);
+
+        {
+            let slice = buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            let _ = self.gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            if rx.recv().is_ok() {
+                let data = slice.get_mapped_range();
+                let row = (w * 4) as usize;
+                for y in 0..h as usize {
+                    let src = y * padded as usize;
+                    let dst = y * row;
+                    if dst + row <= out.len() && src + row <= data.len() {
+                        out[dst..dst + row].copy_from_slice(&data[src..src + row]);
+                    }
+                }
+            }
+        }
+        buf.unmap();
+
+        self.matte_input = Some((tex, buf, w, h, padded));
+        true
     }
 
     /// Run one frame: upload YUY2, apply effects, read YUY2 back.

@@ -1062,6 +1062,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cleanroom-matting"
+version = "0.1.0"
+dependencies = [
+ "ort",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "cleanroom-video"
 version = "0.1.0"
 dependencies = [
@@ -1084,6 +1093,7 @@ dependencies = [
  "cleanroom-core",
  "cleanroom-gpu",
  "cleanroom-ipc",
+ "cleanroom-matting",
  "cleanroom-video",
  "serde",
  "thiserror 2.0.19",

@@ -15,6 +15,7 @@ cleanroom-core = { path = "../cleanroom-core" }
 cleanroom-ipc = { path = "../cleanroom-ipc" }
 cleanroom-audio = { path = "../cleanroom-audio" }
 cleanroom-gpu = { path = "../cleanroom-gpu" }
+cleanroom-matting = { path = "../cleanroom-matting" }
 cleanroom-video = { path = "../cleanroom-video" }
 
 anyhow.workspace = true
