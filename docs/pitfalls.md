@@ -209,27 +209,45 @@ frames.
 two ORT sessions in one process cannot be torn down. `examples/matte_probe.rs` prints the
 alpha histogram and a spatial map for a single still.
 
-**Every WebGPU EP option was tried, and all give bit-identical wrong output** — `fg>0.5`
-0.000, mean 0.002, max 0.185 across all of:
+#### What has been ruled out
 
-| knob | values tried |
-|------|--------------|
-| `preferredLayout` | NCHW, NHWC |
-| `GraphOptimizationLevel` | Disable, Level1, default |
-| `enableGraphCapture` | off |
-| buffer cache modes | disabled |
+Everything below produces **bit-identical** wrong output — `fg>0.5` 0.000, mean 0.002,
+max 0.185 — on the same frame where the CPU provider returns 0.227 / 1.000:
 
-So it is not layout conversion, not a fusion, not command-buffer replay and not buffer
-reuse. Two further avenues are closed too: the model's nodes are **unnamed** (only
-initializers like `decoder.decode4.gru.ih.0.weight` carry names), so
-`forceCpuNodeNames` cannot be used to push a suspect op back to the CPU; and TensorRT is
-already ruled out for this model by the shared symbolic dimension names above.
+| tried | values | verdict |
+|-------|--------|---------|
+| `preferredLayout` | NCHW, NHWC | not layout conversion |
+| `GraphOptimizationLevel` | Disable, Level1, default | not a fusion |
+| `enableGraphCapture` | off | not command-buffer replay |
+| buffer cache modes | disabled | not buffer reuse |
+| `downsample_ratio` | 1.0, 0.5, 0.25 | not the ratio |
+| `src` size | 512x288, 1920x1080 | not resolution |
+| `VK_DRIVER_FILES` | pinned to nvidia_icd | not adapter selection |
+| Resize rewritten | `half_pixel`, `asymmetric` | not the coordinate mode |
+| HardSigmoid rewritten | `Clip(alpha*x + beta, 0, 1)` | not the non-default alpha (1/6) |
+| Split rewritten | axis `-3` normalised to `1` | not negative-axis handling |
 
-The strongest remaining suspect is `Resize`. The model carries `pytorch_half_pixel` and
-`cubic_coeff_a` attributes, the Dawn program log is full of `ResizeBilinear[0|2]`, and
-RVM's decoder upsamples at every stage with the recurrent state flowing through — a
-coordinate-transform mode the kernel does not honour would drift exactly the way the
-measurements do. Unconfirmed; confirming it needs graph surgery or a re-export.
+Each graph rewrite is an exact identity, and each was confirmed a no-op by re-running it on
+the CPU provider, which returned 0.227 unchanged. `scratchpad`-style helpers for this live
+in the commit history: `rewrite.py` (HardSigmoid/Split), `patch_resize.py`.
+
+Two further notes for whoever picks this up:
+
+* The model's 353 nodes **are** all named (`Resize_3`, `Conv_12`, …) — an earlier claim here
+  that they were unnamed was wrong, and came from reading `strings(1)` output instead of the
+  graph. But `forceCpuNodeNames` appears to be **inert**: forcing *all 353* nodes to the CPU
+  still returns the wrong answer at full GPU speed (7 ms), which is the control that says
+  the option is not being honoured. Per-op isolation through that lever is unavailable.
+* The output *is* input-dependent — max alpha 0.279 for a portrait, 0.065 for a blurred
+  room, 0.000 for a screenshot — so the input tensor does reach the kernels. The fault is a
+  systematic attenuation that then compounds through the recurrent state, not a dead input.
+
+The remaining rigorous approach is sub-model extraction: truncate the graph at successive
+tensors with `onnx.utils.extract_model`, run each on both providers and find the first
+divergence. That needs a generic runner, since `matte_sweep` assumes RVM's exact signature.
+
+TensorRT is separately ruled out for this model by the shared symbolic dimension names
+described at the top of `cleanroom-matting`'s module docs.
 
 Re-test on a new `ort` or a new Dawn before trusting the GPU path again.
 

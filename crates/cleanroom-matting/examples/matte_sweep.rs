@@ -102,6 +102,13 @@ fn main() {
                     .with_query_resolve_buffer_cache_mode(mode)
                     .with_default_buffer_cache_mode(mode);
             }
+            // Comma-separated ONNX node names to keep off the GPU. The lever for testing
+            // "is it this operator?" without touching the model — RVM's nodes are all
+            // named (`Resize_3`, `Conv_12`, ...), so a suspect op type can be pushed back
+            // to the CPU while everything else stays on the GPU.
+            if let Some(n) = env("CR_FORCECPU") {
+                gpu = gpu.with_force_cpu_node_names(n);
+            }
             if let Some(v) = env("CR_VALIDATION") {
                 gpu = gpu.with_validation_mode(match v.as_str() {
                     "full" => ValidationMode::Full,
