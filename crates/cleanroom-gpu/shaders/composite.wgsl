@@ -15,6 +15,10 @@ struct CompositeParams {
 @group(0) @binding(3) var comp_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(4) var comp_samp: sampler;
 @group(0) @binding(5) var<uniform> comp: CompositeParams;
+// The replacement plate. Always bound — it is referenced from live code below, so it
+// cannot be optimised out — and defaults to a 1x1 texel when no image is loaded, the same
+// trick the matte uses to stay a valid binding before the first inference.
+@group(0) @binding(6) var comp_bg_image: texture_2d<f32>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -44,6 +48,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var bg: vec3<f32>;
     if (comp.mode == 3u) {
         bg = vec3<f32>(0.0, 1.0, 0.0);
+    } else if (comp.mode == 2u) {
+        // Deliberately NOT `uv`. `src` was mirrored above, and sampling the plate through a
+        // mirrored coordinate flips it with the subject — which is right for blur, where the
+        // background *is* the same frame, and wrong for a photograph, where it means any
+        // text in the plate reads backwards. The subject flips; the room behind them does
+        // not.
+        let plate_uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
+        bg = textureSampleLevel(comp_bg_image, comp_samp, plate_uv, 0.0).rgb;
     } else {
         bg = textureSampleLevel(comp_bg, comp_samp, uv, 0.0).rgb;
     }

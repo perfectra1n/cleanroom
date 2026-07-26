@@ -1096,6 +1096,7 @@ dependencies = [
  "cleanroom-ipc",
  "cleanroom-matting",
  "cleanroom-video",
+ "image",
  "serde",
  "thiserror 2.0.19",
  "tokio",

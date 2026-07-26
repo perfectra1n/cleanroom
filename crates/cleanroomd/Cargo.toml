@@ -38,3 +38,11 @@ zbus = "5"
 toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+# Background plates only. default-features = false drops the dozen codecs we have no reason
+# to accept — a background image is something the user picked from their own disk, so the
+# format list is a choice about attack surface, not about convenience. PNG and JPEG cover
+# what a file picker will realistically hand us.
+#
+# 0.25 is already in Cargo.lock via Slint, so this pulls in nothing new to build.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

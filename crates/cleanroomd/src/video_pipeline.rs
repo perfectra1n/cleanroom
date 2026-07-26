@@ -251,6 +251,10 @@ fn run_once(
     // Consecutive `infer` failures. A single one is a frame not worth crashing over; a run
     // of them means the recurrent state is wedged and needs clearing.
     let mut infer_errors: u32 = 0;
+    // The decoded replacement plate, and whether its current failure has been reported.
+    // The flag stops a broken path re-logging thirty times a second.
+    let mut plate: Option<crate::background::Plate> = None;
+    let mut plate_reported: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // A config change that alters the negotiated mode needs a full restart. Cheap to
@@ -260,6 +264,21 @@ fn run_once(
             tracing::info!("video config changed; restarting pipeline");
             return Ok(Outcome::Restart);
         }
+
+        // The replacement plate is reloaded, never restarted. Changing the picture does not
+        // change the negotiated mode, and a restart would drop the loopback fd and blank
+        // the camera for every app in the call — a heavy price for swapping a JPEG.
+        let effective_background = match gpu.as_mut() {
+            Some(pipe) => sync_background_plate(
+                pipe,
+                &now_cfg,
+                (mode.width, mode.height),
+                &mut plate,
+                shared,
+                &mut plate_reported,
+            ),
+            None => now_cfg.video.background,
+        };
 
         let consumers = watch.poll(Duration::from_millis(0));
         let wanted = !now_cfg.video.power_save || watch.in_use();
@@ -332,7 +351,7 @@ fn run_once(
                 pipe.process(
                     &frame.data,
                     &mut processed,
-                    now_cfg.video.background,
+                    effective_background,
                     now_cfg.video.blur_strength,
                     now_cfg.video.mirror,
                 );
@@ -391,6 +410,94 @@ fn run_once(
 
     // The only way out of that loop is the stop flag.
     Ok(Outcome::Stopped)
+}
+
+/// Keep the GPU's background plate in step with config, and say which mode is really usable.
+///
+/// Returns the mode to actually composite with. That is not always the configured one:
+/// `Replace` with no usable image would key the subject onto flat black, which looks like a
+/// broken effect rather than an unset setting. Falling back to `Blur` and reporting Degraded
+/// is the project's rule — a fallback nobody is told about is the one failure mode this
+/// codebase is most determined not to have.
+///
+/// Reload, never restart. Swapping the picture does not change the negotiated mode, and a
+/// restart would drop the loopback fd and blank the camera for everyone in the call.
+fn sync_background_plate(
+    pipe: &mut FramePipeline,
+    cfg: &Config,
+    frame: (u32, u32),
+    plate: &mut Option<crate::background::Plate>,
+    shared: &Arc<Shared>,
+    reported: &mut Option<String>,
+) -> cleanroom_core::BackgroundMode {
+    use cleanroom_core::BackgroundMode;
+
+    let wanted = cfg.video.background;
+    if wanted != BackgroundMode::Replace {
+        return wanted;
+    }
+
+    let Some(path) = cfg.video.background_image.as_deref() else {
+        return degrade(
+            shared,
+            reported,
+            "background replace has no image — set video.background_image to a PNG or JPEG"
+                .to_string(),
+        );
+    };
+
+    // Reload only when the path, its mtime or the frame size has actually moved.
+    let stale = plate.as_ref().is_none_or(|p| !p.is_current(path, frame));
+    if stale {
+        match crate::background::Plate::load(path, frame) {
+            Ok(p) => {
+                pipe.set_background_image(&p.rgba, p.width, p.height);
+                *plate = Some(p);
+                if reported.take().is_some() {
+                    // Recovered: say so, or the UI keeps showing a stale complaint.
+                    shared.set_video_health(HealthState::nominal(format!(
+                        "background image loaded: {}",
+                        path.display()
+                    )));
+                }
+                tracing::info!(path = %path.display(), "background plate loaded");
+            }
+            Err(e) => {
+                *plate = None;
+                pipe.clear_background_image();
+                return degrade(shared, reported, e.to_string());
+            }
+        }
+    }
+
+    if pipe.has_background_image() {
+        BackgroundMode::Replace
+    } else {
+        degrade(
+            shared,
+            reported,
+            "background replace has no usable image".to_string(),
+        )
+    }
+}
+
+/// Report a background-plate problem once, then fall back to blur.
+///
+/// Once, because this is called per frame: without the latch a bad path would write health
+/// and log thirty times a second, which buries every other message in the journal.
+fn degrade(
+    shared: &Arc<Shared>,
+    reported: &mut Option<String>,
+    detail: String,
+) -> cleanroom_core::BackgroundMode {
+    if reported.as_deref() != Some(detail.as_str()) {
+        tracing::warn!(%detail, "falling back to blur");
+        shared.set_video_health(HealthState::degraded(format!(
+            "{detail} — blurring instead"
+        )));
+        *reported = Some(detail);
+    }
+    cleanroom_core::BackgroundMode::Blur
 }
 
 /// Whether a config change needs the devices reopened.

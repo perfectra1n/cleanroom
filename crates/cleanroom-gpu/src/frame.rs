@@ -46,6 +46,15 @@ pub struct FramePipeline {
     /// pass is identical in both cases rather than branching on the host.
     matte: wgpu::Texture,
 
+    /// The replacement background plate, already cover-fitted to the frame by the caller.
+    /// 1x1 black until one is loaded, for the same reason as `matte`: the binding is
+    /// referenced by live shader code, so it has to exist whether or not it is meaningful.
+    bg_image: wgpu::Texture,
+    /// Whether `bg_image` holds a real plate. `Replace` without one would key the subject
+    /// onto flat black, which looks like a broken effect rather than an unset setting, so
+    /// the host falls back to blur and says why.
+    has_bg_image: bool,
+
     sampler: wgpu::Sampler,
     params: wgpu::Buffer,
 
@@ -154,6 +163,30 @@ impl FramePipeline {
             &[255u8],
         );
 
+        // 1x1 black plate, for the same reason as the matte above: `comp_bg_image` is
+        // referenced by live shader code and must always be bound, whether or not the user
+        // has chosen an image. It is never actually sampled without one, because the host
+        // refuses to select Replace until `has_bg_image`.
+        let bg_image = dev.create_texture_with_data(
+            &gpu.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("bg-image"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &[0u8, 0, 0, 255],
+        );
+
         let sampler = dev.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("linear"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -246,6 +279,8 @@ impl FramePipeline {
             blur_a,
             blur_b,
             matte,
+            bg_image,
+            has_bg_image: false,
             sampler,
             params,
             readback,
@@ -256,6 +291,70 @@ impl FramePipeline {
 
     pub fn adapter_name(&self) -> &str {
         &self.gpu.choice.name
+    }
+
+    /// Upload the replacement background plate.
+    ///
+    /// `data` is tightly packed RGBA8 at `width` x `height`. The caller cover-fits it to
+    /// the frame before calling, so this does no scaling of its own — the resampling is a
+    /// once-per-image cost and belongs where the image is decoded, not on the GPU where it
+    /// would either run per frame or need its own pass.
+    ///
+    /// Uploading once and keeping it is the point: a 1080p plate is 8 MB, and re-uploading
+    /// that every frame would cost more PCIe traffic than the entire rest of the pipeline.
+    pub fn set_background_image(&mut self, data: &[u8], width: u32, height: u32) {
+        debug_assert_eq!(data.len(), (width as usize) * (height as usize) * 4);
+
+        if self.bg_image.width() != width || self.bg_image.height() != height {
+            self.bg_image = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("bg-image"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+        }
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.bg_image,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.has_bg_image = true;
+    }
+
+    /// Whether a replacement plate has been uploaded.
+    ///
+    /// `Replace` without one would key the subject onto flat black, which reads as a broken
+    /// effect rather than as an unset setting — so the caller checks this and degrades to
+    /// blur, loudly, instead.
+    pub fn has_background_image(&self) -> bool {
+        self.has_bg_image
+    }
+
+    /// Forget the current plate, so `Replace` stops being honoured.
+    pub fn clear_background_image(&mut self) {
+        self.has_bg_image = false;
     }
 
     /// Replace the alpha matte.
@@ -566,6 +665,10 @@ impl FramePipeline {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&v(&self.bg_image)),
                 },
             ],
             self.width,
