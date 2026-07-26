@@ -131,14 +131,17 @@ fn run_once(
     let target = cfg.audio.device.clone();
 
     if denoise_active {
+        // Deliberately does NOT include the attenuation value. That is applied live via
+        // set_atten_lim without restarting the node, so embedding it here would leave a
+        // stale number on screen the moment the user moves the slider — the UI shows the
+        // live value next to the slider instead.
         shared.set_audio_health(HealthState::nominal(format!(
-            "{} -> {} (DeepFilterNet, {:.0} dB limit)",
+            "{} -> {} (DeepFilterNet)",
             target
                 .as_ref()
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "system default".into()),
             VIRTUAL_MIC_NODE,
-            cfg.audio.denoise.attenuation_db
         )));
     }
 
@@ -153,6 +156,12 @@ fn run_once(
     // `Denoiser::set_attenuation`, so dragging a slider must not interrupt audio. The
     // prior art respawned an entire helper process per slider drag and dropped ~200 ms
     // of microphone audio each time.
+    // Apply live-tunable parameters inside the process callback, so moving a slider takes
+    // effect on the next hop with no restart and no dropped audio.
+    let live = shared.clone();
+    let mut applied_atten = cfg.audio.denoise.attenuation_db;
+    let mut applied_pf = cfg.audio.denoise.post_filter_beta;
+
     let stop_check = stop.clone();
     let watch = shared.clone();
     let started_with = (
@@ -167,7 +176,18 @@ fn run_once(
         VIRTUAL_MIC_NODE,
         "Cleanroom Microphone",
         move |inp, outp| match denoiser.as_mut() {
-            Some(d) => d.process(inp, outp),
+            Some(d) => {
+                let c = live.config();
+                if c.audio.denoise.attenuation_db != applied_atten {
+                    applied_atten = c.audio.denoise.attenuation_db;
+                    d.set_attenuation(applied_atten);
+                }
+                if c.audio.denoise.post_filter_beta != applied_pf {
+                    applied_pf = c.audio.denoise.post_filter_beta;
+                    d.set_post_filter(applied_pf);
+                }
+                d.process(inp, outp)
+            }
             None => outp.copy_from_slice(inp),
         },
         move || {

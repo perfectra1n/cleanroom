@@ -9,6 +9,7 @@
 //! backpressure to the camera.
 
 use crate::state::{HealthState, Shared};
+use cleanroom_gpu::{FramePipeline, Gpu};
 use cleanroom_ipc::PipelineStats;
 use cleanroom_video::{Camera, ConsumerWatch, FrameDecoder, LoopbackSink, Yuy2Frame};
 use std::sync::Arc;
@@ -114,6 +115,27 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
     let mut decoder = FrameDecoder::new(mode.width, mode.height)?;
     let mut frame = Yuy2Frame::new(mode.width, mode.height);
 
+    // The GPU. A failure here is reported and the pipeline continues as a CPU
+    // passthrough — the *only* place a CPU path is acceptable, because a camera that
+    // still works without effects beats a camera that does not work. It is reported as
+    // Degraded rather than Nominal so it can never be mistaken for the real thing.
+    let gpu = match Gpu::new(cfg.gpu.render_node.as_deref()) {
+        Ok(g) => {
+            let name = g.choice.to_string();
+            shared.set_gpu_adapter(name);
+            Some(FramePipeline::new(g, mode.width, mode.height))
+        }
+        Err(e) => {
+            shared.set_gpu_adapter(format!("unavailable: {e}"));
+            shared.set_video_health(HealthState::degraded(format!(
+                "no GPU — passing the camera through unmodified: {e}"
+            )));
+            None
+        }
+    };
+    let mut gpu = gpu;
+    let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
+
     // Report the mode we actually got, not the one that was asked for.
     shared.set_video_health(HealthState::nominal(format!(
         "{} -> {} ({})",
@@ -177,9 +199,28 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
         decoder.to_yuy2(raw.data, raw.format, raw.width, raw.height, &mut frame)?;
         let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-        sink.write(&frame.data)?;
+        // Effects. Read the live config each frame so a blur-strength change takes effect
+        // on the very next frame rather than at the next restart.
+        let gpu_ms = match gpu.as_mut() {
+            Some(pipe) => {
+                let t1 = Instant::now();
+                pipe.process(
+                    &frame.data,
+                    &mut processed,
+                    now_cfg.video.background,
+                    now_cfg.video.blur_strength,
+                    now_cfg.video.mirror,
+                );
+                sink.write(&processed)?;
+                t1.elapsed().as_secs_f64() * 1000.0
+            }
+            None => {
+                sink.write(&frame.data)?;
+                0.0
+            }
+        };
 
-        stats.record(decode_ms);
+        stats.record(decode_ms, gpu_ms);
         stats.publish_if_due(shared, consumers, false);
     }
 
@@ -190,6 +231,7 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
 struct StatsAccumulator {
     frames: u64,
     decode_ms_total: f64,
+    gpu_ms_total: f64,
     since: Instant,
 }
 
@@ -198,13 +240,15 @@ impl StatsAccumulator {
         Self {
             frames: 0,
             decode_ms_total: 0.0,
+            gpu_ms_total: 0.0,
             since: Instant::now(),
         }
     }
 
-    fn record(&mut self, decode_ms: f64) {
+    fn record(&mut self, decode_ms: f64, gpu_ms: f64) {
         self.frames += 1;
         self.decode_ms_total += decode_ms;
+        self.gpu_ms_total += gpu_ms;
     }
 
     fn publish_if_due(&mut self, shared: &Arc<Shared>, consumers: Option<u32>, idle: bool) {
@@ -225,11 +269,13 @@ impl StatsAccumulator {
             // until there is actually a GPU stage — reporting a number there before then
             // would be inventing data.
             s.decode_ms = self.decode_ms_total / self.frames as f64;
+            s.gpu_ms = self.gpu_ms_total / self.frames as f64;
         }
         shared.set_stats(s);
 
         self.frames = 0;
         self.decode_ms_total = 0.0;
+        self.gpu_ms_total = 0.0;
         self.since = Instant::now();
     }
 }

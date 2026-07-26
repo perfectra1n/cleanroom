@@ -4,6 +4,7 @@ members = [
     "crates/cleanroom-audio",
     "crates/cleanroom-core",
     "crates/cleanroom-gpu",
+    "crates/cleanroom-gui",
     "crates/cleanroom-ipc",
     "crates/cleanroom-video",
     "crates/cleanroomd",

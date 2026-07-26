@@ -1038,6 +1038,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cleanroom-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cleanroom-core",
+ "cleanroom-ipc",
+ "slint",
+ "slint-build",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zbus",
+]
+
+[[package]]
 name = "cleanroom-ipc"
 version = "0.1.0"
 dependencies = [
@@ -1067,6 +1082,7 @@ dependencies = [
  "anyhow",
  "cleanroom-audio",
  "cleanroom-core",
+ "cleanroom-gpu",
  "cleanroom-ipc",
  "cleanroom-video",
  "serde",
@@ -5762,16 +5778,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "socket2"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "socks"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6276,14 +6282,11 @@ version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
 dependencies = [
- "bytes",
  "libc",
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
  "tokio-macros",
- "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -7953,7 +7956,6 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_repr",
- "tokio",
  "tracing",
  "uds_windows",
  "uuid",

@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Name=Cleanroom
+GenericName=Camera and Microphone Effects
+Comment=Background blur and neural noise suppression for your camera and microphone
+Icon=io.github.perfectra1n.Cleanroom
+Exec=cleanroom-gui
+Terminal=false
+Categories=AudioVideo;Video;Settings;
+Keywords=camera;webcam;microphone;blur;background;noise;denoise;
+StartupNotify=true
+
+# The filename, the Icon= value and the GUI's Wayland app_id must all be the same string.
+# Wayland has no WM_CLASS, so app_id is the only identity a compositor gets, and it looks
+# up <app_id>.desktop to find the icon. A mismatch means a generic placeholder in every
+# taskbar, dock and alt-tab.
+StartupWMClass=io.github.perfectra1n.Cleanroom
+
+# Deliberately NO OnlyShowIn or NotShowIn.
+#
+# The desktop-environment registry contains no entry for Hyprland, sway, niri or river, so
+# either key would exclude every wlroots compositor — including the one this was developed
+# on. Setting neither is the only portable choice.
+#
+# Deliberately NO X-GNOME-Autostart-Phase either: any value other than "Application" is
+# fatal on GNOME 49+, and it makes systemd's xdg-autostart generator emit no unit at all.

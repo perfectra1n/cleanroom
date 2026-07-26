@@ -14,6 +14,7 @@ path = "src/main.rs"
 cleanroom-core = { path = "../cleanroom-core" }
 cleanroom-ipc = { path = "../cleanroom-ipc" }
 cleanroom-audio = { path = "../cleanroom-audio" }
+cleanroom-gpu = { path = "../cleanroom-gpu" }
 cleanroom-video = { path = "../cleanroom-video" }
 
 anyhow.workspace = true
@@ -22,7 +23,17 @@ tracing-subscriber.workspace = true
 tracing-journald = "0.3"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+# zbus with its DEFAULT (async-io) executor, deliberately not features = ["tokio"].
+#
+# Enabling zbus's tokio feature switches its executor globally for the whole build graph,
+# and `accesskit_unix` — which Slint uses for the AT-SPI accessibility bridge — runs its
+# own async-io executor on its own thread and calls zbus from there. With the tokio feature
+# on, that call panics ("there is no reactor running") and the accessibility bridge dies,
+# silently taking screen-reader support with it. Verified from a backtrace.
+#
+# zbus does not need the feature: without it, it runs its own small executor, which
+# coexists fine with our tokio runtime.
+zbus = "5"
 toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

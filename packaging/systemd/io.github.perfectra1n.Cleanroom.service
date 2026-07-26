@@ -1,0 +1,6 @@
+[D-BUS Service]
+Name=io.github.perfectra1n.Cleanroom
+Exec=/usr/bin/cleanroomd
+# Hands activation to systemd so the unit's Restart=, Slice= and logging apply, rather than
+# dbus-daemon spawning a bare unsupervised process.
+SystemdService=cleanroomd.service

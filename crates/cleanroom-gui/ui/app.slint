@@ -1,0 +1,281 @@
+import { VerticalBox, HorizontalBox, GroupBox, Button, Slider, CheckBox, ComboBox, Switch, ScrollView } from "std-widgets.slint";
+
+// Health, mirroring cleanroom_ipc::Health. Kept as a plain int rather than a Slint enum
+// because it crosses the D-Bus boundary as a string and the Rust side does the mapping
+// once, in one place.
+//   0 nominal   1 degraded   2 failed   3 idle
+
+// Helper, not a window: deliberately not exported, or the compiler warns that no code
+// will be generated for it.
+component StatusRow inherits HorizontalBox {
+    in property <string> label;
+    in property <int> health: 3;
+    in property <string> detail;
+
+    spacing: 8px;
+    Text {
+        text: root.label;
+        font-weight: 700;
+        width: 56px;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        y: (parent.height - self.height) / 2;
+        background: root.health == 0 ? #3fb950
+                  : root.health == 1 ? #d29922
+                  : root.health == 2 ? #f85149
+                  : #6e7681;
+    }
+    Text {
+        text: root.detail;
+        vertical-alignment: center;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Cleanroom";
+    preferred-width: 560px;
+    preferred-height: 620px;
+    icon: @image-url("../icons/cleanroom.png");
+
+    // --- state pushed from Rust ---
+    in property <int> video-health: 3;
+    in property <string> video-detail: "connecting…";
+    in property <int> audio-health: 3;
+    in property <string> audio-detail: "connecting…";
+    in property <string> gpu-adapter: "—";
+    in property <string> vcam-path: "—";
+
+    in property <float> fps: 0;
+    in property <float> decode-ms: 0;
+    in property <float> gpu-ms: 0;
+    in property <int> consumers: 0;
+    in property <float> mic-in-db: -100;
+    in property <float> mic-out-db: -100;
+
+    in property <bool> connected: false;
+
+    // --- controls, two-way ---
+    in-out property <int> background-mode: 1;   // 0 off, 1 blur, 2 replace, 3 remove
+    in-out property <float> blur-strength: 0.6;
+    in-out property <bool> mirror: false;
+    in-out property <bool> denoise: true;
+    in-out property <float> attenuation: 40;
+
+    callback set-background(int);
+    callback set-blur(float);
+    callback set-mirror(bool);
+    callback set-denoise(bool);
+    callback set-attenuation(float);
+    callback quit-daemon();
+
+    // Wrapped in a ScrollView because the content is taller than the window on a
+    // default-sized launch — without it the Performance panel is simply cut off, with no
+    // indication that anything is missing.
+    ScrollView {
+        VerticalBox {
+        padding: 16px;
+        spacing: 14px;
+
+        // Degradation is surfaced at the top and unmissable. The entire point of tracking
+        // health explicitly is that somebody sees it.
+        if !root.connected || root.video-health == 1 || root.video-health == 2
+                           || root.audio-health == 1 || root.audio-health == 2 : Rectangle {
+            background: !root.connected ? #6e768120 : #d2992220;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: !root.connected ? #6e7681 : #d29922;
+            height: banner.preferred-height + 16px;
+            banner := VerticalBox {
+                padding: 8px;
+                Text {
+                    text: !root.connected
+                        ? "Not connected to the Cleanroom daemon. Start it with: cleanroomd"
+                        : "Running degraded — see the detail below.";
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Status";
+            VerticalBox {
+                spacing: 6px;
+                StatusRow { label: "Video"; health: root.video-health; detail: root.video-detail; }
+                StatusRow { label: "Audio"; health: root.audio-health; detail: root.audio-detail; }
+                HorizontalBox {
+                    Text { text: "GPU"; font-weight: 700; width: 56px; }
+                    Text { text: root.gpu-adapter; wrap: word-wrap; horizontal-stretch: 1; }
+                }
+                HorizontalBox {
+                    Text { text: "Camera"; font-weight: 700; width: 56px; }
+                    Text { text: root.vcam-path; horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Background";
+            VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 8px;
+                    Button {
+                        text: "Off";
+                        primary: root.background-mode == 0;
+                        clicked => { root.background-mode = 0; root.set-background(0); }
+                    }
+                    Button {
+                        text: "Blur";
+                        primary: root.background-mode == 1;
+                        clicked => { root.background-mode = 1; root.set-background(1); }
+                    }
+                    Button {
+                        text: "Replace";
+                        primary: root.background-mode == 2;
+                        clicked => { root.background-mode = 2; root.set-background(2); }
+                    }
+                    Button {
+                        text: "Green";
+                        primary: root.background-mode == 3;
+                        clicked => { root.background-mode = 3; root.set-background(3); }
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Strength"; width: 70px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0; maximum: 1;
+                        value <=> root.blur-strength;
+                        enabled: root.background-mode == 1;
+                        // Applied on the very next frame — no restart, no dropped frames.
+                        released(v) => { root.set-blur(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.blur-strength * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalBox {
+                    CheckBox {
+                        text: "Mirror my video";
+                        checked <=> root.mirror;
+                        toggled => { root.set-mirror(self.checked); }
+                    }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Microphone";
+            VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    Switch {
+                        text: "Noise suppression (DeepFilterNet)";
+                        checked <=> root.denoise;
+                        toggled => { root.set-denoise(self.checked); }
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Strength"; width: 70px; vertical-alignment: center; }
+                    Slider {
+                        // Capped below 100 deliberately: DeepFilterNet reads >= 100 dB as
+                        // "no limit at all", so a slider that reached it would silently
+                        // turn the limiter off at exactly the point a user expects maximum.
+                        minimum: 6; maximum: 90;
+                        value <=> root.attenuation;
+                        enabled: root.denoise;
+                        released(v) => { root.set-attenuation(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.attenuation) + " dB";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                // The gap between the two is the suppression actually being applied,
+                // which is more informative than either number alone.
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Level"; width: 70px; vertical-alignment: center; }
+                    Text {
+                        text: Math.round(root.mic-in-db) + " dBFS in  →  "
+                            + Math.round(root.mic-out-db) + " dBFS out";
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Performance";
+            HorizontalBox {
+                spacing: 18px;
+                Text { text: Math.round(root.fps * 10) / 10 + " fps"; }
+                Text { text: "decode " + Math.round(root.decode-ms * 100) / 100 + " ms"; }
+                Text { text: "gpu " + Math.round(root.gpu-ms * 100) / 100 + " ms"; }
+                Text {
+                    text: root.consumers == 0
+                        ? "idle — camera released"
+                        : root.consumers + " app(s) using the camera";
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+        }
+    }
+}
+
+// The tray icon is a separate top-level component: it has no window of its own, and the
+// only UI it presents is its menu.
+//
+// Whether it appears at all depends entirely on the desktop. GNOME ships no SNI host, and
+// a bare wlroots session often has none either. So the tray is treated as decoration —
+// closing the window quits the GUI rather than hiding it into a tray that may not exist,
+// and every action here is also reachable from `cleanroom-ctl`.
+export component Tray inherits SystemTrayIcon {
+    icon: @image-url("../icons/cleanroom.png");
+    tooltip: "Cleanroom";
+
+    callback show-window();
+    callback toggle-blur();
+    callback toggle-denoise();
+    callback quit();
+
+    in property <bool> blur-on: true;
+    in property <bool> denoise-on: true;
+
+    Menu {
+        MenuItem {
+            title: "Open Cleanroom";
+            activated => { root.show-window(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: root.blur-on ? "Background blur: on" : "Background blur: off";
+            activated => { root.toggle-blur(); }
+        }
+        MenuItem {
+            title: root.denoise-on ? "Noise suppression: on" : "Noise suppression: off";
+            activated => { root.toggle-denoise(); }
+        }
+        MenuSeparator {}
+        MenuItem {
+            title: "Quit";
+            activated => { root.quit(); }
+        }
+    }
+}

@@ -1,19 +1,29 @@
 [package]
-name = "cleanroom-ctl"
-description = "Command-line control for the Cleanroom daemon."
+name = "cleanroom-gui"
+description = "Cleanroom's control panel and tray icon."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "cleanroom-ctl"
+name = "cleanroom-gui"
 path = "src/main.rs"
 
 [dependencies]
+cleanroom-core = { path = "../cleanroom-core" }
 cleanroom-ipc = { path = "../cleanroom-ipc" }
+
 anyhow.workspace = true
-tokio = { version = "1", features = ["rt", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# `system-tray` and `accessibility` are already in Slint's default features; named here
+# so a future default-features=false cannot silently drop the tray or screen-reader
+# support without the change being visible in this file.
+slint = { version = "1.17", features = ["system-tray", "accessibility"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 # zbus with its DEFAULT (async-io) executor, deliberately not features = ["tokio"].
 #
 # Enabling zbus's tokio feature switches its executor globally for the whole build graph,
@@ -25,4 +35,6 @@ tokio = { version = "1", features = ["rt", "macros"] }
 # zbus does not need the feature: without it, it runs its own small executor, which
 # coexists fine with our tokio runtime.
 zbus = "5"
-clap = { version = "4", features = ["derive"] }
+
+[build-dependencies]
+slint-build = "1.17"

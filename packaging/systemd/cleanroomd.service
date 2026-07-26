@@ -1,0 +1,31 @@
+[Unit]
+Description=Cleanroom camera and microphone effects daemon
+Documentation=https://github.com/perfectra1n/cleanroom
+
+# PartOf and After, not just WantedBy. Wants/WantedBy imply no ordering at all, so without
+# After= this races the session's environment import and can start before WAYLAND_DISPLAY,
+# XDG_RUNTIME_DIR and the PipeWire socket exist.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+# Type=dbus with BusName means systemd considers the unit started once the name is taken,
+# and — with the matching .service file in dbus-1/services — lets the daemon be activated
+# on demand by anything that talks to it, including on desktops that never reach
+# graphical-session.target.
+Type=dbus
+BusName=io.github.perfectra1n.Cleanroom
+ExecStart=/usr/bin/cleanroomd
+
+# on-failure, never always. The single-instance guard exits 0 when it loses the name race,
+# and Restart=always would turn that normal outcome into an endless restart loop.
+Restart=on-failure
+RestartSec=3
+
+# Effects are a background convenience, not something that should compete with the
+# meeting app it is feeding.
+Slice=background.slice
+Nice=-5
+
+[Install]
+WantedBy=graphical-session.target
