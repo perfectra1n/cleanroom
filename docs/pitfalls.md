@@ -198,7 +198,7 @@ This caught a real fault within an hour of being written (Dawn could not find
 Note `ort::ep`, not `ort::execution_providers` (deprecated), and `error_on_failure()` is on
 the **dispatch** returned by `build()`, not on the EP.
 
-### Dropping a session that owns a Dawn context segfaults
+### Dropping a session that owns a Dawn context segfaults — *at process exit*, not in `drop`
 
 Reproducible on both Nvidia and AMD, **after** all inference succeeds. Under
 `Restart=on-failure` a segfault at exit is a failed exit, so every clean shutdown becomes a
@@ -214,11 +214,47 @@ impl Drop for Matter {
 }
 ```
 
+Measured precisely by `examples/teardown_check.rs`, which exists so this can be re-tested
+against a new driver, `ort` or Dawn without editing library code:
+
+```sh
+nix develop -c cargo run --release -p cleanroom-matting --example teardown_check
+# ...
+# dropping the session for real...
+# INFO ort::logging: WebGPU device lost (2): Device was destroyed.
+# SURVIVED — a controlled teardown works; the leak in Drop can be removed.
+# exit: 139
+```
+
+Note what that says. The **drop itself completes** — Dawn reports the device destroyed and
+the program runs to the end of `main`. The SIGSEGV lands *afterwards*, during process
+teardown, in global destructors. So `mem::forget` does not avoid a crash inside `drop`; it
+prevents ORT's destructor from ever running, which leaves Dawn's own exit-time cleanup with
+nothing to trip over.
+
+That distinction matters if you try to fix this: an ordered shutdown inside the daemon will
+not help, because the fault is not in the ordering of *our* drops. Control: the default
+(leaking) path exits `0` — `cargo run --example two_sessions` confirms it.
+
+`CLEANROOM_DROP_ORT_SESSION=1` switches any binary to the honest path for testing.
+
 ### Creating two such sessions *concurrently* aborts (SIGABRT)
 
 Sequentially is fine — `crates/cleanroom-matting/examples/two_sessions.rs` proves it. But
 cargo runs tests on parallel threads, so **the two model-dependent tests are deliberately
 merged into one**. Splitting them reintroduces the crash.
+
+A comment cannot enforce that, so `Matter::new` now takes a process-wide mutex across
+construction only:
+
+```rust
+static SESSION_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// in Matter::new, before building the session:
+let _serialise = SESSION_INIT.lock().unwrap_or_else(|e| e.into_inner());
+```
+
+An abort is not catchable and unwinds nothing, so the failure mode is a CI job that dies
+with no stack and no test name. Serialising makes a second caller slow rather than fatal.
 
 ### RVM's reused symbolic dimensions
 
@@ -338,6 +374,42 @@ because if that drifts the count becomes plausible nonsense rather than an obvio
 
 **Contract: unknown counts as in-use.** A detection failure must never blank a camera
 mid-call.
+
+### A solid green frame means "zeroed buffer", not "green-screen mode"
+
+All-zero YUY2 decodes to mid-green through BT.601 limited range, because `Y=0` clamps to
+black luma while `U=V=0` puts both chroma channels at −128:
+
+```
+G = 1.164(0-16) - 0.813(0-128) - 0.391(0-128) ≈ 135     R, B clamp to 0
+```
+
+This is almost exactly what `BackgroundMode::Remove` produces on purpose, so the two are
+easy to confuse. If a consumer shows green, check whether it is receiving buffers the
+producer never wrote before assuming the mode is wrong.
+
+### Changing the capture geometry green-screens consumers that are already streaming
+
+V4L2 has no mid-stream format renegotiation. An app that negotiated 1920x1080 and is
+mid-`STREAMON` cannot follow the producer to 1280x720; it keeps dequeuing buffers that are
+never filled and shows the green above — measured at **207 of 360 frames, with no
+recovery** across a `set video.width` while `ffmpeg` was reading.
+
+Same-geometry restarts are fine. So the restart predicate must stay as narrow as possible
+(`needs_restart` in `video_pipeline.rs`, unit-tested both ways): blur strength, mirror,
+power save and Blur/Replace/Remove are all read per-frame and must never restart, because a
+restart is visible to everyone in the call.
+
+### Testing a v4l2loopback device wedges it
+
+Rapid producer open/close cycles leave the node in a state where a consumer opens it
+successfully, receives **exactly one frame**, then hits EOF — while the daemon reports "no
+consumers" and never wakes from power save. It looks exactly like a broken change.
+
+It is not: an A/B/A against an unmodified `HEAD` build in a throwaway `git worktree` gave
+300 frames / 1 frame / 300 frames for the same binaries, i.e. the variable was the device,
+not the code. Before concluding a change broke frame delivery, re-run the *old* binary
+under the *current* device state.
 
 ### `/dev/v4l2loopback` is root-only
 
@@ -541,6 +613,15 @@ Verified working on quickshell: item `Active`, 256×256 ARGB pixmap, `/MenuBar` 
 four live items. Slint hardcodes `Id = "slint-tray"` and leaves `Title` empty; `ToolTip` is
 correct and is what hosts show.
 
+`Id` and `Title` are not configurable — they are literals inside `i-slint-backend-winit`,
+not defaults we can override from the `SystemTrayIcon` element. Most hosts key off `ToolTip`
+for display, so the visible result is right, but a host that matches on `Id` sees
+`slint-tray` and cannot tell Cleanroom from any other Slint app.
+
+Living with it is deliberate. The alternative is driving `ksni` directly, which means
+re-implementing the menu by hand and giving up the live property binding that keeps the tray
+labels agreeing with the window — a real regression in exchange for a cosmetic fix.
+
 ### Reading the tray menu to check it
 
 ```sh
@@ -578,6 +659,26 @@ at boot with no session.
 - **No `X-GNOME-Autostart-Phase`.** Any value but `Application` is fatal on GNOME 49+, and
   it makes systemd's xdg-autostart generator emit no unit at all.
 - Absolute `Exec=` — the generator silently emits nothing for a relative path.
+
+### A worker thread that reports its own health cannot report its own death
+
+`run_once` returned `Ok(())` both for "the stop flag is set" and for "config changed, reopen
+the devices", and the caller treated every `Ok` as stop. One `cleanroom-ctl set
+video.width` therefore ended the video thread permanently: camera and loopback fds dropped,
+the node reverted to output-only, and every app lost the camera.
+
+The reason it went unnoticed for so long is the reporting, not the control flow. Health is
+only ever *written* by that thread, so once it was gone the daemon kept serving the last
+value it had published — `[idle] no consumers; camera released (virtual camera still
+present)` — indefinitely. Plausible, reassuring, and false.
+
+```rust
+enum Outcome { Stopped, Restart }   // not Ok(())
+```
+
+The general lesson: a component whose liveness is only visible through state *it* publishes
+has no way to say "I died". Either the type system distinguishes the exits, or something
+outside the thread has to notice it stopped.
 
 ### `Restart=on-failure`, never `always`
 

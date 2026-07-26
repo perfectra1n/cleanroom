@@ -139,8 +139,27 @@ pub struct Matter {
     frames: u64,
 }
 
+/// Serialises session construction, process-wide.
+///
+/// Creating two ONNX Runtime sessions that each own a WebGPU/Dawn context *concurrently*
+/// aborts the process with SIGABRT — not an error, not a panic, an abort with no unwinding
+/// and nothing to catch. Sequential construction is fine, proven by `examples/two_sessions.rs`.
+///
+/// This was previously guarded only by a comment and by the two model-dependent tests being
+/// deliberately merged into one, because cargo runs tests on parallel threads. That works
+/// right up until somebody splits the test back apart or adds a second caller, at which
+/// point the failure is a hard abort in CI with no stack. A mutex makes the constraint
+/// something the program enforces rather than something a reader has to know.
+///
+/// It is held across construction only, never across inference.
+static SESSION_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Matter {
     pub fn new(model: &Path) -> Result<Self, MattingError> {
+        // Poisoning is irrelevant here: the guard protects an external library's global
+        // initialisation, not any state of ours, so a previous panic leaves nothing invalid.
+        let _serialise = SESSION_INIT.lock().unwrap_or_else(|e| e.into_inner());
+
         // `.error_on_failure()` is the single most important call here. Without it ort
         // silently registers nothing and runs on the CPU, and the pipeline would appear to
         // work while missing its budget by 10x — the exact silent degradation this project
@@ -300,8 +319,18 @@ impl Drop for Matter {
         //
         // Leaking is the correct trade here: a Matter lives for the life of a pipeline, the
         // memory is reclaimed by the OS at exit, and the alternative is a crash loop.
+        //
+        // `CLEANROOM_DROP_ORT_SESSION=1` takes the honest path instead, so the defect can be
+        // re-tested on a new driver, a new ort, or a new Dawn without editing this file.
+        // `examples/teardown_check.rs` is the harness. If it ever exits 0, this leak can go —
+        // see docs/pitfalls.md for what has already been tried.
         if let Some(session) = self.session.take() {
-            std::mem::forget(session);
+            if std::env::var_os("CLEANROOM_DROP_ORT_SESSION").is_some() {
+                tracing::warn!("dropping the ORT session deliberately; this may segfault");
+                drop(session);
+            } else {
+                std::mem::forget(session);
+            }
         }
     }
 }

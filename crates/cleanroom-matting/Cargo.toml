@@ -31,3 +31,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = [
     "api-24",
     "webgpu",
 ] }
+
+[dev-dependencies]
+# The teardown_check example needs a subscriber to show the deliberate-drop warning.
+tracing-subscriber.workspace = true
