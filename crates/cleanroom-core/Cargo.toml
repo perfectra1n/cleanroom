@@ -1,0 +1,16 @@
+[package]
+name = "cleanroom-core"
+description = "Cleanroom configuration schema and effect parameters. Pure data — no I/O beyond config persistence."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+thiserror = "2"
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
