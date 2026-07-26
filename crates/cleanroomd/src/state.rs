@@ -132,8 +132,25 @@ impl Shared {
         }
     }
 
+    /// Update only the microphone fields, leaving the video telemetry alone. The two
+    /// pipelines publish independently and must not clobber each other.
+    pub fn update_mic_levels(&self, in_db: f32, out_db: f32) {
+        if let Ok(mut s) = self.stats.write() {
+            s.mic_level_db = in_db;
+            s.mic_level_out_db = out_db;
+        }
+    }
+
     pub fn set_stats(&self, s: PipelineStats) {
-        *self.stats.write().expect("stats lock poisoned") = s;
+        let mut guard = self.stats.write().expect("stats lock poisoned");
+        // Preserve the audio fields: the video thread owns everything else, and a plain
+        // overwrite here would make the mic meters flicker to zero once a second.
+        let (mic_in, mic_out) = (guard.mic_level_db, guard.mic_level_out_db);
+        *guard = PipelineStats {
+            mic_level_db: mic_in,
+            mic_level_out_db: mic_out,
+            ..s
+        };
     }
 
     pub fn set_gpu_adapter(&self, s: impl Into<String>) {

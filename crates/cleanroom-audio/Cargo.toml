@@ -10,8 +10,27 @@ rust-version.workspace = true
 cleanroom-core = { path = "../cleanroom-core" }
 thiserror = "2"
 tracing.workspace = true
+anyhow.workspace = true
+
+# v1_2_0 is the newest API level the bindings expose. Without a version feature the
+# constructors have different signatures entirely and TARGET_OBJECT does not exist.
 pipewire = { version = "0.10", features = ["v1_2_0"] }
 libspa = "0.10"
+
+# The real DeepFilterNet, pinned to a tag. NOT the `deep_filter` crate on crates.io —
+# that is a different, useless package containing only an HDF5 training dataloader
+# (0.2.5, published 2022: no DfTract, no weights, 58 KB). The library name is `df`.
+#
+# default-features = false is essential. It drops vorbis/flac and, above all, avoids the
+# `dataset` feature, which pulls in a git dependency on hdf5-rust that cargo refuses to
+# publish. `default-model` is deliberately NOT enabled: that would embed the weights via
+# include_bytes!, and upstream has never granted a licence for them (issue #697,
+# unanswered). We load them from a path at runtime instead.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = [
+    "tract",
+] }
+# Must match the version deep_filter uses — ArrayView2 is in its public call path.
+ndarray = "0.15"
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

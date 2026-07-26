@@ -3,6 +3,7 @@
 //! Owns the camera, the microphone and the GPU, and outlives the GUI. Everything is
 //! driven over the D-Bus session bus so the GUI, the CLI and `busctl` are equal.
 
+mod audio_pipeline;
 mod doctor;
 mod service;
 mod settings;
@@ -90,6 +91,22 @@ async fn main() -> Result<()> {
     // Started after the name is held, so a losing second instance never touches the
     // camera. Failures inside surface as health over D-Bus rather than as a dead daemon.
     let mut video = video_pipeline::VideoPipeline::start(shared.clone());
+    let mut audio = audio_pipeline::AudioPipeline::start(shared.clone());
+
+    // Fold the audio levels into the published stats. The video thread owns the rest of
+    // PipelineStats, so this only touches the two mic fields.
+    {
+        let shared = shared.clone();
+        let levels = audio.level_handle();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let (i, o) = levels.dbfs();
+                shared.update_mic_levels(i, o);
+            }
+        });
+    }
 
     run_until_shutdown(&shared).await;
 
@@ -104,6 +121,7 @@ async fn main() -> Result<()> {
     // Joined, not detached: the thread owns the camera and the loopback fd, and exiting
     // while it still holds them leaves the device half-streaming for the next process.
     video.shutdown();
+    audio.shutdown();
     drop(connection);
     tracing::info!("clean exit");
     Ok(())
