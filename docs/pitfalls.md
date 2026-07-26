@@ -176,16 +176,29 @@ whole frame is blurred, the subject included. It looks fine while somebody walks
 room and fails once they sit still, which is to say it fails during an actual video call and
 passes every casual test.
 
-**Cause:** ONNX Runtime 1.24.2's WebGPU provider degrades RVM's recurrent state on every
-frame hand-off. The same still frame, fed repeatedly through each provider:
+**Cause:** ONNX Runtime's WebGPU provider computes this model wrong. The same still frame,
+fed repeatedly through each provider:
 
 | pass | 1 | 2 | 3 | 5 | 10 |
 |------|---|---|---|---|----|
 | WebGPU mean alpha | 0.039 | 0.027 | 0.018 | 0.005 | **0.002** |
 | CPU mean alpha | 0.227 | 0.227 | 0.227 | 0.227 | **0.227** |
 
+Read the first column before the trend: **pass 1 is already wrong**, with an all-zero
+`(1,1,1,1)` state that both providers share, so this is a fault in the *forward* pass and
+not in the recurrent hand-off. The recurrence only feeds an already-wrong result back into
+itself, which is what drives it to zero over the following seconds — and that is why the
+symptom looks like "it works until you sit still".
+
 Alpha ≈ 0 means "every pixel is background", so the composite blurs everything. Nothing
 errors, the session builds, and `matting_ms` looks excellent — 7 ms against the CPU's 39 ms.
+
+**A newer runtime does not fix it.** ONNX Runtime 1.27.0 — a native WebGPU build with Dawn
+statically linked, taken from the `onnxruntime-webgpu` PyPI manylinux wheel and loaded
+through `ort`'s `load-dynamic` with `ORT_DYLIB_PATH` — returns **bit-identical** wrong
+output to the pinned 1.24.2. Three minor versions apart, the same 0.002 / 0.185. That wheel
+is the cheapest way to re-test this in future: no building, no Dawn, just point the env var
+at the `.so` and run `matte_sweep`.
 
 Ruled out, each by measurement rather than reasoning: `downsample_ratio` (wrong at 1.0, 0.5
 and 0.25), input resolution (wrong at 512x288 and 1920x1080), and adapter selection
@@ -226,6 +239,19 @@ max 0.185 — on the same frame where the CPU provider returns 0.227 / 1.000:
 | Resize rewritten | `half_pixel`, `asymmetric` | not the coordinate mode |
 | HardSigmoid rewritten | `Clip(alpha*x + beta, 0, 1)` | not the non-default alpha (1/6) |
 | Split rewritten | axis `-3` normalised to `1` | not negative-axis handling |
+| recurrent state seed | full-size zeros instead of `(1,1,1,1)` | not the `Expand` broadcast |
+| ONNX Runtime version | 1.24.2 and 1.27.0 | not a fixed-since bug |
+
+`auto_pad` is ruled out by inspection rather than experiment: all 85 Convs use explicit
+pads (`NOTSET`) and none combines `auto_pad` with a stride above 1, so ORT issue #26734
+does not apply here.
+
+The prime remaining suspect is **depthwise/grouped Conv**. The model has 19 depthwise
+convolutions and grouped convolutions at group 4, 16, 64, 72, 120, 184, 200, 240, 480, 672
+and 960 — MobileNetV3's inverted residual blocks — and those take a different kernel path
+in the WebGPU EP from dense convolution. Upstream has a documented pattern of WebGPU Conv
+correctness bugs (microsoft/onnxruntime #26734, #24442, #24070). Confirming it needs a
+minimal reproducer: one depthwise Conv in a two-node model, run on both providers.
 
 Each graph rewrite is an exact identity, and each was confirmed a no-op by re-running it on
 the CPU provider, which returned 0.227 unchanged. `scratchpad`-style helpers for this live

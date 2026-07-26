@@ -142,8 +142,30 @@ fn main() {
     }
 
     // Same seed the daemon uses: a (1,1,1,1) zero tensor asks RVM to shape its own state.
-    let mut state: Vec<(Vec<i64>, Vec<f32>)> =
-        (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0f32])).collect();
+    //
+    // `CR_PRESEED=1` instead hands over zero tensors already at full size. RVM reaches the
+    // first from the second with an `Expand`, which is visible in the Dawn program log — so
+    // if the broadcast is what the provider gets wrong, the state is corrupt from frame one
+    // and compounds, and seeding around it is both the diagnosis and the fix.
+    let preseed = env("CR_PRESEED").is_some();
+    let mut state: Vec<(Vec<i64>, Vec<f32>)> = if preseed {
+        // RVM-mobilenetv3's recurrent channels, at 1/2, 1/4, 1/8 and 1/16 of the input.
+        [(16, 2), (20, 4), (40, 8), (64, 16)]
+            .iter()
+            .map(|(c, div)| {
+                let (rh, rw) = ((h as i64) / div, (w as i64) / div);
+                (
+                    vec![1, *c as i64, rh, rw],
+                    vec![0.0f32; (c * (rh * rw) as i64) as usize],
+                )
+            })
+            .collect()
+    } else {
+        (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0f32])).collect()
+    };
+    if env("CR_SHAPES").is_some() {
+        eprintln!("[s] seed shapes {:?}", state.iter().map(|s| &s.0).collect::<Vec<_>>());
+    }
 
     // Optional 6th argument: how many frames to run. The default settles the recurrent
     // state; a larger count is how the steady-state per-frame cost is measured, since
