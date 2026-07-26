@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/cleanroom-audio",
     "crates/cleanroom-core",
     "crates/cleanroom-ipc",
     "crates/cleanroom-video",
