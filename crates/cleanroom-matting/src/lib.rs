@@ -31,8 +31,31 @@ use std::path::{Path, PathBuf};
 pub const INFER_W: u32 = 512;
 pub const INFER_H: u32 = 288;
 
-/// RVM's internal downsample ratio. 0.25 is the reference default for HD.
-const DOWNSAMPLE_RATIO: f32 = 0.25;
+/// RVM's internal downsample ratio, derived rather than hardcoded.
+///
+/// This is the scale RVM applies *internally*, before its encoder; the deep guided filter
+/// then refines the result back up to `src`'s resolution. Upstream's rule is to choose it
+/// so the **downsampled** width lands between 256 and 512 px.
+///
+/// The widely-quoted 0.25 is the value for a **1920**-wide `src`. Ours is already
+/// `INFER_W` wide, so reusing 0.25 here ran the encoder at 128x72 — a quarter of the
+/// intended linear resolution, which is exactly the "soft, unstable edge" failure. Writing
+/// it as a formula means the correct value follows automatically if `INFER_W` ever moves.
+///
+/// Measured in the daemon at 1920x1080/30, RTX 5090, as `matting_ms` (which also covers
+/// the matte readback, so it is not comparable to the spike's bare inference number):
+///
+/// | ratio | encoder input | matting_ms | fps |
+/// |-------|---------------|------------|-----|
+/// | 0.25  | 128x72        | 7.60       | 30.0 |
+/// | 1.00  | 512x288       | 9.03-10.13 | 30.0 |
+///
+/// ~2 ms for 4x the segmentation resolution, inside a 33 ms budget. Worth it.
+const DOWNSAMPLE_RATIO: f32 = if INFER_W > 512 {
+    512.0 / INFER_W as f32
+} else {
+    1.0
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MattingError {
@@ -156,12 +179,21 @@ impl Matter {
         })
     }
 
-    /// Reset the recurrent state.
+    /// Reset the recurrent state, as if no frame had ever been seen.
     ///
     /// Must be called when the input geometry changes: the state tensors are shaped from
-    /// the first frame, and feeding a different size afterwards is a shape error.
+    /// the first frame, and feeding a different size afterwards is a shape error. It is
+    /// also the right thing to do after any gap in the frame stream — power save releasing
+    /// the camera, a suspend, a run of inference errors — because the recurrent state
+    /// encodes "what the scene looked like a frame ago", and after an arbitrary gap that is
+    /// a statement about a scene that no longer exists.
+    ///
+    /// `prev_alpha` is reset too. It is what the degenerate-alpha guard substitutes for a
+    /// rejected frame, so leaving a stale matte behind means the first bad frame after a
+    /// reset composites the *old* scene's silhouette onto the new one.
     pub fn reset(&mut self) {
         self.state = (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0f32])).collect();
+        self.prev_alpha.fill(255);
         self.frames = 0;
     }
 
@@ -299,6 +331,24 @@ mod tests {
         assert!(m.contains("deliberate"), "must not read like a bug: {m}");
     }
 
+    /// Guards a bug that produced a *plausible* matte rather than an error.
+    ///
+    /// `DOWNSAMPLE_RATIO` was 0.25 — correct for a 1920-wide `src`, but ours is `INFER_W`
+    /// wide, so RVM's encoder ran at 128x72 and the deep guided filter upsampled that back
+    /// to 512x288. Nothing failed; the matte was simply built from a quarter of the linear
+    /// detail, which reads as a soft, unstable edge rather than as a fault.
+    ///
+    /// Upstream's rule is that the *downsampled* side should land between 256 and 512.
+    #[test]
+    fn downsample_ratio_keeps_the_encoder_in_rvms_recommended_band() {
+        let effective = INFER_W as f32 * DOWNSAMPLE_RATIO;
+        assert!(
+            (256.0..=512.0).contains(&effective),
+            "encoder would run at {effective}px wide; RVM wants 256..=512 \
+             (INFER_W = {INFER_W}, ratio = {DOWNSAMPLE_RATIO})"
+        );
+    }
+
     /// Both model-dependent checks live in ONE test on purpose.
     ///
     /// Cargo runs tests on parallel threads, and creating two ONNX Runtime sessions that
@@ -368,6 +418,14 @@ mod tests {
         assert!(
             m.state.iter().all(|(shape, _)| shape == &vec![1, 1, 1, 1]),
             "reset must restore the auto-shaping seed"
+        );
+        // …and must not leave the previous scene's matte behind. `prev_alpha` is what the
+        // degenerate-alpha guard substitutes for a rejected frame, so a stale one composites
+        // the *old* silhouette onto the new scene — visible only as a brief wrong cut-out,
+        // which is exactly the kind of fault nobody manages to reproduce on demand.
+        assert!(
+            m.prev_alpha.iter().all(|&v| v == 255),
+            "reset must clear the fallback matte too"
         );
     }
 }

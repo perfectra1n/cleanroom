@@ -111,6 +111,14 @@ async fn status(proxy: &CleanroomProxy<'_>) -> Result<()> {
         "         {} consumer(s) reading the virtual camera",
         st.vcam_consumers
     );
+    // Only shown once it has happened. A permanent "0 rejected" trains people to skip the
+    // line, which is the opposite of what a counter that only matters when non-zero needs.
+    if st.matte_rejected > 0 {
+        println!(
+            "         {} matte(s) rejected as degenerate since startup",
+            st.matte_rejected
+        );
+    }
     println!(
         "audio    mic {:.1} dBFS in -> {:.1} dBFS out",
         st.mic_level_db, st.mic_level_out_db

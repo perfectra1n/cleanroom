@@ -9,6 +9,7 @@
 //! backpressure to the camera.
 
 use crate::state::{HealthState, Shared};
+use cleanroom_core::Config;
 use cleanroom_gpu::{FramePipeline, Gpu};
 use cleanroom_ipc::PipelineStats;
 use cleanroom_matting::{INFER_H, INFER_W, Matter};
@@ -23,9 +24,37 @@ use std::time::{Duration, Instant};
 /// opening the camera sees video within a frame or two rather than after a visible pause.
 const IDLE_POLL: Duration = Duration::from_millis(250);
 
+/// Consecutive matting failures before the recurrent state is cleared.
+///
+/// Small on purpose. The state is cheap to rebuild — RVM re-shapes it on the next frame —
+/// so there is little reason to persevere with one that is producing errors.
+const MATTE_ERROR_RESET: u32 = 30;
+
 pub struct VideoPipeline {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Why [`run_once`] returned.
+///
+/// This exists because the two reasons are indistinguishable as `Ok(())`, and getting them
+/// the wrong way round is silent and fatal: `run_once` returned `Ok(())` both when asked to
+/// stop *and* when a config change needed the devices reopened, and the caller treated
+/// every `Ok` as "stop". So a single `cleanroom-ctl set video.width 1280` ended the video
+/// thread for good — the camera and loopback fds were dropped, the v4l2loopback node
+/// reverted to output-only ("Not a video capture device"), and every app lost the camera.
+///
+/// Nothing reported it, either: health is only written *by* that thread, so the daemon went
+/// on serving the last value it had published, "no consumers; camera released (virtual
+/// camera still present)". Plausible, reassuring and false.
+///
+/// Making the two cases separate variants means the compiler now asks the question.
+#[must_use]
+enum Outcome {
+    /// The stop flag was set. The thread should end.
+    Stopped,
+    /// Something changed that needs the devices reopened. Re-enter `run_once`.
+    Restart,
 }
 
 impl VideoPipeline {
@@ -65,9 +94,24 @@ impl Drop for VideoPipeline {
 }
 
 fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
+    // The Matter outlives every restart of the pipeline below, and that is deliberate.
+    //
+    // `impl Drop for Matter` leaks its ONNX session on purpose, because dropping one that
+    // owns a Dawn context segfaults. That is a fine trade for one session per *process* —
+    // the OS reclaims it at exit — but it was previously a local inside `run_once`, so
+    // every restart leaked a whole Dawn context plus RVM's weights. `set video.width`
+    // twice and you have leaked twice. Restarts here are routine: a config change, a
+    // camera unplug, an Off/Blur toggle.
+    //
+    // Keeping it out here makes the leak per-process again, and makes `Matter::reset()`
+    // load-bearing rather than decorative: the recurrent state now genuinely survives a
+    // restart, so somebody has to say when it is no longer meaningful.
+    let mut matter: Option<Matter> = None;
+
     while !stop.load(Ordering::Relaxed) {
-        match run_once(&shared, &stop) {
-            Ok(()) => return, // asked to stop
+        match run_once(&shared, &stop, &mut matter) {
+            Ok(Outcome::Stopped) => return,
+            Ok(Outcome::Restart) => continue,
             Err(e) => {
                 shared.set_video_health(HealthState::failed(e.to_string()));
                 // Back off before retrying. A camera that was unplugged, or a loopback
@@ -84,7 +128,11 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_once(
+    shared: &Arc<Shared>,
+    stop: &AtomicBool,
+    matter: &mut Option<Matter>,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let cfg = shared.config();
 
     if !cfg.video.enabled {
@@ -92,7 +140,9 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
         while !stop.load(Ordering::Relaxed) && !shared.config().video.enabled {
             std::thread::sleep(IDLE_POLL);
         }
-        return Ok(());
+        // Either video was re-enabled — in which case the devices need opening — or we are
+        // stopping, which the caller's own loop condition catches.
+        return Ok(Outcome::Restart);
     }
 
     // --- open the camera -----------------------------------------------------------
@@ -137,32 +187,54 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
     let mut gpu = gpu;
     let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
 
-    // Matting. Only loaded when a background effect actually needs a matte — with the mode
-    // Off there is nothing to segment, and loading a model to compute an unused alpha would
-    // be pure waste.
+    // Matting. Only *run* when a background effect actually needs a matte — with the mode
+    // Off there is nothing to segment, and computing an unused alpha would be pure waste.
     //
     // A missing model is reported as Degraded rather than failing: blur without a matte is
     // still a working camera, it just has nothing to separate foreground from background.
     // What it must never be is *silently* the same as having one.
-    let mut matter = None;
     let mut matte_rgba = Vec::new();
-    if gpu.is_some() && cfg.video.background != cleanroom_core::BackgroundMode::Off {
-        match cleanroom_matting::find_model().and_then(|m| Matter::new(&m)) {
-            Ok(m) => {
-                if let Some(pipe) = gpu.as_mut() {
-                    pipe.enable_matte_input(INFER_W, INFER_H);
+    let want_matte = gpu.is_some() && cfg.video.background != cleanroom_core::BackgroundMode::Off;
+
+    // Note what does *not* happen when a matte is not wanted: the Matter is not dropped.
+    //
+    // Dropping one reclaims nothing — `Drop for Matter` forgets its session on purpose, so
+    // the ONNX and Dawn resources stay allocated either way — while costing a full model
+    // load and a second Dawn context to come back. Holding it is therefore both cheaper and
+    // simpler, and makes an Off -> Blur toggle instant rather than a reload.
+    if want_matte {
+        if matter.is_none() {
+            match cleanroom_matting::find_model().and_then(|m| Matter::new(&m)) {
+                Ok(m) => *matter = Some(m),
+                Err(e) => {
+                    shared.set_video_health(HealthState::degraded(format!(
+                        "background effects have no subject to separate — matting model \
+                         unavailable: {e}"
+                    )));
                 }
-                matte_rgba = vec![0u8; (INFER_W * INFER_H * 4) as usize];
-                matter = Some(m);
-            }
-            Err(e) => {
-                shared.set_video_health(HealthState::degraded(format!(
-                    "background effects have no subject to separate — matting model \
-                     unavailable: {e}"
-                )));
             }
         }
+
+        if let Some(m) = matter.as_mut() {
+            // Unconditional, including on a freshly constructed Matter. Reaching here means
+            // the pipeline is (re)starting, so whatever the recurrent state describes — a
+            // different resolution, a different camera, or a scene from before an unplug —
+            // is not the scene about to arrive. Feeding stale state across a geometry change
+            // is a hard shape error; across everything else it is a soft one, a few frames
+            // of matte that belong to the previous scene.
+            m.reset();
+            if let Some(pipe) = gpu.as_mut() {
+                pipe.enable_matte_input(INFER_W, INFER_H);
+            }
+            matte_rgba = vec![0u8; (INFER_W * INFER_H * 4) as usize];
+        }
     }
+
+    // Whether to run inference in the loop below. Deliberately not `matter.is_some()`: the
+    // Matter is retained across a switch to Off, so its mere presence no longer means a
+    // matte is wanted. Gating on the wrong one would spend ~9 ms a frame computing an alpha
+    // the composite discards, and would read into a `matte_rgba` that was never sized.
+    let matting_active = want_matte && matter.is_some();
 
     // Report the mode we actually got, not the one that was asked for.
     shared.set_video_health(HealthState::nominal(format!(
@@ -172,21 +244,21 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
 
     let mut stats = StatsAccumulator::new();
     let mut capturing = true;
+    // Last driver sequence number, for detecting frames the camera produced that we never
+    // collected. `None` until the first frame, and reset across a power-save gap, where a
+    // jump is expected rather than a drop.
+    let mut last_sequence: Option<u32> = None;
+    // Consecutive `infer` failures. A single one is a frame not worth crashing over; a run
+    // of them means the recurrent state is wedged and needs clearing.
+    let mut infer_errors: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         // A config change that alters the negotiated mode needs a full restart. Cheap to
         // check, and it keeps `set video.width` working without a daemon restart.
         let now_cfg = shared.config();
-        if !now_cfg.video.enabled
-            || now_cfg.video.device.as_deref().unwrap_or(&cam_path) != cam_path
-            || (now_cfg.video.width, now_cfg.video.height, now_cfg.video.fps)
-                != (cfg.video.width, cfg.video.height, cfg.video.fps)
-            // Switching to or from Off changes whether a matting model is needed at all.
-            || (now_cfg.video.background == cleanroom_core::BackgroundMode::Off)
-                != (cfg.video.background == cleanroom_core::BackgroundMode::Off)
-        {
+        if needs_restart(&cfg, &now_cfg, &cam_path) {
             tracing::info!("video config changed; restarting pipeline");
-            return Ok(());
+            return Ok(Outcome::Restart);
         }
 
         let consumers = watch.poll(Duration::from_millis(0));
@@ -196,6 +268,16 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
             // Someone opened the camera. Resume before they notice.
             cam.start()?;
             capturing = true;
+            // The gap could have been seconds or hours. RVM's recurrent state is a claim
+            // about what the previous frame looked like, and across a gap that long it is a
+            // claim about a scene that has since been left, relit, or walked out of — so it
+            // is worse than no information. The sequence counter jumps across the gap too,
+            // and that is not a dropped frame.
+            if let Some(m) = matter.as_mut() {
+                m.reset();
+            }
+            last_sequence = None;
+            infer_errors = 0;
             shared.set_video_health(HealthState::nominal(format!(
                 "{} -> {} ({})",
                 cam_path, sink.path, mode
@@ -226,6 +308,16 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
             }
         };
 
+        // Frames the driver produced that we never collected. V4L2's sequence number is
+        // the driver's own counter, so a gap is unambiguous — it is the camera outrunning
+        // us, not us miscounting. Wrapping is handled by `wrapping_sub`; a genuine u32 wrap
+        // at 30 fps takes about four and a half years.
+        let dropped_now = u64::from(match last_sequence {
+            Some(prev) => raw.sequence.wrapping_sub(prev).saturating_sub(1),
+            None => 0,
+        });
+        last_sequence = Some(raw.sequence);
+
         let t0 = Instant::now();
         decoder.to_yuy2(raw.data, raw.format, raw.width, raw.height, &mut frame)?;
         let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -233,6 +325,7 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
         // Effects. Read the live config each frame so a blur-strength change takes effect
         // on the very next frame rather than at the next restart.
         let mut matting_ms = 0.0;
+        let mut matte_rejected = 0u64;
         let gpu_ms = match gpu.as_mut() {
             Some(pipe) => {
                 let t1 = Instant::now();
@@ -248,16 +341,38 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
                 // avoids a pipeline stall: the alternative is to downscale, read back, run
                 // the network and only then composite, serialising the GPU behind the CPU
                 // on every single frame.
-                if let Some(m) = matter.as_mut() {
+                if let Some(m) = matter.as_mut().filter(|_| matting_active) {
                     let t2 = Instant::now();
                     if pipe.read_matte_input(&mut matte_rgba) {
                         match m.infer(&matte_rgba) {
-                            Ok(alpha) => pipe.set_matte(alpha, INFER_W, INFER_H),
+                            Ok(alpha) => {
+                                pipe.set_matte(alpha, INFER_W, INFER_H);
+                                infer_errors = 0;
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "matting failed for one frame");
+                                // One failure is a frame, not an outage — the previous
+                                // matte stays up and nobody notices. A *run* of them is
+                                // different: the most likely cause is recurrent state the
+                                // session will keep choking on, and re-feeding it every
+                                // frame forever is how a transient becomes permanent.
+                                infer_errors += 1;
+                                tracing::warn!(
+                                    error = %e,
+                                    consecutive = infer_errors,
+                                    "matting failed for one frame"
+                                );
+                                if infer_errors >= MATTE_ERROR_RESET {
+                                    tracing::warn!(
+                                        "resetting matting state after {infer_errors} \
+                                         consecutive failures"
+                                    );
+                                    m.reset();
+                                    infer_errors = 0;
+                                }
                             }
                         }
                     }
+                    matte_rejected = m.rejected;
                     matting_ms = t2.elapsed().as_secs_f64() * 1000.0;
                 }
 
@@ -270,11 +385,41 @@ fn run_once(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), Box<dyn std::
             }
         };
 
-        stats.record(decode_ms, gpu_ms, matting_ms);
+        stats.record(decode_ms, gpu_ms, matting_ms, dropped_now, matte_rejected);
         stats.publish_if_due(shared, consumers, false);
     }
 
-    Ok(())
+    // The only way out of that loop is the stop flag.
+    Ok(Outcome::Stopped)
+}
+
+/// Whether a config change needs the devices reopened.
+///
+/// Split out of the frame loop so the policy can be tested without a camera. The
+/// distinction it draws is the whole point: anything affecting the *negotiated mode* — the
+/// device, its geometry, whether a matting model is needed at all — cannot be changed on a
+/// running stream, while everything else (blur strength, mirror, which non-Off background)
+/// is read fresh each frame and must NOT restart, because a restart drops the loopback fd
+/// and every consuming app sees the camera vanish.
+///
+/// `started_with` is the config the current run opened its devices against; `now` is live.
+fn needs_restart(started_with: &Config, now: &Config, cam_path: &str) -> bool {
+    use cleanroom_core::BackgroundMode::Off;
+
+    // `None` means "first usable camera", which is the one already open, so an unset device
+    // is not a change away from it.
+    let device_changed = now.video.device.as_deref().unwrap_or(cam_path) != cam_path;
+
+    !now.video.enabled
+        || device_changed
+        || (now.video.width, now.video.height, now.video.fps)
+            != (
+                started_with.video.width,
+                started_with.video.height,
+                started_with.video.fps,
+            )
+        // Switching to or from Off changes whether a matting model is needed at all.
+        || (now.video.background == Off) != (started_with.video.background == Off)
 }
 
 /// Accumulates per-second telemetry.
@@ -283,6 +428,12 @@ struct StatsAccumulator {
     decode_ms_total: f64,
     gpu_ms_total: f64,
     matting_ms_total: f64,
+    /// Summed per interval: "frames lost in the last second" is the actionable number.
+    dropped: u64,
+    /// Carried, not summed. `Matter::rejected` is already cumulative since startup, and
+    /// what matters is whether it is climbing, so re-publishing the latest reading keeps
+    /// it monotonic across intervals instead of resetting it every second.
+    matte_rejected: u64,
     since: Instant,
 }
 
@@ -293,15 +444,26 @@ impl StatsAccumulator {
             decode_ms_total: 0.0,
             gpu_ms_total: 0.0,
             matting_ms_total: 0.0,
+            dropped: 0,
+            matte_rejected: 0,
             since: Instant::now(),
         }
     }
 
-    fn record(&mut self, decode_ms: f64, gpu_ms: f64, matting_ms: f64) {
+    fn record(
+        &mut self,
+        decode_ms: f64,
+        gpu_ms: f64,
+        matting_ms: f64,
+        dropped: u64,
+        matte_rejected: u64,
+    ) {
         self.frames += 1;
         self.decode_ms_total += decode_ms;
         self.gpu_ms_total += gpu_ms;
         self.matting_ms_total += matting_ms;
+        self.dropped += dropped;
+        self.matte_rejected = matte_rejected;
     }
 
     fn publish_if_due(&mut self, shared: &Arc<Shared>, consumers: Option<u32>, idle: bool) {
@@ -314,6 +476,10 @@ impl StatsAccumulator {
             // An unknown consumer count is reported as 0 here only for display; the
             // *decision* to keep capturing uses `in_use()`, which treats unknown as busy.
             vcam_consumers: consumers.unwrap_or(0),
+            // Survives an idle interval. This is a since-startup total, so blanking it
+            // whenever the camera is released would make a real problem disappear the
+            // moment the meeting ended.
+            matte_rejected: self.matte_rejected,
             ..Default::default()
         };
         if !idle && self.frames > 0 {
@@ -324,6 +490,7 @@ impl StatsAccumulator {
             s.decode_ms = self.decode_ms_total / self.frames as f64;
             s.gpu_ms = self.gpu_ms_total / self.frames as f64;
             s.matting_ms = self.matting_ms_total / self.frames as f64;
+            s.dropped = self.dropped;
         }
         shared.set_stats(s);
 
@@ -331,6 +498,100 @@ impl StatsAccumulator {
         self.decode_ms_total = 0.0;
         self.gpu_ms_total = 0.0;
         self.matting_ms_total = 0.0;
+        self.dropped = 0;
         self.since = Instant::now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cleanroom_core::BackgroundMode;
+
+    const CAM: &str = "/dev/video0";
+
+    /// Guards the class of bug that cost the most time here: a restart that should not
+    /// have happened. A restart drops the loopback fd, and because `exclusive_caps=1` makes
+    /// the node revert to output-only the moment the producer stops, every app that had the
+    /// camera open loses it — mid-call, with no error anywhere.
+    #[test]
+    fn live_adjustable_settings_never_restart_the_pipeline() {
+        let base = Config::default();
+
+        let mut blur = base.clone();
+        blur.video.blur_strength = 0.95;
+        assert!(!needs_restart(&base, &blur, CAM), "blur strength is live");
+
+        let mut mirror = base.clone();
+        mirror.video.mirror = !base.video.mirror;
+        assert!(!needs_restart(&base, &mirror, CAM), "mirror is live");
+
+        let mut power = base.clone();
+        power.video.power_save = !base.video.power_save;
+        assert!(!needs_restart(&base, &power, CAM), "power save is live");
+
+        // Blur -> Replace -> Remove all need the same matting model, so switching between
+        // them is a uniform change, not a pipeline change.
+        for mode in [BackgroundMode::Replace, BackgroundMode::Remove] {
+            let mut m = base.clone();
+            m.video.background = mode;
+            assert!(
+                !needs_restart(&base, &m, CAM),
+                "{mode:?} needs no restart when already non-Off"
+            );
+        }
+    }
+
+    #[test]
+    fn changes_to_the_negotiated_mode_do_restart() {
+        let base = Config::default();
+
+        for (name, mutate) in [
+            (
+                "width",
+                (|c: &mut Config| c.video.width = 1280) as fn(&mut Config),
+            ),
+            ("height", |c: &mut Config| c.video.height = 720),
+            ("fps", |c: &mut Config| c.video.fps = 60),
+            ("device", |c: &mut Config| {
+                c.video.device = Some("/dev/video9".into())
+            }),
+            ("enabled", |c: &mut Config| c.video.enabled = false),
+            ("background off", |c: &mut Config| {
+                c.video.background = BackgroundMode::Off
+            }),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(
+                needs_restart(&base, &changed, CAM),
+                "changing {name} must reopen the devices"
+            );
+        }
+    }
+
+    /// `video.device = None` means "first usable camera". That is the camera already open,
+    /// so it must not read as a change — otherwise an unrelated `set` on any other key
+    /// would restart the pipeline forever on a default config.
+    #[test]
+    fn an_unset_device_is_not_a_change_away_from_the_open_one() {
+        let base = Config::default();
+        assert_eq!(base.video.device, None, "precondition");
+        assert!(!needs_restart(&base, &base, CAM));
+    }
+
+    /// The bug this whole `Outcome` type exists to prevent: `run_once` returned `Ok(())`
+    /// both for "stop" and for "restart me", the caller read every `Ok` as "stop", and a
+    /// single `cleanroom-ctl set video.width` ended the video thread permanently — camera
+    /// and loopback fds dropped, `/dev/video10` reverting to "Not a video capture device",
+    /// and the daemon still reporting the last health it had published.
+    #[test]
+    fn restart_and_stop_are_distinguishable() {
+        assert!(matches!(Outcome::Restart, Outcome::Restart));
+        assert!(matches!(Outcome::Stopped, Outcome::Stopped));
+        assert!(
+            !matches!(Outcome::Restart, Outcome::Stopped),
+            "a restart must never be readable as a stop"
+        );
     }
 }

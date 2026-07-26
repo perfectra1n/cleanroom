@@ -54,6 +54,9 @@ export component AppWindow inherits Window {
     in property <float> fps: 0;
     in property <float> decode-ms: 0;
     in property <float> gpu-ms: 0;
+    in property <float> matting-ms: 0;
+    in property <int> dropped: 0;
+    in property <int> matte-rejected: 0;
     in property <int> consumers: 0;
     in property <float> mic-in-db: -100;
     in property <float> mic-out-db: -100;
@@ -220,16 +223,38 @@ export component AppWindow inherits Window {
 
         GroupBox {
             title: "Performance";
-            HorizontalBox {
-                spacing: 18px;
-                Text { text: Math.round(root.fps * 10) / 10 + " fps"; }
-                Text { text: "decode " + Math.round(root.decode-ms * 100) / 100 + " ms"; }
-                Text { text: "gpu " + Math.round(root.gpu-ms * 100) / 100 + " ms"; }
+            VerticalBox {
+                padding: 0px;
+                spacing: 6px;
+                HorizontalBox {
+                    padding: 0px;
+                    spacing: 18px;
+                    Text { text: Math.round(root.fps * 10) / 10 + " fps"; }
+                    Text { text: "decode " + Math.round(root.decode-ms * 100) / 100 + " ms"; }
+                    Text { text: "gpu " + Math.round(root.gpu-ms * 100) / 100 + " ms"; }
+                    // Matting is usually the largest single cost in gpu-ms, so showing gpu
+                    // alone makes the expensive part look free.
+                    Text { text: "matting " + Math.round(root.matting-ms * 100) / 100 + " ms"; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
                 Text {
                     text: root.consumers == 0
                         ? "idle — camera released"
                         : root.consumers + " app(s) using the camera";
-                    horizontal-stretch: 1;
+                }
+                // Both hidden until non-zero. A counter permanently reading 0 is noise, and
+                // noise is what stops anyone noticing the moment it stops reading 0.
+                Text {
+                    visible: root.dropped > 0;
+                    text: root.dropped + " frame(s) dropped in the last second — the camera is outrunning the pipeline";
+                    wrap: word-wrap;
+                    color: #d08770;
+                }
+                Text {
+                    visible: root.matte-rejected > 0;
+                    text: root.matte-rejected + " matte(s) rejected as degenerate since startup";
+                    wrap: word-wrap;
+                    color: #d08770;
                 }
             }
         }

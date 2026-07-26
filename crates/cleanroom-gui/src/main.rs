@@ -235,6 +235,9 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_fps(st.fps as f32);
     ui.set_decode_ms(st.decode_ms as f32);
     ui.set_gpu_ms(st.gpu_ms as f32);
+    ui.set_matting_ms(st.matting_ms as f32);
+    ui.set_dropped(st.dropped.min(i32::MAX as u64) as i32);
+    ui.set_matte_rejected(st.matte_rejected.min(i32::MAX as u64) as i32);
     ui.set_consumers(st.vcam_consumers as i32);
     ui.set_mic_in_db(st.mic_level_db);
     ui.set_mic_out_db(st.mic_level_out_db);

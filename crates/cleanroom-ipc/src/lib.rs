@@ -26,7 +26,9 @@ pub const INTERFACE: &str = "io.github.perfectra1n.Cleanroom1";
 
 /// Bumped on a breaking change to the interface. Exposed as a property so a mismatched
 /// GUI can say "update me" rather than failing in some obscure way at the first call.
-pub const INTERFACE_VERSION: u32 = 1;
+///
+/// 2: `PipelineStats` gained `matte_rejected`, which changes the struct's D-Bus signature.
+pub const INTERFACE_VERSION: u32 = 2;
 
 /// How healthy the pipeline is.
 ///
@@ -89,8 +91,21 @@ pub struct PipelineStats {
     /// compositing — everything between upload and readback.
     pub gpu_ms: f64,
     /// Mean matting inference time, milliseconds. A subset of `gpu_ms`.
+    ///
+    /// Covers the matte readback as well as inference, so it is deliberately *not*
+    /// comparable to a bare model benchmark — it is the cost the frame loop actually pays.
     pub matting_ms: f64,
-    /// Frames dropped because the pipeline could not keep up.
+    /// Mattes rejected by the degenerate-alpha guard since startup.
+    ///
+    /// Cumulative, not per-second, because what matters is the trend: a handful over a
+    /// session is the guard doing its job, a number that climbs with the frame counter
+    /// means the guard's threshold is wrong for this footage and every matte is being
+    /// thrown away. Without this on the wire, that failure looks like "matting is on but
+    /// does nothing", which is indistinguishable from having no model at all.
+    pub matte_rejected: u64,
+    /// Frames the *driver* produced that we never collected, counted from gaps in the V4L2
+    /// sequence number. This is the camera outrunning the pipeline, and it is the number
+    /// that goes up first when a frame's total work exceeds the frame interval.
     pub dropped: u64,
     /// How many processes are currently reading the virtual camera. Drives power save.
     /// Note this counts *streaming* consumers, not opens: browsers probe-open cameras
