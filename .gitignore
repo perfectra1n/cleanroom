@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+.direnv/
+result
+result-*
+
+# Model weights are not vendored. RVM's are GPL-3.0 (compatible, but large), and
+# DeepFilterNet's have NO license grant at all — upstream issue #697 asks for one and
+# is unanswered — which is exactly why we load them from a path at runtime instead of
+# embedding them with include_bytes!.
+/models/*.onnx
+/models/*.tar.gz

@@ -1,0 +1,20 @@
+[package]
+name = "spike-slint-hyprland"
+description = "M0a spikes 1+2: does Slint work on Hyprland/Wayland, and can it display a wgpu texture we own?"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# `unstable-wgpu-29` is what exposes texture interop and lets Slint adopt an existing
+# wgpu Device/Queue. Note the ceiling: Slint 1.17 offers unstable-wgpu-28 and -29 only,
+# so THE WHOLE PROJECT PINS TO wgpu 29 even though wgpu 30.0 is out. `cleanroom-gpu`
+# must match this or the types will not unify across the process boundary later.
+slint = { version = "1.17", features = ["unstable-wgpu-29", "renderer-femtovg-wgpu"] }
+wgpu = "29"
+anyhow.workspace = true
+
+[build-dependencies]
+slint-build = "1.17"

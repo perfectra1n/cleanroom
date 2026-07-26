@@ -1,0 +1,34 @@
+[package]
+name = "spike-ort-rvm"
+description = "M0a spike 3: can ort run RVM on a vendor-neutral GPU execution provider?"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+
+# `webgpu` is the whole point of this spike: it is the only EP that gives us GPU
+# inference on both Nvidia and AMD without a vendor SDK. `download-binaries` is a
+# DEFAULT feature, so the build script fetches a prebuilt libonnxruntime — whether a
+# linux-x64 build with WebGPU compiled in actually exists is precisely what we are here
+# to find out. nixpkgs' onnxruntime does NOT have it (verified: override args expose
+# only coreml/cuda/nccl/openvino/rocm, and there is no Dawn anywhere in the store).
+# NOTE `tls-rustls` instead of the default `tls-native`: ort's build script downloads
+# the prebuilt over HTTPS, and linking that download against system OpenSSL fails on
+# NixOS with `libssl.so.3: cannot open shared object file`. rustls is pure Rust and
+# sidesteps it entirely — better than adding openssl to the dev shell, because the build
+# script then works outside the shell too.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-24",
+    "webgpu",
+] }
+ndarray = "0.16"

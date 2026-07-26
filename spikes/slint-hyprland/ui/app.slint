@@ -1,0 +1,99 @@
+// M0a spikes 1+2 harness.
+//
+// Everything on this window exists to answer a specific question about Slint on
+// Hyprland/Wayland. It is deliberately ugly; it is a probe, not a design.
+
+import { VerticalBox, HorizontalBox, GroupBox, Button } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "cleanroom spike — Slint on Hyprland";
+    preferred-width: 720px;
+    preferred-height: 560px;
+
+    // Spike 1a: does keyboard input reach the app at all? egui#8249 reports mouse
+    // working and ZERO key events arriving on Hyprland. If `typed` stays empty while
+    // this window has focus, Slint has the same bug and we fall back to GTK4.
+    in-out property <string> typed: "";
+    in-out property <int> key-count: 0;
+
+    // Spike 1b: does drag-resize stall the UI thread? egui#8314 reports 100% CPU with
+    // the render callback never firing again, persisting after the drag ends. A
+    // free-running counter makes a stall obvious: it freezes.
+    in-out property <int> tick: 0;
+    in-out property <string> fps: "-";
+    in-out property <string> win-size: "-";
+
+    // Spike 2: is the texture below a real wgpu texture we rendered into ourselves?
+    in-out property <image> gpu-frame;
+    in-out property <string> gpu-status: "not started";
+
+    forward-focus: key-catcher;
+
+    key-catcher := FocusScope {
+        key-pressed(event) => {
+            root.key-count += 1;
+            if (event.text == Key.Backspace) {
+                root.typed = "";
+            } else {
+                root.typed += event.text;
+            }
+            accept
+        }
+
+        VerticalBox {
+            padding: 12px;
+            spacing: 10px;
+
+            GroupBox {
+                title: "spike 1a — keyboard (egui#8249 was fatal here)";
+                VerticalBox {
+                    Text {
+                        text: root.key-count == 0
+                            ? "Type anything. If nothing appears, Slint has egui's Hyprland bug."
+                            : "keys received: " + root.key-count;
+                        color: root.key-count == 0 ? #cc4444 : #44aa55;
+                    }
+                    Text {
+                        text: "buffer: " + root.typed;
+                        font-family: "monospace";
+                        wrap: word-wrap;
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "spike 1b — resize liveness (egui#8314 froze the UI thread)";
+                VerticalBox {
+                    Text { text: "Drag the window edge. The counter must keep moving DURING and AFTER the drag."; }
+                    HorizontalBox {
+                        Text { text: "tick: " + root.tick; font-family: "monospace"; }
+                        Text { text: "fps: " + root.fps; font-family: "monospace"; }
+                        Text { text: "size: " + root.win-size; font-family: "monospace"; }
+                    }
+                }
+            }
+
+            GroupBox {
+                title: "spike 2 — wgpu texture interop";
+                VerticalBox {
+                    Text { text: root.gpu-status; }
+                    // If interop works this shows an animated gradient rendered by our
+                    // own wgpu pipeline into a texture Slint never allocated.
+                    Image {
+                        source: root.gpu-frame;
+                        width: 100%;
+                        height: 160px;
+                        image-fit: contain;
+                    }
+                }
+            }
+
+            Button {
+                text: "quit";
+                clicked => { root.request-quit(); }
+            }
+        }
+    }
+
+    callback request-quit();
+}

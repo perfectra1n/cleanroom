@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["spikes/ort-rvm", "spikes/slint-hyprland"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/perfectra1n/cleanroom"
+rust-version = "1.95"
+
+[workspace.dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# The video pipeline is latency-sensitive; LTO and a single codegen unit are worth
+# the build time. debug=1 keeps frames attributable in perf/flamegraph output.
+lto = "thin"
+codegen-units = 1
+debug = 1
