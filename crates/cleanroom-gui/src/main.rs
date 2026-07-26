@@ -35,6 +35,9 @@
 //! rather than hiding into a tray that may not exist, and everything in the tray menu is
 //! also reachable from `cleanroom-ctl`.
 
+mod filechooser;
+mod preview;
+
 use anyhow::{Context, Result};
 use cleanroom_ipc::{CleanroomProxy, Health, Status};
 use slint::ComponentHandle;
@@ -65,7 +68,28 @@ struct Snapshot {
     mirror: bool,
     denoise: bool,
     attenuation: f32,
+    background_image: String,
+    /// `None` when this poll skipped the expensive parts (see `DEVICE_POLL_EVERY`).
+    devices: Option<Devices>,
 }
+
+/// Device lists and autostart state, refreshed on a slower cadence than the rest.
+///
+/// Enumerating cameras opens every `/dev/video*` to query its capabilities, and the
+/// autostart check talks to the systemd user manager. Neither changes on the timescale a
+/// status poll runs at, and doing them twice a second would be a lot of syscalls to learn
+/// nothing.
+#[derive(Clone, Default)]
+struct Devices {
+    cameras: Vec<(String, String)>,
+    microphones: Vec<(String, String)>,
+    autostart_on: bool,
+    autostart_mechanism: String,
+    autostart_instruction: String,
+}
+
+/// Poll the device lists every Nth status poll. 500 ms x 20 = every 10 s.
+const DEVICE_POLL_EVERY: u32 = 20;
 
 fn health_code(h: &Health) -> i32 {
     match h {
@@ -132,6 +156,18 @@ fn main() -> Result<()> {
     rt.spawn(dbus_loop(ui.as_weak(), set_rx));
 
     wire_controls(&ui, set_tx.clone());
+
+    // The preview consumes the virtual camera the same way a meeting app does, so it is
+    // WYSIWYG by construction.
+    //
+    // Started from the status snapshot rather than from a repeating UI timer: the vcam path
+    // is not known until the daemon has been polled at least once, and the snapshot is
+    // already the thing that learns it. One fewer mechanism, and it cannot start before
+    // there is a path to start on.
+    let preview_slot: std::rc::Rc<std::cell::RefCell<Option<preview::Preview>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    PREVIEW_SLOT.with(|s| *s.borrow_mut() = Some(preview_slot));
+
     if let Some(t) = &tray {
         wire_tray(t, &ui, set_tx);
     }
@@ -144,6 +180,7 @@ fn main() -> Result<()> {
 /// Poll the daemon and apply UI requests. Runs as a task on the shared runtime.
 async fn dbus_loop(ui: slint::Weak<AppWindow>, mut set_rx: mpsc::UnboundedReceiver<SetRequest>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut ticks: u32 = 0;
     loop {
         tokio::select! {
             // Applied immediately rather than on the next tick, so a control feels instant.
@@ -155,7 +192,11 @@ async fn dbus_loop(ui: slint::Weak<AppWindow>, mut set_rx: mpsc::UnboundedReceiv
                 }
             }
             _ = tick.tick() => {
-                let snap = poll().await;
+                // Device enumeration and the autostart check ride a slower cadence; the
+                // first poll includes them so the pickers are populated immediately.
+                let with_devices = ticks.is_multiple_of(DEVICE_POLL_EVERY);
+                ticks = ticks.wrapping_add(1);
+                let snap = poll(with_devices).await;
                 let ui = ui.clone();
                 // Touching the UI from another thread is not allowed; this hands the
                 // update to the Slint event loop.
@@ -182,9 +223,42 @@ async fn proxy() -> zbus::Result<CleanroomProxy<'static>> {
     CleanroomProxy::new(&conn).await
 }
 
-async fn poll() -> Option<Snapshot> {
+async fn poll(with_devices: bool) -> Option<Snapshot> {
     let p = proxy().await.ok()?;
+
+    let devices = if with_devices {
+        let cameras = p
+            .list_cameras()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| (d.id, d.description))
+            .collect();
+        let microphones = p
+            .list_microphones()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| (d.id, d.description))
+            .collect();
+        let (mechanism, instruction, on) = p
+            .autostart()
+            .await
+            .unwrap_or_else(|_| ("unknown".into(), String::new(), false));
+        Some(Devices {
+            cameras,
+            microphones,
+            autostart_on: on,
+            autostart_mechanism: mechanism,
+            autostart_instruction: instruction,
+        })
+    } else {
+        None
+    };
+
     Some(Snapshot {
+        devices,
+        background_image: p.get("video.background_image").await.unwrap_or_default(),
         status: p.status().await.ok()?,
         background: match p.get("video.background").await.ok()?.as_str() {
             "off" => 0,
@@ -217,8 +291,61 @@ async fn apply(req: &SetRequest) -> Result<()> {
     Ok(())
 }
 
+/// The camera path the daemon reports it is using, parsed out of the health detail.
+///
+/// The detail is formatted "<camera> -> <vcam> (<mode>)", so the left-hand side is the
+/// device in use. Read from there rather than from config because config may say `None`,
+/// meaning "first usable camera", and the picker needs to highlight the concrete one.
+fn current_camera_id(status: &Status) -> String {
+    status
+        .video_detail
+        .split(" -> ")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+thread_local! {
+    /// Owns the preview thread. Thread-local because it can only be touched from the UI
+    /// thread, which is also the only place `apply_snapshot` runs.
+    static PREVIEW_SLOT: std::cell::RefCell<
+        Option<std::rc::Rc<std::cell::RefCell<Option<preview::Preview>>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Start the preview once the daemon has told us which device to read.
+fn ensure_preview(ui: &AppWindow, vcam_path: &str) {
+    if vcam_path.is_empty() || vcam_path == "—" {
+        return;
+    }
+    PREVIEW_SLOT.with(|slot| {
+        let slot = slot.borrow();
+        let Some(slot) = slot.as_ref() else { return };
+        if slot.borrow().is_some() {
+            return;
+        }
+        tracing::info!(path = vcam_path, "starting preview");
+        let weak = ui.as_weak();
+        *slot.borrow_mut() = Some(preview::Preview::start(
+            vcam_path.to_string(),
+            move |rgb, pw, ph| {
+                if let Some(ui) = weak.upgrade() {
+                    let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
+                        &rgb, pw, ph,
+                    );
+                    ui.set_preview_frame(slint::Image::from_rgb8(buf));
+                    ui.set_preview_running(true);
+                }
+            },
+        ));
+    });
+}
+
 fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_connected(true);
+    // Both taken before the status fields are moved into the UI below.
+    let active_camera = current_camera_id(&s.status);
+    let vcam_path = s.status.vcam_path.clone();
 
     ui.set_video_health(health_code(&s.status.video_health));
     ui.set_video_detail(s.status.video_detail.into());
@@ -242,6 +369,35 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_mic_in_db(st.mic_level_db);
     ui.set_mic_out_db(st.mic_level_out_db);
 
+    ui.set_background_image(s.background_image.clone().into());
+    ensure_preview(ui, &vcam_path);
+
+    // Only when this poll actually fetched them. Writing empty lists on the intervening
+    // polls would make the pickers flicker empty nineteen times out of twenty.
+    if let Some(d) = &s.devices {
+        let cam_names: Vec<slint::SharedString> = d
+            .cameras
+            .iter()
+            .map(|(id, desc)| format!("{desc}  ({id})").into())
+            .collect();
+        let cam_idx = d
+            .cameras
+            .iter()
+            .position(|(id, _)| *id == active_camera)
+            .map(|i| i as i32)
+            .unwrap_or(-1);
+        ui.set_camera_names(slint::ModelRc::new(slint::VecModel::from(cam_names)));
+        ui.set_camera_index(cam_idx);
+
+        let mic_names: Vec<slint::SharedString> =
+            d.microphones.iter().map(|(_, desc)| desc.into()).collect();
+        ui.set_microphone_names(slint::ModelRc::new(slint::VecModel::from(mic_names)));
+
+        ui.set_autostart_on(d.autostart_on);
+        ui.set_autostart_mechanism(d.autostart_mechanism.clone().into());
+        ui.set_autostart_instruction(d.autostart_instruction.clone().into());
+    }
+
     // Reflect the daemon's values back, so a change made from the CLI or a second GUI
     // shows up here rather than leaving the two silently disagreeing.
     ui.set_background_mode(s.background);
@@ -252,6 +408,128 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
 }
 
 fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
+    {
+        // The ComboBox hands back the label it displays, so the device id is recovered from
+        // the "(…)" suffix the label was built with rather than by index — an index would
+        // be wrong the moment the list is re-sorted or a camera is unplugged mid-session.
+        let tx = tx.clone();
+        ui.on_set_camera(move |label| {
+            let label = label.to_string();
+            let id = label
+                .rsplit_once('(')
+                .map(|(_, rest)| rest.trim_end_matches(')').to_string())
+                .unwrap_or(label);
+            let _ = tx.send(SetRequest {
+                key: "video.device",
+                value: id,
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_set_microphone(move |label| {
+            // Microphones are listed by description, so map back through the model to the
+            // PipeWire node.name, which is what config stores.
+            let Some(ui) = ui_weak.upgrade() else { return };
+            use slint::Model;
+            let names = ui.get_microphone_names();
+            if let Some(i) = names.iter().position(|n| n.as_str() == label.as_str()) {
+                ui.set_microphone_index(i as i32);
+            }
+            let _ = tx.send(SetRequest {
+                key: "audio.device",
+                value: label.to_string(),
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_choose_background_image(move || {
+            let tx = tx.clone();
+            let ui_weak = ui_weak.clone();
+            // Spawned rather than awaited: the portal call blocks until the user picks a
+            // file, and doing that on the UI thread would freeze the window behind the
+            // dialog it just opened.
+            tokio::spawn(async move {
+                match filechooser::pick_image().await {
+                    Ok(Some(path)) => {
+                        let _ = tx.send(SetRequest {
+                            key: "video.background_image",
+                            value: path,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // A bare wlroots session may have no FileChooser portal at all.
+                        // Say so, and point at the path that always works.
+                        tracing::warn!(
+                            error = %e,
+                            "no file dialog available — set it with: \
+                             cleanroom-ctl set video.background_image /path/to/image.png"
+                        );
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_autostart_instruction(
+                                    "No file dialog is available on this desktop. Set it with:\n    \
+                                     cleanroom-ctl set video.background_image /path/to/image.png"
+                                        .into(),
+                                );
+                            }
+                        });
+                    }
+                }
+            });
+        });
+    }
+    {
+        let tx = tx.clone();
+        ui.on_clear_background_image(move || {
+            // The daemon's settings layer treats these words as "unset" for an optional.
+            let _ = tx.send(SetRequest {
+                key: "video.background_image",
+                value: "unset".into(),
+            });
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_set_autostart(move |on| {
+            let ui_weak = ui_weak.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let p = proxy().await.ok()?;
+                    p.set_autostart(on).await.ok()
+                }
+                .await;
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        match result {
+                            Some((mechanism, instruction)) => {
+                                ui.set_autostart_mechanism(mechanism.into());
+                                ui.set_autostart_instruction(instruction.clone().into());
+                                // Only claim it is on if the daemon actually did it.
+                                ui.set_autostart_on(on && instruction.is_empty());
+                            }
+                            None => ui.set_autostart_on(!on),
+                        }
+                    }
+                });
+            });
+        });
+    }
+    {
+        // Declared in the .slint since the beginning and never connected to anything.
+        ui.on_quit_daemon(move || {
+            tokio::spawn(async move {
+                if let Ok(p) = proxy().await {
+                    let _ = p.shutdown().await;
+                }
+            });
+        });
+    }
+
     let send = move |key: &'static str, value: String| {
         let _ = tx.send(SetRequest { key, value });
     };

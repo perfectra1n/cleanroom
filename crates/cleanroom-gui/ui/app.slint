@@ -63,6 +63,19 @@ export component AppWindow inherits Window {
 
     in property <bool> connected: false;
 
+    // Device pickers. Populated from ListCameras / ListMicrophones.
+    in property <[string]> camera-names: [];
+    in property <[string]> microphone-names: [];
+    in-out property <int> camera-index: -1;
+    in-out property <int> microphone-index: -1;
+
+    in property <image> preview-frame;
+    in property <bool> preview-running: false;
+    in-out property <string> background-image: "";
+    in property <string> autostart-mechanism: "";
+    in property <string> autostart-instruction: "";
+    in-out property <bool> autostart-on: false;
+
     // --- controls, two-way ---
     in-out property <int> background-mode: 1;   // 0 off, 1 blur, 2 replace, 3 remove
     in-out property <float> blur-strength: 0.6;
@@ -70,6 +83,11 @@ export component AppWindow inherits Window {
     in-out property <bool> denoise: true;
     in-out property <float> attenuation: 40;
 
+    callback set-camera(string);
+    callback set-microphone(string);
+    callback choose-background-image();
+    callback clear-background-image();
+    callback set-autostart(bool);
     callback set-background(int);
     callback set-blur(float);
     callback set-mirror(bool);
@@ -118,6 +136,73 @@ export component AppWindow inherits Window {
                 HorizontalBox {
                     Text { text: "Camera"; font-weight: 700; width: 56px; }
                     Text { text: root.vcam-path; horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Preview";
+            VerticalBox {
+                padding: 0px;
+                spacing: 6px;
+                Rectangle {
+                    height: 180px;
+                    background: #1a1a1a;
+                    border-radius: 4px;
+                    clip: true;
+                    Image {
+                        source: root.preview-frame;
+                        width: parent.width;
+                        height: parent.height;
+                        image-fit: contain;
+                    }
+                    Text {
+                        visible: !root.preview-running;
+                        text: "waiting for the virtual camera…";
+                        color: #888;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                }
+                // Said plainly rather than left to be discovered: the preview is a real
+                // consumer of the virtual camera, so it keeps the capture awake.
+                Text {
+                    text: "This is what other apps see. Keeping it open holds the camera awake.";
+                    color: #888;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Devices";
+            VerticalBox {
+                padding: 0px;
+                spacing: 8px;
+                HorizontalBox {
+                    padding: 0px;
+                    Text { text: "Camera"; width: 76px; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.camera-names;
+                        current-index: root.camera-index;
+                        enabled: root.camera-names.length > 0;
+                        horizontal-stretch: 1;
+                        selected(value) => { root.set-camera(value); }
+                    }
+                }
+                HorizontalBox {
+                    padding: 0px;
+                    Text { text: "Microphone"; width: 76px; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.microphone-names;
+                        current-index: root.microphone-index;
+                        enabled: root.microphone-names.length > 0;
+                        horizontal-stretch: 1;
+                        selected(value) => { root.set-microphone(value); }
+                    }
                 }
             }
         }
@@ -217,6 +302,29 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         horizontal-stretch: 1;
                     }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Startup";
+            VerticalBox {
+                padding: 0px;
+                spacing: 6px;
+                Switch {
+                    text: "Start Cleanroom with my session";
+                    checked: root.autostart-on;
+                    enabled: root.autostart-instruction == "";
+                    toggled => { root.set-autostart(self.checked); }
+                }
+                // Shown when this session supports neither systemd nor XDG autostart. The
+                // switch is disabled in that case rather than pretending to work.
+                Text {
+                    visible: root.autostart-instruction != "";
+                    text: root.autostart-instruction;
+                    color: #d08770;
+                    font-size: 11px;
+                    wrap: word-wrap;
                 }
             }
         }

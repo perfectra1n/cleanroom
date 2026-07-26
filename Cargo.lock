@@ -1055,6 +1055,8 @@ dependencies = [
  "anyhow",
  "cleanroom-core",
  "cleanroom-ipc",
+ "cleanroom-video",
+ "futures-util",
  "slint",
  "slint-build",
  "tokio",

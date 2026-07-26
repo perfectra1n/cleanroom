@@ -13,6 +13,9 @@ path = "src/main.rs"
 [dependencies]
 cleanroom-core = { path = "../cleanroom-core" }
 cleanroom-ipc = { path = "../cleanroom-ipc" }
+# The preview consumes the virtual camera exactly as a meeting app would, so it reuses the
+# same V4L2 capture the daemon uses rather than a second implementation.
+cleanroom-video = { path = "../cleanroom-video" }
 
 anyhow.workspace = true
 tracing.workspace = true
@@ -35,6 +38,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # zbus does not need the feature: without it, it runs its own small executor, which
 # coexists fine with our tokio runtime.
 zbus = "5"
+# StreamExt for the portal's Response signal. default-features = false keeps it to the
+# core traits rather than pulling an executor in behind zbus's back.
+futures-util = { version = "0.3", default-features = false }
 
 [build-dependencies]
 slint-build = "1.17"
