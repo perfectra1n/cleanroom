@@ -4,4 +4,4 @@ pub mod device;
 pub mod frame;
 
 pub use device::{AdapterChoice, Gpu, GpuError};
-pub use frame::FramePipeline;
+pub use frame::{FramePipeline, Look};

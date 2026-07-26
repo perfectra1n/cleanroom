@@ -67,7 +67,7 @@ fn the_unit_restarts_on_failure_never_always() {
         .collect();
 
     assert!(
-        directives.iter().any(|l| *l == "Restart=on-failure"),
+        directives.contains(&"Restart=on-failure"),
         "the unit must specify Restart=on-failure"
     );
     assert!(
@@ -76,7 +76,7 @@ fn the_unit_restarts_on_failure_never_always() {
     );
     // With lingering, this starts a device-holding daemon at boot with no session.
     assert!(
-        !directives.iter().any(|l| *l == "WantedBy=default.target"),
+        !directives.contains(&"WantedBy=default.target"),
         "WantedBy=default.target starts the daemon at boot with no session"
     );
 }
@@ -125,7 +125,10 @@ fn the_desktop_identity_agrees_with_the_bus_name() {
     );
 
     let unit = read("packaging/systemd/cleanroomd.service");
-    assert!(unit.contains(&format!("BusName={ID}")), "BusName must be {ID}");
+    assert!(
+        unit.contains(&format!("BusName={ID}")),
+        "BusName must be {ID}"
+    );
 }
 
 /// wgpu is pinned to 29 by Slint, which offers `unstable-wgpu-28` and `-29` and nothing

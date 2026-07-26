@@ -35,3 +35,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = [
 [dev-dependencies]
 # The teardown_check example needs a subscriber to show the deliberate-drop warning.
 tracing-subscriber.workspace = true
+# matte_probe reads a still off disk so the network can be inspected against a real frame
+# without a camera, a daemon or a GPU compositor in the way. Already in the lock file via
+# Slint, so this pulls nothing new down.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -31,6 +31,8 @@ struct CompositeParams {
 /// nothing on a discrete GPU and still affordable on the 2-CU iGPU that is this project's
 /// slow-hardware conformance target. Larger windows smooth more but start pulling in
 /// structure that has nothing to do with the subject's edge.
+///
+/// The default; `video.guided_radius` overrides it.
 const GUIDED_RADIUS: i32 = 3;
 
 /// Guided-filter regularisation.
@@ -39,16 +41,46 @@ const GUIDED_RADIUS: i32 = 3;
 /// the alpha is allowed to follow the image. 1e-4 on luma in 0..1 corresponds to roughly a
 /// 1% contrast step, which keeps sensor noise on a plain wall from being read as an edge
 /// while still tracking a real shoulder against a similarly-lit background.
+///
+/// The default; `video.guided_eps` overrides it.
 const GUIDED_EPS: f32 = 1e-4;
 
-/// How far Replace pulls the alpha edge in, against Blur's zero.
+/// Everything about how a frame is *composited*, as one value.
 ///
-/// Against a blurred copy of the same room a slightly generous silhouette is invisible,
-/// because what bleeds through is the same colours. Against a swapped background it is a
-/// bright fringe tracing shoulders and ears — the single most recognisable "bad virtual
-/// background" artifact, and the reason replace wants tighter morphology than blur rather
-/// than the same.
-const REPLACE_TIGHTEN: f32 = 0.12;
+/// A struct rather than eight positional arguments to `process`: `mirror`, `desaturate` and
+/// `dim` are all small scalars, and a call site that reads `(.., 0.0, 0.0, true, false)` is
+/// one transposition away from a bug nothing would catch.
+#[derive(Debug, Clone, Copy)]
+pub struct Look {
+    pub mode: BackgroundMode,
+    /// 0.0..=1.0, mapped to a blur sigma internally.
+    pub blur_strength: f32,
+    pub mirror: bool,
+    /// Pull the background toward luma, 0.0..=1.0. Background plane only.
+    pub desaturate: f32,
+    /// Darken the background, 0.0..=1.0. Background plane only.
+    pub dim: f32,
+    /// Pull the alpha edge inward, 0.0..=0.9.
+    ///
+    /// Against a blurred copy of the same room a slightly generous silhouette is invisible,
+    /// because what bleeds through is the same colours. Against a swapped background it is a
+    /// bright fringe tracing shoulders and ears — the single most recognisable "bad virtual
+    /// background" artifact, and the reason replace wants tighter morphology than blur.
+    pub tighten: f32,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            mode: BackgroundMode::Blur,
+            blur_strength: 0.6,
+            mirror: false,
+            desaturate: 0.0,
+            dim: 0.0,
+            tighten: 0.0,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -112,6 +144,10 @@ pub struct FramePipeline {
     guided_params: wgpu::Buffer,
     /// Whether `guided_ab` holds coefficients for the current matte.
     guided_ready: bool,
+    /// Live guided-filter settings, from `video.guided_*`. See [`FramePipeline::set_guided`].
+    guided_enabled: bool,
+    guided_radius: i32,
+    guided_eps: f32,
 
     /// Staging buffer for the readback. Persistent so the hot path allocates nothing.
     readback: wgpu::Buffer,
@@ -323,6 +359,9 @@ impl FramePipeline {
             guided: pipeline("guided-ab", &m_guided, "main"),
             guided_ab: None,
             guided_ready: false,
+            guided_enabled: true,
+            guided_radius: GUIDED_RADIUS,
+            guided_eps: GUIDED_EPS,
             guided_params: {
                 let b = dev.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("guided-params"),
@@ -483,6 +522,11 @@ impl FramePipeline {
     /// with the wrong guidance is subtle and ugly: the edge locks onto structure the subject
     /// has already moved away from, so fast motion smears instead of sharpening.
     fn run_guided(&mut self, width: u32, height: u32) {
+        if !self.guided_enabled {
+            // Turned off in config. The composite falls back to sampling the matte directly.
+            self.guided_ready = false;
+            return;
+        }
         let Some((guide, _, gw, gh, _)) = self.matte_input.as_ref() else {
             // No matting input configured, so there is no guidance image and nothing to do.
             self.guided_ready = false;
@@ -528,6 +572,18 @@ impl FramePipeline {
             .as_ref()
             .expect("just allocated")
             .create_view(&Default::default());
+
+        // Written every time rather than only on change: this is 8 bytes against a pass that
+        // reads millions of texels, and a uniform that silently lags the config by a frame is
+        // the kind of bug that only shows up while somebody is dragging a slider.
+        self.gpu.queue.write_buffer(
+            &self.guided_params,
+            0,
+            bytemuck::bytes_of(&GuidedParams {
+                radius: self.guided_radius,
+                eps: self.guided_eps,
+            }),
+        );
 
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         self.dispatch(
@@ -678,15 +734,21 @@ impl FramePipeline {
         true
     }
 
+    /// Configure the guided-filter upsample. Takes effect on the next `set_matte`.
+    ///
+    /// `enabled = false` falls back to sampling the matte directly, which is faster and
+    /// visibly worse: bilinear does not know where the subject ends.
+    pub fn set_guided(&mut self, enabled: bool, radius: u32, eps: f32) {
+        // Clamped rather than trusted: radius feeds a `(2r+1)^2` inner loop in a compute
+        // shader, so a typo'd 500 in a config file is a hung GPU, not a slow one.
+        self.guided_enabled = enabled;
+        self.guided_radius = radius.clamp(1, 16) as i32;
+        self.guided_eps = eps.max(1e-8);
+    }
+
     /// Run one frame: upload YUY2, apply effects, read YUY2 back.
-    pub fn process(
-        &mut self,
-        input: &[u8],
-        output: &mut [u8],
-        mode: BackgroundMode,
-        blur_strength: f32,
-        mirror: bool,
-    ) {
+    pub fn process(&mut self, input: &[u8], output: &mut [u8], look: Look) {
+        let (mode, blur_strength, mirror) = (look.mode, look.blur_strength, look.mirror);
         let packed_w = self.width.div_ceil(2);
         let dev = &self.gpu.device;
 
@@ -718,14 +780,10 @@ impl FramePipeline {
                 BackgroundMode::Remove => 3,
             },
             mirror: mirror as u32,
-            desaturate: 0.0,
-            dim: 0.0,
+            desaturate: look.desaturate.clamp(0.0, 1.0),
+            dim: look.dim.clamp(0.0, 1.0),
             guided: self.guided_ready as u32,
-            tighten: if matches!(mode, BackgroundMode::Replace) {
-                REPLACE_TIGHTEN
-            } else {
-                0.0
-            },
+            tighten: look.tighten.clamp(0.0, 0.9),
             _pad0: 0,
             _pad1: 0,
         };

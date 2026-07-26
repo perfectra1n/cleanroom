@@ -14,7 +14,12 @@ fn main() {
 
     for round in 1..=2 {
         eprintln!("--- session {round} ---");
-        match cleanroom_matting::Matter::new(&model) {
+        match cleanroom_matting::Matter::new(
+            &model,
+            cleanroom_matting::Backend::Gpu,
+            cleanroom_matting::INFER_W,
+            cleanroom_matting::INFER_H,
+        ) {
             Ok(mut m) => {
                 match m.infer(&frame) {
                     Ok(a) => eprintln!("  inferred, matte {} bytes", a.len()),

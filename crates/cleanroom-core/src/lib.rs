@@ -16,7 +16,8 @@ pub mod node;
 pub mod persist;
 
 pub use config::{
-    AudioConfig, BackgroundMode, Config, DenoiseConfig, GpuConfig, SCHEMA_VERSION, VideoConfig,
+    AudioConfig, BackgroundMode, Config, DenoiseConfig, GpuConfig, MattingBackend, SCHEMA_VERSION,
+    VideoConfig,
 };
 pub use node::{CaptureTarget, CaptureTargetError, VIRTUAL_CAM_NODE, VIRTUAL_MIC_NODE};
 pub use persist::{ConfigError, ConfigPaths, LoadOutcome};

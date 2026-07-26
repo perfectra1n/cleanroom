@@ -29,7 +29,7 @@ pub const INTERFACE: &str = "io.github.perfectra1n.Cleanroom1";
 ///
 /// 2: `PipelineStats` gained `matte_rejected` and `Status` gained `pw_node`, both of
 ///    which change D-Bus signatures.
-pub const INTERFACE_VERSION: u32 = 2;
+pub const INTERFACE_VERSION: u32 = 3;
 
 /// How healthy the pipeline is.
 ///
@@ -136,6 +136,15 @@ pub struct Status {
     /// failed. Reported separately from `vcam_path` because the two transports succeed and
     /// fail independently, and "the camera works" is a different claim for each.
     pub pw_node: String,
+    /// Which execution provider is running the matting network, and why if it is not the
+    /// one that was asked for — e.g. "cpu (the GPU provider found 0.0% of the frame to be
+    /// subject where the CPU found 8.8%)".
+    ///
+    /// Reported for the same reason `gpu_adapter` is: the fast path and the correct path
+    /// turned out to be different providers on the reference machine, and a matte that
+    /// quietly decays to nothing is indistinguishable from "the effect is off" unless
+    /// something says which engine produced it.
+    pub matting_engine: String,
     pub stats: PipelineStats,
 }
 

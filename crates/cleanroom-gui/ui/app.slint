@@ -83,6 +83,21 @@ export component AppWindow inherits Window {
     in-out property <bool> denoise: true;
     in-out property <float> attenuation: 40;
 
+    // --- background fine tuning ---
+    in-out property <float> desaturate: 0;
+    in-out property <float> dim: 0;
+    in-out property <float> tighten: 0;
+    in-out property <bool> guided-filter: true;
+    // float, not int: it is two-way bound to a Slider, whose `value` is a float, and Slint
+    // requires both sides of `<=>` to agree. Rounded on the way out to the daemon.
+    in-out property <float> guided-radius: 3;
+
+    // Which execution provider runs the matting network: 0 auto, 1 gpu, 2 cpu. A
+    // correctness setting, which is why it is surfaced at all rather than left in the file.
+    in-out property <int> matting-backend: 0;
+    // What the daemon actually ended up running, plus why if it had to change its mind.
+    in property <string> matting-detail: "";
+
     callback set-camera(string);
     callback set-microphone(string);
     callback choose-background-image();
@@ -93,6 +108,12 @@ export component AppWindow inherits Window {
     callback set-mirror(bool);
     callback set-denoise(bool);
     callback set-attenuation(float);
+    callback set-desaturate(float);
+    callback set-dim(float);
+    callback set-tighten(float);
+    callback set-guided-filter(bool);
+    callback set-guided-radius(float);
+    callback set-matting-backend(int);
     callback quit-daemon();
 
     // Wrapped in a ScrollView because the content is taller than the window on a
@@ -184,7 +205,7 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 HorizontalBox {
                     padding: 0px;
-                    Text { text: "Camera"; width: 76px; vertical-alignment: center; }
+                    Text { text: "Camera"; width: 96px; vertical-alignment: center; }
                     ComboBox {
                         model: root.camera-names;
                         current-index: root.camera-index;
@@ -195,7 +216,7 @@ export component AppWindow inherits Window {
                 }
                 HorizontalBox {
                     padding: 0px;
-                    Text { text: "Microphone"; width: 76px; vertical-alignment: center; }
+                    Text { text: "Microphone"; width: 96px; vertical-alignment: center; }
                     ComboBox {
                         model: root.microphone-names;
                         current-index: root.microphone-index;
@@ -257,6 +278,123 @@ export component AppWindow inherits Window {
                         checked <=> root.mirror;
                         toggled => { root.set-mirror(self.checked); }
                     }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Background fine tuning";
+            VerticalBox {
+                spacing: 8px;
+
+                // Both apply to the background plane only, so the subject keeps its colour
+                // and exposure. Live on the next frame, like blur strength.
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Desaturate"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0; maximum: 1;
+                        value <=> root.desaturate;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-desaturate(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.desaturate * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Dim"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0; maximum: 1;
+                        value <=> root.dim;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-dim(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.dim * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Edge tighten"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0; maximum: 0.9;
+                        value <=> root.tighten;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-tighten(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.tighten * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: "Tighten pulls the cutout inward. Raise it if a bright fringe traces your shoulders against a replaced background.";
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    opacity: 0.7;
+                }
+
+                HorizontalBox {
+                    spacing: 8px;
+                    Switch {
+                        text: "Edge-aware matte upscaling";
+                        checked <=> root.guided-filter;
+                        toggled => { root.set-guided-filter(self.checked); }
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Edge radius"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 1; maximum: 12;
+                        value <=> root.guided-radius;
+                        enabled: root.guided-filter;
+                        released(v) => { root.set-guided-radius(Math.round(v)); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.guided-radius);
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        GroupBox {
+            title: "Matting engine";
+            VerticalBox {
+                spacing: 8px;
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Run on"; width: 96px; vertical-alignment: center; }
+                    ComboBox {
+                        model: ["Automatic (verified)", "GPU", "CPU"];
+                        current-index <=> root.matting-backend;
+                        horizontal-stretch: 1;
+                        selected => { root.set-matting-backend(self.current-index); }
+                    }
+                }
+                // Not decoration. The GPU provider on this stack can return a matte that
+                // quietly fades out while you sit still, and "Automatic" is the mode that
+                // notices and moves to the CPU. Saying which one is live, and why, is the
+                // difference between a fixed bug and a mysterious one.
+                Text {
+                    text: root.matting-detail;
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    opacity: 0.7;
+                    visible: root.matting-detail != "";
                 }
             }
         }

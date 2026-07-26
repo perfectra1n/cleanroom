@@ -1078,6 +1078,7 @@ dependencies = [
 name = "cleanroom-matting"
 version = "0.1.0"
 dependencies = [
+ "image",
  "ort",
  "thiserror 2.0.19",
  "tracing",

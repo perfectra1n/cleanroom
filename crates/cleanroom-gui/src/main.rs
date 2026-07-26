@@ -68,6 +68,12 @@ struct Snapshot {
     mirror: bool,
     denoise: bool,
     attenuation: f32,
+    desaturate: f32,
+    dim: f32,
+    tighten: f32,
+    guided_filter: bool,
+    guided_radius: f32,
+    matting_backend: i32,
     background_image: String,
     /// `None` when this poll skipped the expensive parts (see `DEVICE_POLL_EVERY`).
     devices: Option<Devices>,
@@ -280,6 +286,38 @@ async fn poll(with_devices: bool) -> Option<Snapshot> {
             .ok()?
             .parse()
             .unwrap_or(40.0),
+        desaturate: p
+            .get("video.background_desaturate")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.0),
+        dim: p
+            .get("video.background_dim")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.0),
+        // `(unset)` is the honest answer for an optional that is deriving its value per
+        // mode, and it must read as 0 on the slider rather than as a parse failure.
+        tighten: p
+            .get("video.matte_tighten")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.0),
+        guided_filter: p.get("video.guided_filter").await.ok()? == "true",
+        guided_radius: p
+            .get("video.guided_radius")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(3.0),
+        matting_backend: match p.get("video.matting_backend").await.ok()?.as_str() {
+            "gpu" => 1,
+            "cpu" => 2,
+            _ => 0,
+        },
     })
 }
 
@@ -352,6 +390,7 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_audio_health(health_code(&s.status.audio_health));
     ui.set_audio_detail(s.status.audio_detail.into());
     ui.set_gpu_adapter(s.status.gpu_adapter.into());
+    ui.set_matting_detail(s.status.matting_engine.into());
     ui.set_vcam_path(if s.status.vcam_path.is_empty() {
         "—".into()
     } else {
@@ -405,6 +444,12 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_mirror(s.mirror);
     ui.set_denoise(s.denoise);
     ui.set_attenuation(s.attenuation);
+    ui.set_desaturate(s.desaturate);
+    ui.set_dim(s.dim);
+    ui.set_tighten(s.tighten);
+    ui.set_guided_filter(s.guided_filter);
+    ui.set_guided_radius(s.guided_radius);
+    ui.set_matting_backend(s.matting_backend);
 }
 
 fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
@@ -544,6 +589,28 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     ui.on_set_denoise(move |b| s("audio.denoise.enabled", b.to_string()));
     let s = send.clone();
     ui.on_set_attenuation(move |v| s("audio.denoise.attenuation_db", format!("{}", v.round())));
+
+    let s = send.clone();
+    ui.on_set_desaturate(move |v| s("video.background_desaturate", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_dim(move |v| s("video.background_dim", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_tighten(move |v| s("video.matte_tighten", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_guided_filter(move |b| s("video.guided_filter", b.to_string()));
+    let s = send.clone();
+    ui.on_set_guided_radius(move |v| s("video.guided_radius", format!("{}", v.round() as u32)));
+    let s = send.clone();
+    ui.on_set_matting_backend(move |i| s("video.matting_backend", backend_name(i).to_string()));
+}
+
+/// Combo index to the config value. Order matches the `model` in `app.slint`.
+fn backend_name(i: i32) -> &'static str {
+    match i {
+        1 => "gpu",
+        2 => "cpu",
+        _ => "auto",
+    }
 }
 
 fn wire_tray(tray: &Tray, ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {

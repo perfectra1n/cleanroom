@@ -38,7 +38,13 @@ fn main() {
     let frame = vec![128u8; px * 4];
 
     println!("creating session");
-    let mut matter = Matter::new(&model).expect("session must build");
+    let mut matter = Matter::new(
+        &model,
+        cleanroom_matting::Backend::Gpu,
+        cleanroom_matting::INFER_W,
+        cleanroom_matting::INFER_H,
+    )
+    .expect("session must build");
 
     println!("running inference (the fault only shows up after real work)");
     for _ in 0..4 {

@@ -19,6 +19,9 @@ const OPTIONAL_KEYS: &[&str] = &[
     "audio.device",
     "video.device",
     "video.background_image",
+    "video.matte_tighten",
+    "video.matting_width",
+    "video.matting_height",
     "gpu.render_node",
 ];
 

@@ -70,6 +70,8 @@ pub struct Shared {
     gpu_adapter: RwLock<String>,
     vcam_path: RwLock<String>,
     pw_node: RwLock<String>,
+    /// Which matting provider is live, and why if it was not the requested one.
+    matting_engine: RwLock<String>,
 
     /// Set by the logind watcher when the system is about to suspend; cleared on resume.
     /// The video thread polls it and releases its devices.
@@ -105,6 +107,7 @@ impl Shared {
             gpu_adapter: RwLock::new("not initialised".into()),
             vcam_path: RwLock::new(String::new()),
             pw_node: RwLock::new(String::new()),
+            matting_engine: RwLock::new(String::new()),
             suspend: AtomicBool::new(false),
             suspend_ack: AtomicBool::new(false),
             rt_status: RwLock::new(crate::realtime::RtStatus::default()),
@@ -212,6 +215,13 @@ impl Shared {
         self.suspend_ack.load(Ordering::SeqCst)
     }
 
+    pub fn set_matting_engine(&self, s: impl Into<String>) {
+        *self
+            .matting_engine
+            .write()
+            .expect("matting engine lock poisoned") = s.into();
+    }
+
     pub fn set_pw_node(&self, s: impl Into<String>) {
         *self.pw_node.write().expect("pw lock poisoned") = s.into();
     }
@@ -231,6 +241,11 @@ impl Shared {
             gpu_adapter: self.gpu_adapter.read().expect("gpu lock poisoned").clone(),
             vcam_path: self.vcam_path.read().expect("vcam lock poisoned").clone(),
             pw_node: self.pw_node.read().expect("pw lock poisoned").clone(),
+            matting_engine: self
+                .matting_engine
+                .read()
+                .expect("matting engine lock poisoned")
+                .clone(),
             stats: self.stats.read().expect("stats lock poisoned").clone(),
         }
     }

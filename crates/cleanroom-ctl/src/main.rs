@@ -133,6 +133,12 @@ async fn status(proxy: &CleanroomProxy<'_>) -> Result<()> {
     if !s.pw_node.is_empty() {
         println!("pw node  {}", s.pw_node);
     }
+    // Which engine produced the matte, on the same footing as which GPU produced the
+    // frame. A matte that decays to nothing looks exactly like "the effect is off", so the
+    // provider is not an implementation detail the user can be left to guess at.
+    if !s.matting_engine.is_empty() {
+        println!("matting  {}", s.matting_engine);
+    }
 
     let st = &s.stats;
     println!();

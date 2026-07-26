@@ -12,7 +12,7 @@ use crate::state::{HealthState, Shared};
 use cleanroom_core::Config;
 use cleanroom_gpu::{FramePipeline, Gpu};
 use cleanroom_ipc::PipelineStats;
-use cleanroom_matting::{INFER_H, INFER_W, Matter};
+use cleanroom_matting::Matter;
 use cleanroom_video::{Camera, ConsumerWatch, FrameDecoder, LoopbackSink, Yuy2Frame};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,8 +108,15 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     // restart, so somebody has to say when it is no longer meaningful.
     let mut matter: Option<Matter> = None;
 
+    // Sticky for the life of the process: once the cross-check has caught the GPU provider
+    // returning an empty matte, `auto` must stop offering it another chance. Without this,
+    // every restart would re-request the GPU, be demoted ~90 frames later, restart to
+    // re-size, and go round again — a loop whose symptom is a camera that hitches every
+    // three seconds forever.
+    let mut matting_demoted = false;
+
     while !stop.load(Ordering::Relaxed) {
-        match run_once(&shared, &stop, &mut matter) {
+        match run_once(&shared, &stop, &mut matter, &mut matting_demoted) {
             Ok(Outcome::Stopped) => return,
             Ok(Outcome::Restart) => continue,
             Err(e) => {
@@ -132,6 +139,7 @@ fn run_once(
     shared: &Arc<Shared>,
     stop: &AtomicBool,
     matter: &mut Option<Matter>,
+    matting_demoted: &mut bool,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let cfg = shared.config();
 
@@ -205,6 +213,14 @@ fn run_once(
     let mut gpu = gpu;
     let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
 
+    if let Some(pipe) = gpu.as_mut() {
+        pipe.set_guided(
+            cfg.video.guided_filter,
+            cfg.video.guided_radius,
+            cfg.video.guided_eps,
+        );
+    }
+
     // Matting. Only *run* when a background effect actually needs a matte — with the mode
     // Off there is nothing to segment, and computing an unused alpha would be pure waste.
     //
@@ -213,6 +229,8 @@ fn run_once(
     // What it must never be is *silently* the same as having one.
     let mut matte_rgba = Vec::new();
     let want_matte = gpu.is_some() && cfg.video.background != cleanroom_core::BackgroundMode::Off;
+    // Which provider this run sized the matte for, so a mid-run demotion can be noticed.
+    let mut sized_for_gpu = true;
 
     // Note what does *not* happen when a matte is not wanted: the Matter is not dropped.
     //
@@ -221,8 +239,33 @@ fn run_once(
     // load and a second Dawn context to come back. Holding it is therefore both cheaper and
     // simpler, and makes an Off -> Blur toggle instant rather than a reload.
     if want_matte {
+        // The requested provider decides the inference size, because the two have budgets
+        // that differ by 4x. `Auto` is sized for the GPU it is about to try; if the
+        // cross-check later demotes it to the CPU, the pipeline restarts and re-sizes.
+        let requested = match cfg.video.matting_backend {
+            // Already caught lying once this process; do not offer it the GPU again.
+            cleanroom_core::MattingBackend::Auto if *matting_demoted => {
+                cleanroom_matting::Backend::Cpu
+            }
+            cleanroom_core::MattingBackend::Auto => cleanroom_matting::Backend::Auto,
+            cleanroom_core::MattingBackend::Gpu => cleanroom_matting::Backend::Gpu,
+            cleanroom_core::MattingBackend::Cpu => cleanroom_matting::Backend::Cpu,
+        };
+        let on_gpu = requested != cleanroom_matting::Backend::Cpu;
+        let (mw, mh) = cfg.video.matting_size(on_gpu);
+
+        // Rebuild when the geometry or the provider changed under us: the recurrent state
+        // and every buffer here are shaped from those two, so a stale Matter is a shape
+        // error waiting to happen rather than merely a suboptimal one.
+        if matter
+            .as_ref()
+            .is_some_and(|m| m.infer_w() != mw || m.infer_h() != mh)
+        {
+            *matter = None;
+        }
+
         if matter.is_none() {
-            match cleanroom_matting::find_model().and_then(|m| Matter::new(&m)) {
+            match cleanroom_matting::find_model().and_then(|m| Matter::new(&m, requested, mw, mh)) {
                 Ok(m) => *matter = Some(m),
                 Err(e) => {
                     shared.set_video_health(HealthState::degraded(format!(
@@ -230,6 +273,21 @@ fn run_once(
                          unavailable: {e}"
                     )));
                 }
+            }
+        }
+
+        // Record what actually runs, not what was asked for. `auto` on a machine with no
+        // GPU provider at all resolves straight to the CPU here, and the loop below has to
+        // compare against reality or it would restart on the first frame, forever.
+        if let Some(m) = matter.as_ref() {
+            shared.set_matting_engine(describe_engine(m));
+            sized_for_gpu = m.backend() != cleanroom_matting::Backend::Cpu;
+            if !sized_for_gpu && on_gpu {
+                // Sized for a provider we did not get. Remember it and restart once so the
+                // matte is rebuilt at the CPU's affordable resolution.
+                *matting_demoted = true;
+                tracing::info!("matting resolved to the CPU provider; re-sizing the matte");
+                return Ok(Outcome::Restart);
             }
         }
 
@@ -242,9 +300,9 @@ fn run_once(
             // of matte that belong to the previous scene.
             m.reset();
             if let Some(pipe) = gpu.as_mut() {
-                pipe.enable_matte_input(INFER_W, INFER_H);
+                pipe.enable_matte_input(m.infer_w(), m.infer_h());
             }
-            matte_rgba = vec![0u8; (INFER_W * INFER_H * 4) as usize];
+            matte_rgba = vec![0u8; (m.infer_w() * m.infer_h() * 4) as usize];
         }
     }
 
@@ -287,6 +345,20 @@ fn run_once(
         let now_cfg = shared.config();
         if needs_restart(&cfg, &now_cfg, &cam_path) {
             tracing::info!("video config changed; restarting pipeline");
+            return Ok(Outcome::Restart);
+        }
+
+        // The matting cross-check can demote the GPU to the CPU mid-run, and the two want
+        // different inference resolutions — 512x288 costs 7 ms on the GPU and 39 ms on the
+        // CPU, which is the difference between holding 30 fps and not. Restart so the size
+        // is re-derived for the provider that actually ended up running.
+        if matting_active
+            && matter
+                .as_ref()
+                .is_some_and(|m| (m.backend() != cleanroom_matting::Backend::Cpu) != sized_for_gpu)
+        {
+            *matting_demoted = true;
+            tracing::info!("matting backend changed; restarting to re-size the matte");
             return Ok(Outcome::Restart);
         }
 
@@ -427,9 +499,18 @@ fn run_once(
                 pipe.process(
                     &frame.data,
                     &mut processed,
-                    effective_background,
-                    now_cfg.video.blur_strength,
-                    now_cfg.video.mirror,
+                    cleanroom_gpu::Look {
+                        mode: effective_background,
+                        blur_strength: now_cfg.video.blur_strength,
+                        mirror: now_cfg.video.mirror,
+                        desaturate: now_cfg.video.background_desaturate,
+                        dim: now_cfg.video.background_dim,
+                        // Resolved against the mode actually being rendered, not the one
+                        // configured: a missing background image degrades Replace to Blur,
+                        // and carrying Replace's tighter edge into that would erode the
+                        // silhouette for no reason.
+                        tighten: now_cfg.video.tighten_for(effective_background),
+                    },
                 );
                 // Matting runs *after* the composite, so its matte applies to the next
                 // frame rather than this one. One frame of latency is invisible, and it
@@ -438,10 +519,13 @@ fn run_once(
                 // on every single frame.
                 if let Some(m) = matter.as_mut().filter(|_| matting_active) {
                     let t2 = Instant::now();
+                    // Read before inferring: `alpha` borrows `m`, so the geometry has to be
+                    // out before the match arm needs it.
+                    let (matte_w, matte_h) = (m.infer_w(), m.infer_h());
                     if pipe.read_matte_input(&mut matte_rgba) {
                         match m.infer(&matte_rgba) {
                             Ok(alpha) => {
-                                pipe.set_matte(alpha, INFER_W, INFER_H);
+                                pipe.set_matte(alpha, matte_w, matte_h);
                                 infer_errors = 0;
                             }
                             Err(e) => {
@@ -634,6 +718,16 @@ fn degrade(
     cleanroom_core::BackgroundMode::Blur
 }
 
+/// One line naming the live matting provider, its geometry, and any reason it changed.
+fn describe_engine(m: &Matter) -> String {
+    let mut s = format!("{} at {}x{}", m.backend(), m.infer_w(), m.infer_h());
+    if !m.note.is_empty() {
+        s.push_str(" — ");
+        s.push_str(&m.note);
+    }
+    s
+}
+
 /// Whether a config change needs the devices reopened.
 ///
 /// Split out of the frame loop so the policy can be tested without a camera. The
@@ -664,6 +758,12 @@ fn needs_restart(started_with: &Config, now: &Config, cam_path: &str) -> bool {
         // Publishing or withdrawing a PipeWire node means starting or stopping a thread
         // that was handed the negotiated geometry at construction.
         || now.video.pipewire_source != started_with.video.pipewire_source
+        // The provider decides the session, and the matte size decides every buffer between
+        // the downscale pass and the network's input tensor. Neither can be swapped under a
+        // running Matter, so both are a reopen rather than a live read.
+        || now.video.matting_backend != started_with.video.matting_backend
+        || (now.video.matting_width, now.video.matting_height)
+            != (started_with.video.matting_width, started_with.video.matting_height)
 }
 
 /// Accumulates per-second telemetry.

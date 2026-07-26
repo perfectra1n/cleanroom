@@ -21,15 +21,100 @@
 //! the model dump makes the shared names plainly visible, so it is worth knowing before
 //! someone tries a different execution provider.
 
-use ort::ep::{ExecutionProvider, WebGPU};
+use ort::ep::{CPUExecutionProvider, WebGPU};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::{Path, PathBuf};
 
 /// Matting input width. The network is fully convolutional, so this is free; 512x288 is the
 /// 16:9 box the reference implementation uses for HD input, and what the spike measured.
+///
+/// These remain the defaults, but the working resolution is now a runtime value: the CPU
+/// provider costs 39 ms/frame here and 10.6 ms at 256x144, and the difference between those
+/// two is the difference between holding 30 fps and not. See [`Backend`].
 pub const INFER_W: u32 = 512;
 pub const INFER_H: u32 = 288;
+
+/// Which execution provider runs the network.
+///
+/// This is not a performance knob. The WebGPU provider in ONNX Runtime 1.24.2 returns a
+/// **wrong** matte for this model — see [`Matter::infer`]'s cross-check — and the whole
+/// reason this enum exists is that "fast" and "correct" turned out to be different
+/// backends on the reference machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Try the GPU, then prove it against the CPU on the first usable frame and switch if
+    /// the GPU is wrong. The only setting that cannot silently produce a dead matte.
+    Auto,
+    /// Force the WebGPU provider and trust it. Fast; verify it yourself.
+    Gpu,
+    /// Force the CPU provider. Slower, and correct everywhere it has been measured.
+    Cpu,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Backend::Auto => "auto",
+            Backend::Gpu => "gpu",
+            Backend::Cpu => "cpu",
+        })
+    }
+}
+
+impl std::str::FromStr for Backend {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Backend::Auto),
+            "gpu" | "webgpu" => Ok(Backend::Gpu),
+            "cpu" => Ok(Backend::Cpu),
+            other => Err(format!(
+                "unknown matting backend `{other}` (expected auto, gpu or cpu)"
+            )),
+        }
+    }
+}
+
+/// Alpha above which a pixel counts as subject.
+const SUBJECT_ALPHA: f32 = 0.5;
+
+/// Fraction of the frame that has to read as subject before the matte is "working".
+///
+/// Deliberately a *coverage* test rather than a peak one. Peak alpha is a single pixel and
+/// therefore noise: the broken WebGPU path still produced the occasional stray texel above
+/// 0.5, which was enough to make a peak-based check declare it healthy while every frame
+/// came out uniformly blurred. Coverage cannot be faked that way — measured on the same
+/// frame, the CPU provider called 22.7% of pixels subject and the WebGPU provider 0.0%.
+///
+/// 2% of a 16:9 frame is a person occupying about a seventh of the width at full height:
+/// far smaller than anyone sits from a webcam, and far larger than any amount of speckle.
+const MIN_SUBJECT_COVERAGE: f32 = 0.02;
+
+/// Consecutive subject-less frames that trigger a cross-check against the CPU.
+///
+/// Verification is continuous rather than one-shot, and the reason is the exact shape of
+/// the WebGPU defect. Measured on one static frame run repeatedly through the provider, the
+/// mean alpha decays 0.039 -> 0.027 -> 0.018 -> 0.005 -> 0.002 over ten frames: the
+/// recurrent state degrades on every hand-off until the matte is gone. The CPU provider
+/// holds 0.227 indefinitely on the same input.
+///
+/// A one-shot check at startup passes cleanly and then latches, because early frames still
+/// carry signal — and the failure appears later, precisely when the subject stops moving.
+/// Which is to say: it works in testing and breaks the moment somebody sits still in a
+/// meeting. So the matte is watched for as long as the GPU is in use.
+///
+/// 45 frames is 1.5 s at 30 fps: longer than any blink of the matte, shorter than anyone
+/// would tolerate watching their own face blurred.
+const COLLAPSE_STREAK: u32 = 45;
+
+/// Ceiling for the backoff between inconclusive cross-checks.
+///
+/// A check is inconclusive when *neither* provider finds a subject, which is what an empty
+/// room looks like — and an empty room can last all day. Doubling the wait each time keeps
+/// the answer prompt when someone sits down in the first few seconds without paying 40 ms
+/// of CPU inference every second forever when nobody does.
+const VALIDATION_MAX_WAIT: u32 = 900;
 
 /// RVM's internal downsample ratio, derived rather than hardcoded.
 ///
@@ -85,8 +170,9 @@ pub enum MattingError {
 
     #[error(
         "could not register the WebGPU execution provider: {0}\n\
-         This is deliberate rather than a silent fall back to CPU: CPU matting cannot hold \
-         a 33 ms frame budget, and a slow path nobody notices is worse than an error."
+         `video.matting_backend = auto` falls back to the CPU provider here and says so; \
+         this error means the GPU was asked for explicitly, and silently running 4x slower \
+         would be worse than failing."
     )]
     NoGpu(String),
 
@@ -157,6 +243,25 @@ pub struct Matter {
     /// How many frames were rejected by the degenerate-alpha guard.
     pub rejected: u64,
     frames: u64,
+
+    /// Inference geometry. Runtime rather than `const` because the viable resolution
+    /// depends on which provider ended up running.
+    width: u32,
+    height: u32,
+    /// The provider actually in use. Never `Auto` — that is a request, not a result.
+    backend: Backend,
+    /// Set while the GPU is in use under `Auto` and therefore still on probation — which is
+    /// for as long as it runs, not just at startup. Holds the model path, because proving
+    /// the GPU wrong means building a CPU session to compare against.
+    unproven: Option<PathBuf>,
+    /// Consecutive frames the GPU has reported no subject, against [`COLLAPSE_STREAK`].
+    validation_frames: u32,
+    /// Streak length required for the next check; doubles on each inconclusive result so an
+    /// empty room does not pay for a CPU inference over and over.
+    validation_wait: u32,
+    /// Why the backend ended up where it did, for `status` and `doctor` to report. Empty
+    /// when nothing surprising happened.
+    pub note: String,
 }
 
 /// Serialises session construction, process-wide.
@@ -174,37 +279,135 @@ pub struct Matter {
 /// It is held across construction only, never across inference.
 static SESSION_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-impl Matter {
-    pub fn new(model: &Path) -> Result<Self, MattingError> {
-        // Poisoning is irrelevant here: the guard protects an external library's global
-        // initialisation, not any state of ours, so a previous panic leaves nothing invalid.
-        let _serialise = SESSION_INIT.lock().unwrap_or_else(|e| e.into_inner());
+/// Build one session on one provider.
+///
+/// `.error_on_failure()` on the GPU path is the single most important call here. Without it
+/// ort silently registers nothing and runs on the CPU, and the pipeline would appear to work
+/// while missing its budget — the exact silent degradation this project exists to avoid.
+/// During the spike it caught a real fault (Dawn could not find libvulkan.so.1) that would
+/// otherwise have produced a fabricated GPU number.
+fn build_session(model: &Path, backend: Backend) -> Result<Session, MattingError> {
+    // Poisoning is irrelevant here: the guard protects an external library's global
+    // initialisation, not any state of ours, so a previous panic leaves nothing invalid.
+    let _serialise = SESSION_INIT.lock().unwrap_or_else(|e| e.into_inner());
 
-        // `.error_on_failure()` is the single most important call here. Without it ort
-        // silently registers nothing and runs on the CPU, and the pipeline would appear to
-        // work while missing its budget by 10x — the exact silent degradation this project
-        // exists to avoid. During the spike this call caught a real fault (Dawn could not
-        // find libvulkan.so.1) that would otherwise have produced a fabricated GPU number.
-        let session = Session::builder()
-            .map_err(|e| MattingError::NoGpu(e.to_string()))?
+    let builder = Session::builder().map_err(|e| MattingError::NoGpu(e.to_string()))?;
+    let mut builder = match backend {
+        Backend::Cpu => builder
+            .with_execution_providers([CPUExecutionProvider::default().build()])
+            .map_err(|e| MattingError::NoGpu(e.to_string()))?,
+        _ => builder
             .with_execution_providers([WebGPU::default().build().error_on_failure()])
-            .map_err(|e| MattingError::NoGpu(e.to_string()))?
-            .commit_from_file(model)
-            .map_err(|e| MattingError::Load {
-                path: model.to_path_buf(),
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| MattingError::NoGpu(e.to_string()))?,
+    };
+    builder
+        .commit_from_file(model)
+        .map_err(|e| MattingError::Load {
+            path: model.to_path_buf(),
+            detail: e.to_string(),
+        })
+}
 
-        let available = WebGPU::default().is_available().unwrap_or(false);
+/// Fraction of the matte that reads as subject.
+///
+/// The one statistic that distinguishes a working matte from a dead one, and the reason it
+/// is a fraction rather than a maximum: see [`MIN_SUBJECT_COVERAGE`].
+fn subject_coverage(pha: &[f32]) -> f32 {
+    if pha.is_empty() {
+        return 0.0;
+    }
+    pha.iter().filter(|&&v| v > SUBJECT_ALPHA).count() as f32 / pha.len() as f32
+}
+
+/// One forward pass: threads the recurrent state in and out, returns the alpha plane.
+///
+/// A free function rather than a method so the cross-check can drive a *second*, temporary
+/// session with the same code. Returning an owned `Vec` costs one 590 kB copy per frame at
+/// 512x288 (~60 us, against 7-40 ms of inference) and buys the caller a result that does not
+/// borrow the session — which is what lets `infer` keep using `&mut self` afterwards.
+fn run_frame(
+    session: &mut Session,
+    input: &[f32],
+    state: &mut [State],
+    width: u32,
+    height: u32,
+) -> Result<Vec<f32>, MattingError> {
+    let src = Tensor::from_array((vec![1i64, 3, height as i64, width as i64], input.to_vec()))
+        .map_err(|e| MattingError::Inference(e.to_string()))?;
+
+    let mut rs = Vec::with_capacity(4);
+    for s in state.iter() {
+        rs.push(
+            Tensor::from_array((s.0.clone(), s.1.clone()))
+                .map_err(|e| MattingError::Inference(e.to_string()))?,
+        );
+    }
+    let ratio = Tensor::from_array((vec![1i64], vec![DOWNSAMPLE_RATIO]))
+        .map_err(|e| MattingError::Inference(e.to_string()))?;
+
+    let mut it = rs.into_iter();
+    let outputs = session
+        .run(ort::inputs![
+            "src" => src,
+            "r1i" => it.next().unwrap(),
+            "r2i" => it.next().unwrap(),
+            "r3i" => it.next().unwrap(),
+            "r4i" => it.next().unwrap(),
+            "downsample_ratio" => ratio,
+        ])
+        .map_err(|e| MattingError::Inference(e.to_string()))?;
+
+    // Carry the recurrent state forward. This is the step that makes the matte stable frame
+    // to frame rather than flickering.
+    for (i, name) in ["r1o", "r2o", "r3o", "r4o"].iter().enumerate() {
+        let (shape, data) = outputs[*name]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| MattingError::Inference(e.to_string()))?;
+        state[i] = (shape.iter().copied().collect(), data.to_vec());
+    }
+
+    let (_, pha) = outputs["pha"]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| MattingError::Inference(e.to_string()))?;
+    Ok(pha.to_vec())
+}
+
+impl Matter {
+    /// Load the model at `width`x`height` on `requested`.
+    ///
+    /// `Backend::Auto` prefers the GPU but does not trust it: the first frame containing a
+    /// subject is run through a CPU session as well, and the GPU is kept only if it agrees.
+    /// See [`Matter::infer`].
+    pub fn new(
+        model: &Path,
+        requested: Backend,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, MattingError> {
+        let mut note = String::new();
+        let (session, backend, unproven) = match requested {
+            Backend::Cpu => (build_session(model, Backend::Cpu)?, Backend::Cpu, None),
+            Backend::Gpu => (build_session(model, Backend::Gpu)?, Backend::Gpu, None),
+            Backend::Auto => match build_session(model, Backend::Gpu) {
+                Ok(s) => (s, Backend::Gpu, Some(model.to_path_buf())),
+                Err(e) => {
+                    // No GPU provider at all is a legitimate machine, not a failure. Say so
+                    // rather than refusing to start: a correct slow matte beats none.
+                    note = format!("no GPU provider ({e}); using the CPU provider");
+                    tracing::warn!(error = %e, "no WebGPU provider; falling back to CPU matting");
+                    (build_session(model, Backend::Cpu)?, Backend::Cpu, None)
+                }
+            },
+        };
+
         tracing::info!(
             model = %model.display(),
-            webgpu = available,
-            "matting model loaded ({}x{})",
-            INFER_W,
-            INFER_H
+            backend = %backend,
+            unproven = unproven.is_some(),
+            "matting model loaded ({width}x{height})"
         );
 
-        let px = (INFER_W * INFER_H) as usize;
+        let px = (width * height) as usize;
         Ok(Self {
             session: Some(session),
             // A (1,1,1,1) zero tensor is how RVM is told to auto-shape its state on the
@@ -216,7 +419,38 @@ impl Matter {
             smoothed: Vec::new(),
             rejected: 0,
             frames: 0,
+            width,
+            height,
+            backend,
+            unproven,
+            validation_frames: 0,
+            validation_wait: COLLAPSE_STREAK,
+            note,
         })
+    }
+
+    /// The provider actually running the network.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// Inference width, which the caller must match when sizing the downscale.
+    pub fn infer_w(&self) -> u32 {
+        self.width
+    }
+
+    /// Inference height.
+    pub fn infer_h(&self) -> u32 {
+        self.height
+    }
+
+    /// Whether the GPU provider is in use and still on probation.
+    ///
+    /// Stays true for as long as the GPU runs under `Auto`. The defect being watched for is
+    /// a matte that decays over seconds, so there is no point at which the provider can be
+    /// declared good and stop being checked.
+    pub fn is_unproven(&self) -> bool {
+        self.unproven.is_some()
     }
 
     /// Reset the recurrent state, as if no frame had ever been seen.
@@ -243,10 +477,11 @@ impl Matter {
 
     /// Run one frame.
     ///
-    /// `rgba` is tightly packed RGBA8 at [`INFER_W`]x[`INFER_H`] — what the GPU downscale
-    /// pass produces. Returns the alpha matte as R8 at the same size, ready to upload.
+    /// `rgba` is tightly packed RGBA8 at [`Matter::infer_w`]x[`Matter::infer_h`] — what the
+    /// GPU downscale pass produces. Returns the alpha matte as R8 at the same size, ready to
+    /// upload.
     pub fn infer(&mut self, rgba: &[u8]) -> Result<&[u8], MattingError> {
-        let px = (INFER_W * INFER_H) as usize;
+        let px = (self.width * self.height) as usize;
         debug_assert_eq!(rgba.len(), px * 4);
 
         // Interleaved RGBA to planar NCHW float, which is what RVM's input expects.
@@ -256,49 +491,17 @@ impl Matter {
             self.input[2 * px + i] = rgba[i * 4 + 2] as f32 / 255.0;
         }
 
-        let src = Tensor::from_array((
-            vec![1i64, 3, INFER_H as i64, INFER_W as i64],
-            self.input.clone(),
-        ))
-        .map_err(|e| MattingError::Inference(e.to_string()))?;
-
-        let mut rs = Vec::with_capacity(4);
-        for s in &self.state {
-            rs.push(
-                Tensor::from_array((s.0.clone(), s.1.clone()))
-                    .map_err(|e| MattingError::Inference(e.to_string()))?,
-            );
-        }
-        let ratio = Tensor::from_array((vec![1i64], vec![DOWNSAMPLE_RATIO]))
-            .map_err(|e| MattingError::Inference(e.to_string()))?;
-
-        let mut it = rs.into_iter();
-        let outputs = self
+        let session = self
             .session
             .as_mut()
-            .expect("session is only taken in Drop")
-            .run(ort::inputs![
-                "src" => src,
-                "r1i" => it.next().unwrap(),
-                "r2i" => it.next().unwrap(),
-                "r3i" => it.next().unwrap(),
-                "r4i" => it.next().unwrap(),
-                "downsample_ratio" => ratio,
-            ])
-            .map_err(|e| MattingError::Inference(e.to_string()))?;
-
-        // Carry the recurrent state forward. This is the step that makes the matte stable
-        // frame to frame rather than flickering.
-        for (i, name) in ["r1o", "r2o", "r3o", "r4o"].iter().enumerate() {
-            let (shape, data) = outputs[*name]
-                .try_extract_tensor::<f32>()
-                .map_err(|e| MattingError::Inference(e.to_string()))?;
-            self.state[i] = (shape.iter().copied().collect(), data.to_vec());
-        }
-
-        let (_, pha) = outputs["pha"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| MattingError::Inference(e.to_string()))?;
+            .expect("session is only taken in Drop");
+        let pha = run_frame(
+            session,
+            &self.input,
+            &mut self.state,
+            self.width,
+            self.height,
+        )?;
 
         // Degenerate-alpha guard.
         //
@@ -320,17 +523,113 @@ impl Matter {
             return Ok(&self.prev_alpha);
         }
 
-        // Field-level rather than `self.smooth(..)`: `pha` still borrows `self.session`
-        // through `outputs`, so a method taking `&mut self` would be a second borrow of the
-        // whole struct. Naming the one field it touches keeps the borrows disjoint and
-        // avoids copying the matte out just to satisfy the checker.
-        Self::smooth_into(&mut self.smoothed, self.frames, pha);
+        // Prove the GPU before trusting it — see `cross_check`.
+        if self.unproven.is_some() {
+            let coverage = subject_coverage(&pha);
+            self.cross_check(coverage);
+        }
+
+        Self::smooth_into(&mut self.smoothed, self.frames, &pha);
         for (dst, &v) in self.alpha.iter_mut().zip(self.smoothed.iter()) {
             *dst = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
         self.prev_alpha.copy_from_slice(&self.alpha);
         self.frames += 1;
         Ok(&self.alpha)
+    }
+
+    /// Decide whether the GPU provider is telling the truth, using the CPU as the oracle.
+    ///
+    /// The motivating defect: ONNX Runtime 1.24.2's WebGPU provider runs this model roughly
+    /// four times faster than the CPU provider and returns an alpha matte that is zero
+    /// everywhere. Nothing about that is detectable from inside a single provider — the
+    /// session builds, inference succeeds, the timings look excellent, and the composite
+    /// dutifully treats the entire frame as background and blurs the subject along with the
+    /// room. `.error_on_failure()` cannot catch it, because nothing fails.
+    ///
+    /// So the only honest check is a second opinion. When the GPU reports a frame with no
+    /// subject in it, run the *same* pixels through a CPU session: if the CPU finds a
+    /// subject where the GPU found none, the GPU is wrong and we switch permanently.
+    ///
+    /// Frames where the GPU already sees a subject prove it works, and cost nothing.
+    fn cross_check(&mut self, gpu_coverage: f32) {
+        // The GPU is finding a subject right now, so there is nothing to investigate. The
+        // streak resets rather than the provider being marked proven for good: this same
+        // provider produces a healthy matte and then lets it decay away over the following
+        // seconds, so "it worked a moment ago" is not evidence that it works now.
+        if gpu_coverage >= MIN_SUBJECT_COVERAGE {
+            self.validation_frames = 0;
+            return;
+        }
+
+        self.validation_frames += 1;
+
+        // An empty room also produces no subject, and that is not a fault. Only a sustained
+        // absence is worth spending a CPU inference to explain.
+        if self.validation_frames < self.validation_wait {
+            return;
+        }
+
+        let Some(model) = self.unproven.take() else {
+            return;
+        };
+
+        // One CPU session, one frame, on the pixels the GPU just called empty.
+        let verdict = build_session(&model, Backend::Cpu).and_then(|mut cpu| {
+            let mut fresh: Vec<State> = (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0f32])).collect();
+            run_frame(&mut cpu, &self.input, &mut fresh, self.width, self.height).inspect(|_| {
+                // Same trade as `Drop`: this session owns a provider context, and dropping
+                // it is what segfaults. It is one session for the life of the process.
+                std::mem::forget(cpu);
+            })
+        });
+
+        match verdict {
+            Ok(cpu_pha) => {
+                let cpu_coverage = subject_coverage(&cpu_pha);
+                if cpu_coverage < MIN_SUBJECT_COVERAGE {
+                    // Both blank: nobody is in front of the camera. Inconclusive, so leave
+                    // the GPU alone and re-arm rather than switching on no evidence.
+                    self.unproven = Some(model);
+                    self.validation_frames = 0;
+                    self.validation_wait = (self.validation_wait * 2).min(VALIDATION_MAX_WAIT);
+                    tracing::debug!(
+                        cpu_coverage,
+                        gpu_coverage,
+                        next_check_in = self.validation_wait,
+                        "matting cross-check inconclusive; no subject on either provider"
+                    );
+                    return;
+                }
+
+                // The CPU found a subject in pixels the GPU called empty. The GPU is wrong.
+                self.note = format!(
+                    "the GPU provider found {:.1}% of the frame to be subject where the CPU \
+                     found {:.1}%; switched to the CPU provider",
+                    gpu_coverage * 100.0,
+                    cpu_coverage * 100.0
+                );
+                tracing::warn!(gpu_coverage, cpu_coverage, "{}", self.note);
+                match build_session(&model, Backend::Cpu) {
+                    Ok(s) => {
+                        if let Some(old) = self.session.replace(s) {
+                            std::mem::forget(old);
+                        }
+                        self.backend = Backend::Cpu;
+                        self.reset();
+                    }
+                    Err(e) => {
+                        self.note =
+                            format!("the GPU matte looks wrong but the CPU provider failed: {e}");
+                        tracing::error!(error = %e, "could not switch to the CPU provider");
+                    }
+                }
+            }
+            Err(e) => {
+                self.note = format!("could not verify the GPU matte against the CPU: {e}");
+                tracing::warn!(error = %e, "matting cross-check failed");
+            }
+        }
     }
 
     /// Motion-adaptive, asymmetric temporal smoothing of the alpha matte.
@@ -413,6 +712,60 @@ impl Drop for Matter {
 mod tests {
     use super::*;
 
+    /// The regression this whole cross-check exists for.
+    ///
+    /// A peak-based test called the broken WebGPU provider healthy, because a matte that is
+    /// zero everywhere still throws the odd stray texel over 0.5. Coverage is what actually
+    /// separates the two, and these are the measured numbers from the reference machine on
+    /// one identical frame: 22.7% of pixels for the CPU provider, 0.0% for WebGPU.
+    #[test]
+    fn coverage_separates_a_working_matte_from_a_dead_one() {
+        let px = 512 * 288;
+
+        // A dead matte with speckle: nothing but noise, plus a handful of hot pixels.
+        let mut dead = vec![0.01f32; px];
+        for i in 0..20 {
+            dead[i * 997] = 0.9;
+        }
+        assert!(
+            subject_coverage(&dead) < MIN_SUBJECT_COVERAGE,
+            "speckle must not read as a subject, got {}",
+            subject_coverage(&dead)
+        );
+        assert!(
+            dead.iter().cloned().fold(f32::MIN, f32::max) > SUBJECT_ALPHA,
+            "this matte must be one a peak-based check would have wrongly passed"
+        );
+
+        // A working matte: a subject occupying a fifth of the frame.
+        let mut live = vec![0.0f32; px];
+        live[..px / 5].fill(1.0);
+        assert!(
+            subject_coverage(&live) >= MIN_SUBJECT_COVERAGE,
+            "a fifth of the frame is plainly a subject"
+        );
+    }
+
+    /// An empty room is not a broken GPU. Both providers legitimately return nothing, and
+    /// switching on that would be a false positive that costs 4x the inference time.
+    #[test]
+    fn an_empty_frame_reads_as_no_subject_on_any_provider() {
+        assert_eq!(subject_coverage(&vec![0.0f32; 1000]), 0.0);
+        assert_eq!(subject_coverage(&[]), 0.0);
+    }
+
+    #[test]
+    fn backend_parses_the_names_a_user_would_type() {
+        use std::str::FromStr;
+        assert_eq!(Backend::from_str("auto").unwrap(), Backend::Auto);
+        assert_eq!(Backend::from_str("CPU").unwrap(), Backend::Cpu);
+        assert_eq!(Backend::from_str(" gpu ").unwrap(), Backend::Gpu);
+        // `webgpu` is what the provider is called in ort and in every log line, so someone
+        // reading a log and typing what they saw must not get an error.
+        assert_eq!(Backend::from_str("webgpu").unwrap(), Backend::Gpu);
+        assert!(Backend::from_str("cuda").is_err());
+    }
+
     #[test]
     fn missing_model_error_is_actionable() {
         let e = MattingError::ModelNotFound {
@@ -428,10 +781,22 @@ mod tests {
         );
     }
 
+    /// The error is only reachable when the GPU was demanded explicitly, so it has to say
+    /// which setting relaxes it. There *is* a CPU fallback now — the failure mode this
+    /// project cares about turned out to be a GPU that runs and returns nonsense, not a GPU
+    /// that refuses to start — so an error implying no alternative exists would send someone
+    /// hunting for a Vulkan problem instead of typing one word.
     #[test]
-    fn no_gpu_error_explains_why_there_is_no_cpu_fallback() {
+    fn no_gpu_error_names_the_setting_that_falls_back() {
         let m = MattingError::NoGpu("dawn sad".into()).to_string();
-        assert!(m.contains("deliberate"), "must not read like a bug: {m}");
+        assert!(
+            m.contains("dawn sad"),
+            "must keep the underlying cause: {m}"
+        );
+        assert!(
+            m.contains("matting_backend"),
+            "must name the setting that falls back: {m}"
+        );
     }
 
     /// The asymmetry is the point, so it gets a test rather than a comment.
@@ -518,7 +883,10 @@ mod tests {
             eprintln!("RVM weights not installed; skipping");
             return;
         };
-        let mut m = match Matter::new(&model) {
+        // The CPU provider, deliberately. This test asserts shape, range and state hand-off,
+        // and it must do so against the provider that is known to compute them correctly —
+        // a GPU run here would be testing the machine's driver stack rather than this code.
+        let mut m = match Matter::new(&model, Backend::Cpu, INFER_W, INFER_H) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("could not load the model ({e}); skipping");

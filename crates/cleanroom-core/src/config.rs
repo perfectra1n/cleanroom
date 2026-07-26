@@ -58,6 +58,48 @@ pub struct VideoConfig {
     /// Gaussian-equivalent blur radius, 0.0..=1.0, mapped to a sigma internally.
     pub blur_strength: f32,
 
+    /// Pull the background toward grey, 0.0..=1.0. Applied to the background plane only,
+    /// so the subject keeps its colour. Blur alone leaves a busy room still legible as
+    /// colour and motion; a little desaturation is what makes it read as "not the point".
+    pub background_desaturate: f32,
+
+    /// Darken the background, 0.0..=1.0. Same idea as `background_desaturate`, and the two
+    /// together approximate the "spotlight" look without a second render pass.
+    pub background_dim: f32,
+
+    /// Pull the alpha edge inward, 0.0..=0.9. `None` picks per mode: nothing for blur,
+    /// where a generous silhouette against a blurred copy of the same room is invisible,
+    /// and a little for replace, where the same generosity is a bright halo tracing the
+    /// shoulders and ears. Set a number to force one value for every mode.
+    pub matte_tighten: Option<f32>,
+
+    /// Edge-aware upsampling of the matte, instead of a plain bilinear stretch.
+    ///
+    /// The matte is computed small and shown at frame size, and bilinear does not know
+    /// where the subject ends — it smears alpha across the boundary, which is the soft halo
+    /// around a shoulder and the background bleeding into hair. Off is faster and worse.
+    pub guided_filter: bool,
+
+    /// Guided-filter window radius in matte pixels. Larger is smoother and costs
+    /// `(2r+1)^2` taps per pixel.
+    pub guided_radius: u32,
+
+    /// Guided-filter regularisation. Larger means more smoothing and less edge-following;
+    /// this is the knob that trades a crisp-but-noisy edge against a clean-but-soft one.
+    pub guided_eps: f32,
+
+    /// Which execution provider runs the matting network. See [`MattingBackend`] — this is
+    /// a correctness setting, not just a speed one.
+    pub matting_backend: MattingBackend,
+
+    /// Matting input width. `None` derives it from the provider that ends up running: the
+    /// GPU can afford 512 px, the CPU cannot and gets 320. Raising it sharpens the matte
+    /// and costs inference time on a budget already shared with decode and compositing.
+    pub matting_width: Option<u32>,
+
+    /// Matting input height. `None` derives 16:9 from the width.
+    pub matting_height: Option<u32>,
+
     /// Path to a still image for [`BackgroundMode::Replace`]. Cover-fitted to frame.
     pub background_image: Option<PathBuf>,
 
@@ -92,12 +134,73 @@ impl Default for VideoConfig {
             fps: 30,
             background: BackgroundMode::Blur,
             blur_strength: 0.6,
+            background_desaturate: 0.0,
+            background_dim: 0.0,
+            matte_tighten: None,
+            guided_filter: true,
+            guided_radius: 3,
+            guided_eps: 1e-4,
+            matting_backend: MattingBackend::Auto,
+            matting_width: None,
+            matting_height: None,
             background_image: None,
             mirror: false,
             pipewire_source: true,
             power_save: true,
             card_label: "Cleanroom Camera".into(),
         }
+    }
+}
+
+/// Which ONNX Runtime execution provider runs the matting network.
+///
+/// A correctness setting before it is a speed setting. ONNX Runtime 1.24.2's WebGPU
+/// provider runs this model ~4x faster than the CPU provider and returns an alpha matte
+/// that is **zero everywhere**, which composites as "the whole frame is background" — the
+/// subject gets blurred along with the room. Nothing errors; it is simply wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MattingBackend {
+    /// Prefer the GPU, then prove it against the CPU on the first frame with a subject in
+    /// it and switch if it disagrees. The only value that cannot silently blur your face.
+    Auto,
+    /// Force the GPU provider. Fast, and unverified — check the output yourself.
+    Gpu,
+    /// Force the CPU provider. Correct on every machine measured so far.
+    Cpu,
+}
+
+impl VideoConfig {
+    /// The matting input size actually used, resolving `None` against the provider.
+    ///
+    /// The two providers have very different budgets — measured on an RTX 5090 with a
+    /// 33 ms frame, this model costs 4-18 ms on the GPU and 10.6 ms at 256x144 rising to
+    /// 39 ms at 512x288 on the CPU — so a single default cannot serve both. A GPU that
+    /// turns out to be wrong and falls back to the CPU would otherwise silently halve the
+    /// frame rate instead of the matte resolution.
+    ///
+    /// An explicit width with no height keeps 16:9, rounded to even so chroma subsampling
+    /// downstream never sees an odd dimension.
+    pub fn matting_size(&self, on_gpu: bool) -> (u32, u32) {
+        let w = self
+            .matting_width
+            .unwrap_or(if on_gpu { 512 } else { 320 })
+            .clamp(64, 1920);
+        let h = self
+            .matting_height
+            .unwrap_or(((w * 9 / 16) + 1) & !1)
+            .clamp(64, 1080);
+        (w, h)
+    }
+
+    /// How far to pull the alpha edge in, resolved per mode. See [`VideoConfig::matte_tighten`].
+    pub fn tighten_for(&self, mode: BackgroundMode) -> f32 {
+        self.matte_tighten
+            .unwrap_or(match mode {
+                BackgroundMode::Replace => 0.12,
+                _ => 0.0,
+            })
+            .clamp(0.0, 0.9)
     }
 }
 

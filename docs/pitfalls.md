@@ -169,6 +169,57 @@ and convert with the same matrix — then the error is **0**.
 
 ## ONNX Runtime / matting
 
+### The WebGPU EP runs RVM fast and returns a matte that decays to nothing
+
+**Symptom:** background blur appears not to work. Look closely and it *is* working — the
+whole frame is blurred, the subject included. It looks fine while somebody walks around the
+room and fails once they sit still, which is to say it fails during an actual video call and
+passes every casual test.
+
+**Cause:** ONNX Runtime 1.24.2's WebGPU provider degrades RVM's recurrent state on every
+frame hand-off. The same still frame, fed repeatedly through each provider:
+
+| pass | 1 | 2 | 3 | 5 | 10 |
+|------|---|---|---|---|----|
+| WebGPU mean alpha | 0.039 | 0.027 | 0.018 | 0.005 | **0.002** |
+| CPU mean alpha | 0.227 | 0.227 | 0.227 | 0.227 | **0.227** |
+
+Alpha ≈ 0 means "every pixel is background", so the composite blurs everything. Nothing
+errors, the session builds, and `matting_ms` looks excellent — 7 ms against the CPU's 39 ms.
+
+Ruled out, each by measurement rather than reasoning: `downsample_ratio` (wrong at 1.0, 0.5
+and 0.25), input resolution (wrong at 512x288 and 1920x1080), and adapter selection
+(identical with `VK_DRIVER_FILES` pinned to `nvidia_icd.json`).
+
+`.error_on_failure()` cannot catch this, because nothing fails. The only detector is a
+second opinion, so `video.matting_backend = auto` watches the matte for as long as the GPU
+runs and cross-checks against a CPU session when the subject disappears for 45 consecutive
+frames.
+
+**Two things that make the check work, both learned by getting them wrong first:**
+
+* **Measure coverage, not peak alpha.** A dead matte still throws stray texels above 0.5, so
+  a peak-based test declared the provider healthy and latched while every frame came out
+  uniformly blurred. The fraction of pixels above 0.5 separates cleanly: 22.7% versus 0.0%.
+* **Verify continuously, not once at startup.** Early frames still carry signal, so a
+  one-shot check passes and then latches — and the defect appears seconds later, exactly
+  when the subject stops moving.
+
+`examples/matte_sweep.rs` is the harness: one provider/ratio/resolution per process, since
+two ORT sessions in one process cannot be torn down. `examples/matte_probe.rs` prints the
+alpha histogram and a spatial map for a single still.
+
+Re-test on a new `ort` or a new Dawn before trusting the GPU path again.
+
+### Run the probe *inside* `nix develop`, or it measures nothing
+
+Running `target/release/examples/matte_sweep` directly with only `LD_LIBRARY_PATH` set to
+`target/release` fails to find `libvulkan.so.1`, so the WebGPU provider never registers.
+`.error_on_failure()` turns that into a panic — and the panic then *hangs* rather than
+exiting, because Dawn is mid-initialisation, which reads as "inference is extremely slow"
+rather than as "there is no GPU here". Two of these were misread as a hung model before the
+stderr was looked at directly instead of through a `grep`.
+
 ### nixpkgs' onnxruntime has no WebGPU EP
 
 ```sh

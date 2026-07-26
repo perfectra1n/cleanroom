@@ -9,8 +9,18 @@
 //!     nix develop -c cargo run --release -p cleanroom-gpu --example gpu_check
 
 use cleanroom_core::BackgroundMode;
-use cleanroom_gpu::{FramePipeline, Gpu};
+use cleanroom_gpu::{FramePipeline, Gpu, Look};
 use std::time::Instant;
+
+/// The three settings these checks vary, with everything else left at its default.
+fn look(mode: BackgroundMode, blur_strength: f32, mirror: bool) -> Look {
+    Look {
+        mode,
+        blur_strength,
+        mirror,
+        ..Default::default()
+    }
+}
 
 const W: u32 = 1920;
 const H: u32 = 1080;
@@ -74,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = vec![0u8; frame_bytes];
 
     // --- 1. round-trip fidelity ------------------------------------------------------
-    pipe.process(&input, &mut output, BackgroundMode::Off, 0.0, false);
+    pipe.process(&input, &mut output, look(BackgroundMode::Off, 0.0, false));
 
     let luma_err: Vec<i32> = input
         .iter()
@@ -107,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the composite, not the blur.
     pipe.set_matte(&[0u8], 1, 1);
     let mut blurred = vec![0u8; frame_bytes];
-    pipe.process(&input, &mut blurred, BackgroundMode::Blur, 1.0, false);
+    pipe.process(&input, &mut blurred, look(BackgroundMode::Blur, 1.0, false));
     pipe.set_matte(&[255u8], 1, 1);
 
     // Local luma variance is the cleanest proxy for detail: blur removes high-frequency
@@ -140,12 +150,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         // Warm up: first submissions include pipeline creation and allocation.
         for _ in 0..5 {
-            pipe.process(&input, &mut output, mode, strength, false);
+            pipe.process(&input, &mut output, look(mode, strength, false));
         }
         let n = 60;
         let t0 = Instant::now();
         for _ in 0..n {
-            pipe.process(&input, &mut output, mode, strength, false);
+            pipe.process(&input, &mut output, look(mode, strength, false));
         }
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
         println!(
@@ -157,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Mirroring is a free index flip inside the composite pass; confirm it actually flips.
     let mut mirrored = vec![0u8; frame_bytes];
-    pipe.process(&input, &mut mirrored, BackgroundMode::Off, 0.0, true);
+    pipe.process(&input, &mut mirrored, look(BackgroundMode::Off, 0.0, true));
     let row = (W / 2) as usize * 4;
     let left = mirrored[..4].to_vec();
     let right_of_normal = output[row - 4..row].to_vec();
@@ -190,7 +200,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pipe.set_matte(&[0u8], 1, 1); // all background, so the plate should be all we see
 
     let mut replaced = vec![0u8; frame_bytes];
-    pipe.process(&input, &mut replaced, BackgroundMode::Replace, 0.0, false);
+    pipe.process(
+        &input,
+        &mut replaced,
+        look(BackgroundMode::Replace, 0.0, false),
+    );
 
     // Compare in luma: the plate is a single flat colour, so a correct replace has almost
     // no luma variance, where the checkerboard has a great deal.
@@ -213,7 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sampling the matte directly rather than reading an uninitialised coefficient field.
     pipe.enable_matte_input(128, 72);
     let mut guided_out = vec![0u8; frame_bytes];
-    pipe.process(&input, &mut guided_out, BackgroundMode::Blur, 1.0, false);
+    pipe.process(
+        &input,
+        &mut guided_out,
+        look(BackgroundMode::Blur, 1.0, false),
+    );
     let mut small = vec![0u8; 128 * 72 * 4];
     let got_guidance = pipe.read_matte_input(&mut small);
     // A half-and-half matte at guidance resolution: the guided filter should keep the
@@ -226,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     pipe.set_matte(&half, 128, 72);
     let mut split = vec![0u8; frame_bytes];
-    pipe.process(&input, &mut split, BackgroundMode::Blur, 1.0, false);
+    pipe.process(&input, &mut split, look(BackgroundMode::Blur, 1.0, false));
 
     // Compare halves statistically rather than probing single pixels. Two lone texels can
     // agree by coincidence on a checkerboard, which is exactly what an earlier version of
