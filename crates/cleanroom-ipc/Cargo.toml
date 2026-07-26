@@ -1,0 +1,12 @@
+[package]
+name = "cleanroom-ipc"
+description = "Cleanroom's D-Bus control surface: names, DTOs, and the client proxy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cleanroom-core = { path = "../cleanroom-core" }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }

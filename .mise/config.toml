@@ -1,0 +1,141 @@
+# Cleanroom task runner.
+#
+# Everything here funnels through `nix develop -c`, which is not ceremony: this project
+# will not build or run outside the dev shell. Three hard reasons, all learned the hard
+# way during the M0a spikes (docs/spike-results.md):
+#
+#   * `pipewire-sys` and `v4l2-sys-mit` run bindgen and need LIBCLANG_PATH.
+#   * wgpu dlopens libvulkan.so.1 rather than linking it, and hand-globbing the nix store
+#     for it picks a 32-bit build about half the time — which surfaces from inside Dawn as
+#     "Couldn't load Vulkan: wrong ELF class", i.e. it reads as "no GPU" rather than as a
+#     path bug. `makeLibraryPath` in the flake always resolves the right architecture.
+#   * `ort`'s copy-dylibs drops libonnxruntime.so and libwebgpu_dawn.so next to the binary
+#     but sets no $ORIGIN rpath, so target/{debug,release} must be on LD_LIBRARY_PATH.
+#
+# Run `mise tasks` to list everything.
+
+[tools]
+# Rust comes from the nix flake, not from mise, so there is exactly one toolchain and it
+# matches what CI and the Nix build use. Listed tools are things the flake does not own.
+
+[settings]
+# Task output stays readable when several run under `check`.
+task_output = "prefix"
+
+[env]
+# Belt and braces for anyone invoking a binary directly rather than through a task.
+# The flake's shellHook sets the full path; this only adds the bit that depends on $PWD.
+LD_LIBRARY_PATH = "{{cwd}}/target/debug:{{cwd}}/target/release:{{env.LD_LIBRARY_PATH | default(value='')}}"
+
+# Fail loudly rather than silently landing on CPU. Mirrors the .error_on_failure() call
+# in the matting backend — the project's no-silent-degradation rule, applied to logs.
+RUST_LOG = "{{env.RUST_LOG | default(value='cleanroom=debug,info')}}"
+
+# --- build ---------------------------------------------------------------------------
+
+[tasks.build]
+description = "Build the workspace (debug)"
+run = "nix develop -c cargo build --workspace"
+
+[tasks."build:release"]
+description = "Build the workspace optimised — use this for anything you intend to measure"
+run = "nix develop -c cargo build --workspace --release"
+
+[tasks.test]
+description = "Run the test suite"
+run = "nix develop -c cargo test --workspace"
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "nix develop -c cargo fmt --all"
+
+[tasks.lint]
+description = "clippy + rustfmt check, warnings are errors"
+run = '''
+set -euo pipefail
+nix develop -c cargo fmt --all -- --check
+nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+'''
+
+[tasks.check]
+description = "Everything that must pass before committing"
+depends = ["lint", "test"]
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "cargo clean"
+
+# --- running -------------------------------------------------------------------------
+
+[tasks.daemon]
+description = "Run the daemon in the foreground with logging"
+run = "nix develop -c cargo run -p cleanroomd"
+
+[tasks.ctl]
+description = "Run the CLI: mise run ctl -- status"
+run = "nix develop -c cargo run -q -p cleanroom-ctl --"
+
+[tasks.gui]
+description = "Run the GUI"
+run = "nix develop -c cargo run -p cleanroom-gui"
+
+[tasks.doctor]
+description = "Environment check: GPU adapter, Vulkan ICDs, v4l2loopback, PipeWire, browser prefs"
+run = "nix develop -c cargo run -q -p cleanroom-ctl -- doctor"
+
+# --- spikes --------------------------------------------------------------------------
+# The M0a go/no-go probes, kept runnable so their results stay reproducible rather than
+# becoming folklore in a commit message.
+
+[tasks."spike:rvm"]
+description = "Matting spike on the default GPU — expect <10ms/frame"
+run = "nix develop -c cargo run --release -p spike-ort-rvm"
+
+[tasks."spike:rvm:nvidia"]
+description = "Matting spike pinned to the NVIDIA adapter"
+run = "VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json nix develop -c cargo run --release -p spike-ort-rvm"
+
+[tasks."spike:rvm:amd"]
+description = "Matting spike pinned to the AMD adapter — proves vendor neutrality with no ROCm installed"
+run = "VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/radeon_icd.x86_64.json nix develop -c cargo run --release -p spike-ort-rvm"
+
+[tasks."spike:vendor-neutral"]
+description = "Run the matting spike on BOTH GPUs back to back — the project's central claim"
+depends = ["spike:rvm:nvidia", "spike:rvm:amd"]
+
+[tasks."spike:slint"]
+description = "GUI toolkit spike: keyboard + resize + wgpu texture interop on this compositor"
+run = "nix develop -c cargo run --release -p spike-slint-hyprland"
+
+# --- environment ---------------------------------------------------------------------
+
+[tasks."env:show"]
+description = "Print what the dev shell resolves to (rust, Vulkan devices, ONNX Runtime)"
+run = "nix develop -c true"
+
+[tasks."env:gpus"]
+description = "List the Vulkan adapters visible on this machine"
+run = "nix develop -c vulkaninfo --summary"
+
+[tasks."env:pipewire"]
+description = "Show the PipeWire graph, our nodes included"
+run = '''
+set -euo pipefail
+echo "--- quantum/rate (DeepFilterNet needs 48k; hop is 480 regardless of quantum) ---"
+pw-metadata -n settings 2>/dev/null | grep -E 'clock\.(rate|quantum)' || true
+echo
+echo "--- nodes ---"
+wpctl status
+'''
+
+[tasks."env:cameras"]
+description = "List V4L2 devices, including which are metadata-only or virtual"
+run = '''
+set -euo pipefail
+nix develop -c v4l2-ctl --list-devices || true
+echo
+echo "--- v4l2loopback module parameters in effect ---"
+for f in /sys/module/v4l2loopback/parameters/*; do
+  [ -e "$f" ] && printf '%-16s %s\n' "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+done
+'''

@@ -38,7 +38,10 @@ fn main() -> anyhow::Result<()> {
         "HYPRLAND_INSTANCE_SIGNATURE",
         "SLINT_BACKEND",
     ] {
-        println!("  {var:<28} {}", std::env::var(var).unwrap_or_else(|_| "<unset>".into()));
+        println!(
+            "  {var:<28} {}",
+            std::env::var(var).unwrap_or_else(|_| "<unset>".into())
+        );
     }
 
     // Spike 2: force Slint onto the wgpu renderer so we can share textures with it.
@@ -116,15 +119,22 @@ fn main() -> anyhow::Result<()> {
         let gpu = gpu.clone();
         ui.window().set_rendering_notifier(move |state, api| {
             // We only want the one-shot setup event; ignore the per-frame states.
-            let (Some(ui), slint::RenderingState::RenderingSetup, slint::GraphicsAPI::WGPU29 { device, queue, .. }) =
-                (weak.upgrade(), state, api)
+            let (
+                Some(ui),
+                slint::RenderingState::RenderingSetup,
+                slint::GraphicsAPI::WGPU29 { device, queue, .. },
+            ) = (weak.upgrade(), state, api)
             else {
                 return;
             };
 
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("cleanroom-preview"),
-                size: wgpu::Extent3d { width: TEX_W, height: TEX_H, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: TEX_W,
+                    height: TEX_H,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -136,7 +146,10 @@ fn main() -> anyhow::Result<()> {
             });
 
             *gpu.borrow_mut() = Some((device.clone(), queue.clone(), texture));
-            ui.set_gpu_status(format!("wgpu device acquired; {TEX_W}x{TEX_H} Rgba8Unorm texture allocated").into());
+            ui.set_gpu_status(
+                format!("wgpu device acquired; {TEX_W}x{TEX_H} Rgba8Unorm texture allocated")
+                    .into(),
+            );
             println!("[spike2] got Slint's wgpu device/queue, allocated our own texture");
         })?;
     }
@@ -149,45 +162,59 @@ fn main() -> anyhow::Result<()> {
         let gpu = gpu.clone();
         let mut phase = 0u32;
         let mut announced = false;
-        gpu_timer.start(slint::TimerMode::Repeated, Duration::from_millis(33), move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let borrowed = gpu.borrow();
-            let Some((_device, queue, texture)) = borrowed.as_ref() else { return };
+        gpu_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(33),
+            move || {
+                let Some(ui) = weak.upgrade() else { return };
+                let borrowed = gpu.borrow();
+                let Some((_device, queue, texture)) = borrowed.as_ref() else {
+                    return;
+                };
 
-            phase = phase.wrapping_add(3);
-            let pixels = render_pattern(phase);
+                phase = phase.wrapping_add(3);
+                let pixels = render_pattern(phase);
 
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(TEX_W * 4),
-                    rows_per_image: Some(TEX_H),
-                },
-                wgpu::Extent3d { width: TEX_W, height: TEX_H, depth_or_array_layers: 1 },
-            );
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(TEX_W * 4),
+                        rows_per_image: Some(TEX_H),
+                    },
+                    wgpu::Extent3d {
+                        width: TEX_W,
+                        height: TEX_H,
+                        depth_or_array_layers: 1,
+                    },
+                );
 
-            match slint::Image::try_from(texture.clone()) {
-                Ok(img) => {
-                    ui.set_gpu_frame(img);
-                    if !announced {
-                        ui.set_gpu_status("wgpu interop WORKING — this is our own texture".into());
-                        println!("[spike2] Image::try_from(wgpu::Texture) succeeded — interop works");
-                        announced = true;
+                match slint::Image::try_from(texture.clone()) {
+                    Ok(img) => {
+                        ui.set_gpu_frame(img);
+                        if !announced {
+                            ui.set_gpu_status(
+                                "wgpu interop WORKING — this is our own texture".into(),
+                            );
+                            println!(
+                                "[spike2] Image::try_from(wgpu::Texture) succeeded — interop works"
+                            );
+                            announced = true;
+                        }
+                    }
+                    Err(e) => {
+                        ui.set_gpu_status(format!("interop FAILED: {e}").into());
+                        println!("[spike2] Image::try_from failed: {e}");
                     }
                 }
-                Err(e) => {
-                    ui.set_gpu_status(format!("interop FAILED: {e}").into());
-                    println!("[spike2] Image::try_from failed: {e}");
-                }
-            }
-        });
+            },
+        );
     }
 
     println!("\nWindow open. Checks:");
@@ -212,7 +239,8 @@ fn render_pattern(phase: u32) -> Vec<u8> {
         for x in 0..TEX_W {
             let fx = x as f32 / TEX_W as f32;
             let fy = y as f32 / TEX_H as f32;
-            let wave = ((fx * 8.0 + p).sin() * (fy * 6.0 - p * 0.7).cos() * 0.5 + 0.5).clamp(0.0, 1.0);
+            let wave =
+                ((fx * 8.0 + p).sin() * (fy * 6.0 - p * 0.7).cos() * 0.5 + 0.5).clamp(0.0, 1.0);
             let i = ((y * TEX_W + x) * 4) as usize;
             buf[i] = (40.0 + wave * 60.0) as u8;
             buf[i + 1] = (90.0 + wave * 140.0) as u8;

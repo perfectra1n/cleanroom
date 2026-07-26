@@ -129,12 +129,17 @@ fn infer_loop(mut session: Session) -> Result<()> {
     for f in 0..FRAMES {
         fill_test_frame(&mut frame, f);
 
-        let src = Tensor::from_array((vec![1i64, 3, INFER_H as i64, INFER_W as i64], frame.clone()))
-            .map_err(|e| anyhow!("src tensor: {e}"))?;
-        let r1 = Tensor::from_array((state[0].0.clone(), state[0].1.clone())).map_err(tag("r1i"))?;
-        let r2 = Tensor::from_array((state[1].0.clone(), state[1].1.clone())).map_err(tag("r2i"))?;
-        let r3 = Tensor::from_array((state[2].0.clone(), state[2].1.clone())).map_err(tag("r3i"))?;
-        let r4 = Tensor::from_array((state[3].0.clone(), state[3].1.clone())).map_err(tag("r4i"))?;
+        let src =
+            Tensor::from_array((vec![1i64, 3, INFER_H as i64, INFER_W as i64], frame.clone()))
+                .map_err(|e| anyhow!("src tensor: {e}"))?;
+        let r1 =
+            Tensor::from_array((state[0].0.clone(), state[0].1.clone())).map_err(tag("r1i"))?;
+        let r2 =
+            Tensor::from_array((state[1].0.clone(), state[1].1.clone())).map_err(tag("r2i"))?;
+        let r3 =
+            Tensor::from_array((state[2].0.clone(), state[2].1.clone())).map_err(tag("r3i"))?;
+        let r4 =
+            Tensor::from_array((state[3].0.clone(), state[3].1.clone())).map_err(tag("r4i"))?;
         // RVM's internal downsample ratio; 0.25 is the reference default for HD.
         let ratio = Tensor::from_array((vec![1i64], vec![0.25f32])).map_err(tag("ratio"))?;
 
@@ -181,7 +186,10 @@ fn infer_loop(mut session: Session) -> Result<()> {
 
     println!("\nsteady-state mean:  {mean_ms:.2} ms");
     println!("steady-state worst: {:.2} ms", worst.as_secs_f64() * 1000.0);
-    println!("alpha range, last frame: {:.4} .. {:.4}", last_alpha.0, last_alpha.1);
+    println!(
+        "alpha range, last frame: {:.4} .. {:.4}",
+        last_alpha.0, last_alpha.1
+    );
 
     // The degenerate-alpha guard, stated correctly. The failure mode it exists to catch
     // is a matte that is flat and *high* — RVM fed a blank frame emits a near-uniform
@@ -191,8 +199,11 @@ fn infer_loop(mut session: Session) -> Result<()> {
     // version of this check tested spread alone and cried wolf on every run.
     let spread = last_alpha.1 - last_alpha.0;
     if spread < 0.005 && last_alpha.0 > 0.5 {
-        println!("WARNING: flat HIGH alpha (min {:.4}, spread {spread:.6}) — the classic \
-                  blank-frame signature", last_alpha.0);
+        println!(
+            "WARNING: flat HIGH alpha (min {:.4}, spread {spread:.6}) — the classic \
+                  blank-frame signature",
+            last_alpha.0
+        );
     } else if spread < 0.005 {
         println!(
             "note: alpha is uniformly {:.3}. Expected here — the synthetic test frame has no \
@@ -206,7 +217,11 @@ fn infer_loop(mut session: Session) -> Result<()> {
     println!("1080p30 gives a 33.3 ms total frame budget; matting should be well under 10 ms.");
     println!(
         "mean {mean_ms:.2} ms => {}",
-        if mean_ms < 10.0 { "PASS" } else { "OVER BUDGET (fine for a slow-GPU conformance target)" }
+        if mean_ms < 10.0 {
+            "PASS"
+        } else {
+            "OVER BUDGET (fine for a slow-GPU conformance target)"
+        }
     );
 
     // Teardown. Dropping an ORT session that owns a WebGPU/Dawn context segfaults on

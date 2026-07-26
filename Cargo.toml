@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/cleanroom-core", "spikes/ort-rvm", "spikes/slint-hyprland"]
+members = [
+    "crates/cleanroom-core",
+    "crates/cleanroom-ipc",
+    "crates/cleanroomd",
+    "crates/cleanroom-ctl",
+    "spikes/ort-rvm",
+    "spikes/slint-hyprland",
+]
 
 [workspace.package]
 version = "0.1.0"
