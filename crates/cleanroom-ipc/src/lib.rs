@@ -27,7 +27,8 @@ pub const INTERFACE: &str = "io.github.perfectra1n.Cleanroom1";
 /// Bumped on a breaking change to the interface. Exposed as a property so a mismatched
 /// GUI can say "update me" rather than failing in some obscure way at the first call.
 ///
-/// 2: `PipelineStats` gained `matte_rejected`, which changes the struct's D-Bus signature.
+/// 2: `PipelineStats` gained `matte_rejected` and `Status` gained `pw_node`, both of
+///    which change D-Bus signatures.
 pub const INTERFACE_VERSION: u32 = 2;
 
 /// How healthy the pipeline is.
@@ -131,6 +132,10 @@ pub struct Status {
     /// Path of the v4l2loopback node we are producing into. Allocated at runtime via the
     /// control device rather than hardcoded, so we never fight OBS over /dev/video10.
     pub vcam_path: String,
+    /// The PipeWire node name we publish as, or empty when that transport is off or has
+    /// failed. Reported separately from `vcam_path` because the two transports succeed and
+    /// fail independently, and "the camera works" is a different claim for each.
+    pub pw_node: String,
     pub stats: PipelineStats,
 }
 

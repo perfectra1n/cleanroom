@@ -100,6 +100,13 @@ async fn status(proxy: &CleanroomProxy<'_>) -> Result<()> {
     if !s.vcam_path.is_empty() {
         println!("vcam     {}", s.vcam_path);
     }
+    // Reported separately because the two transports fail independently: v4l2loopback
+    // reaches Chrome and Zoom, the PipeWire node reaches Flatpak and portal apps, and
+    // knowing which one is up is the difference between "my camera is broken" and "my
+    // camera is broken *in this app*".
+    if !s.pw_node.is_empty() {
+        println!("pw node  {}", s.pw_node);
+    }
 
     let st = &s.stats;
     println!();

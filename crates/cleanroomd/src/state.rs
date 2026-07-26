@@ -68,6 +68,7 @@ pub struct Shared {
     stats: RwLock<PipelineStats>,
     gpu_adapter: RwLock<String>,
     vcam_path: RwLock<String>,
+    pw_node: RwLock<String>,
 
     /// What the PipeWire registry watcher sees. Owned here rather than by the audio
     /// pipeline because the D-Bus side must be able to answer ListMicrophones whether or
@@ -91,6 +92,7 @@ impl Shared {
             stats: RwLock::new(PipelineStats::default()),
             gpu_adapter: RwLock::new("not initialised".into()),
             vcam_path: RwLock::new(String::new()),
+            pw_node: RwLock::new(String::new()),
             audio_registry: cleanroom_audio::RegistryView::new(),
             shutdown: Notify::new(),
         })
@@ -163,6 +165,10 @@ impl Shared {
         *self.gpu_adapter.write().expect("gpu lock poisoned") = s.into();
     }
 
+    pub fn set_pw_node(&self, s: impl Into<String>) {
+        *self.pw_node.write().expect("pw lock poisoned") = s.into();
+    }
+
     pub fn set_vcam_path(&self, s: impl Into<String>) {
         *self.vcam_path.write().expect("vcam lock poisoned") = s.into();
     }
@@ -177,6 +183,7 @@ impl Shared {
             audio_detail: a.detail,
             gpu_adapter: self.gpu_adapter.read().expect("gpu lock poisoned").clone(),
             vcam_path: self.vcam_path.read().expect("vcam lock poisoned").clone(),
+            pw_node: self.pw_node.read().expect("pw lock poisoned").clone(),
             stats: self.stats.read().expect("stats lock poisoned").clone(),
         }
     }

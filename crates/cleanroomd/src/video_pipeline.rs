@@ -162,6 +162,24 @@ fn run_once(
     let mut sink = LoopbackSink::open(&sink_dev, mode.width, mode.height, mode.fps)?;
     shared.set_vcam_path(sink.path.clone());
 
+    // --- the second transport -------------------------------------------------------
+    //
+    // A separate thread with its own PipeWire main loop, because this one is about to
+    // block in V4L2 DQBUF and cannot host one. The frame slot is the whole interface
+    // between them: newest-wins, so a slow consumer costs latency on its own side only.
+    //
+    // A failure here is Degraded, never fatal. The loopback device is what most apps use;
+    // losing the portal transport is a real reduction in coverage and must be reported,
+    // but it is not a reason to have no camera at all.
+    let pw_source = if cfg.video.pipewire_source {
+        let s = PwSourceThread::start(mode.width, mode.height, mode.fps);
+        shared.set_pw_node(cleanroom_core::node::VIRTUAL_CAM_NODE);
+        Some(s)
+    } else {
+        shared.set_pw_node("");
+        None
+    };
+
     let mut watch = ConsumerWatch::open(&sink_dev.path)?;
     let mut decoder = FrameDecoder::new(mode.width, mode.height)?;
     let mut frame = Yuy2Frame::new(mode.width, mode.height);
@@ -396,10 +414,18 @@ fn run_once(
                 }
 
                 sink.write(&processed)?;
+                // Same buffer to both transports. Advertising YUY2 on the PipeWire node is
+                // what makes that possible — an I420 node would need a conversion here.
+                if let Some(pw) = pw_source.as_ref() {
+                    pw.slot.put(&processed);
+                }
                 t1.elapsed().as_secs_f64() * 1000.0
             }
             None => {
                 sink.write(&frame.data)?;
+                if let Some(pw) = pw_source.as_ref() {
+                    pw.slot.put(&frame.data);
+                }
                 0.0
             }
         };
@@ -410,6 +436,56 @@ fn run_once(
 
     // The only way out of that loop is the stop flag.
     Ok(Outcome::Stopped)
+}
+
+/// The PipeWire `Video/Source` publisher, on its own thread.
+///
+/// Owns its stop flag and join handle so `Drop` tears the thread down on every exit path
+/// from `run_once`, including the `?` returns. Leaking it across a pipeline restart would
+/// leave a second node publishing the old geometry, and PipeWire would happily show a user
+/// two cameras with the same name.
+struct PwSourceThread {
+    slot: Arc<cleanroom_video::FrameSlot>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PwSourceThread {
+    fn start(width: u32, height: u32, fps: u32) -> Self {
+        let slot = cleanroom_video::FrameSlot::new(width, height, fps);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let slot_thread = slot.clone();
+        let handle = std::thread::Builder::new()
+            .name("cleanroom-pwcam".into())
+            .spawn(move || {
+                // Degraded, never fatal: the loopback device is what most apps use, so
+                // losing the portal transport reduces coverage but is not a reason to have
+                // no camera at all.
+                if let Err(e) =
+                    cleanroom_video::PwSource::run(slot_thread, "Cleanroom Camera", move || {
+                        stop_thread.load(Ordering::Relaxed)
+                    })
+                {
+                    tracing::warn!(error = %e, "PipeWire Video/Source failed");
+                }
+            })
+            .expect("spawning the PipeWire camera thread");
+        Self {
+            slot,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for PwSourceThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Keep the GPU's background plate in step with config, and say which mode is really usable.
@@ -527,6 +603,9 @@ fn needs_restart(started_with: &Config, now: &Config, cam_path: &str) -> bool {
             )
         // Switching to or from Off changes whether a matting model is needed at all.
         || (now.video.background == Off) != (started_with.video.background == Off)
+        // Publishing or withdrawing a PipeWire node means starting or stopping a thread
+        // that was handed the negotiated geometry at construction.
+        || now.video.pipewire_source != started_with.video.pipewire_source
 }
 
 /// Accumulates per-second telemetry.

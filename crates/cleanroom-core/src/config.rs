@@ -63,6 +63,14 @@ pub struct VideoConfig {
 
     pub mirror: bool,
 
+    /// Also publish a PipeWire `Video/Source` node alongside the v4l2loopback device.
+    ///
+    /// Both transports, because neither reaches everyone. v4l2loopback is what Chrome,
+    /// Electron, Zoom, Discord and OBS see. Flatpak and portal-aware apps can only reach a
+    /// PipeWire node — and on Fedora, where Firefox ships with PipeWire camera support
+    /// patched on, the loopback device may never appear at all.
+    pub pipewire_source: bool,
+
     /// Release the camera when nothing is consuming the virtual camera: LED off, no
     /// decode, no inference. The v4l2loopback producer stays attached throughout, so
     /// meeting apps never see the device disappear — they enumerate cameras once at
@@ -86,6 +94,7 @@ impl Default for VideoConfig {
             blur_strength: 0.6,
             background_image: None,
             mirror: false,
+            pipewire_source: true,
             power_save: true,
             card_label: "Cleanroom Camera".into(),
         }

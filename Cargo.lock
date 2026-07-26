@@ -1077,7 +1077,10 @@ version = "0.1.0"
 dependencies = [
  "cleanroom-core",
  "libc",
+ "libspa",
+ "libspa-sys",
  "nix 0.30.1",
+ "pipewire",
  "thiserror 2.0.19",
  "tracing",
  "tracing-subscriber",

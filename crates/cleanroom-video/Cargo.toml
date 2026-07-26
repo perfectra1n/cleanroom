@@ -11,6 +11,16 @@ cleanroom-core = { path = "../cleanroom-core" }
 thiserror = "2"
 tracing.workspace = true
 libc = "0.2"
+# Pinned identically to cleanroom-audio so the two agree; a version-feature mismatch
+# between them would give the same crate two different constructor signatures.
+# v1_2_0 chains down through v1_0_0 -> v0_3_77 -> ... -> v0_3_34, which is where
+# trigger_process() and is_driving() live, so no extra feature is needed for the
+# driver-cadence path.
+pipewire = { version = "0.10", features = ["v1_2_0"] }
+libspa = "0.10"
+# The raw SPA constants (SPA_PARAM_BUFFERS_*, SPA_META_Header) are not re-exported by the
+# safe wrapper, and the Buffers/Meta params cannot be built without them.
+libspa-sys = "0.10"
 nix = { version = "0.30", features = ["ioctl", "poll", "fs"] }
 v4l = "0.14"
 turbojpeg = "1.5"
