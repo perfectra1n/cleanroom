@@ -205,6 +205,7 @@ fn run_once(
             }
             changed
         },
+        shared.audio_registry.clone(),
     )?;
 
     // Distinguish "asked to stop" from "restart for a config change": returning Ok on a

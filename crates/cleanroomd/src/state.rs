@@ -69,6 +69,11 @@ pub struct Shared {
     gpu_adapter: RwLock<String>,
     vcam_path: RwLock<String>,
 
+    /// What the PipeWire registry watcher sees. Owned here rather than by the audio
+    /// pipeline because the D-Bus side must be able to answer ListMicrophones whether or
+    /// not the audio thread happens to be running.
+    pub audio_registry: Arc<cleanroom_audio::RegistryView>,
+
     /// Signalled to ask the run loop to stop. Shutdown is explicit rather than a
     /// process::exit because the GPU context must be torn down in a controlled order:
     /// dropping an ONNX Runtime session that owns a Dawn context segfaults, and under
@@ -86,6 +91,7 @@ impl Shared {
             stats: RwLock::new(PipelineStats::default()),
             gpu_adapter: RwLock::new("not initialised".into()),
             vcam_path: RwLock::new(String::new()),
+            audio_registry: cleanroom_audio::RegistryView::new(),
             shutdown: Notify::new(),
         })
     }

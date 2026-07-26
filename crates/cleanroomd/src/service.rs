@@ -31,7 +31,22 @@ impl Service {
     }
 
     async fn list_microphones(&self) -> Vec<DeviceInfo> {
-        Vec::new()
+        // Read from the PipeWire registry watcher rather than enumerating here: the
+        // registry lives on the audio thread's main loop, and this is the async side.
+        //
+        // `available` is true for every entry. A PipeWire source is shareable — unlike a
+        // V4L2 camera, several clients can read one microphone at once — so there is no
+        // "in use by something else" state to report.
+        self.shared
+            .audio_registry
+            .sources()
+            .into_iter()
+            .map(|s| DeviceInfo {
+                id: s.name,
+                description: s.description,
+                available: true,
+            })
+            .collect()
     }
 
     async fn get(&self, key: &str) -> zbus::fdo::Result<String> {

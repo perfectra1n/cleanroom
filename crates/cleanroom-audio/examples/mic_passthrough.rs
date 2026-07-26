@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Cleanroom Microphone",
         |inp, outp| outp.copy_from_slice(inp),
         move || stop_check.load(Ordering::Relaxed),
+        cleanroom_audio::RegistryView::new(),
     )?;
     Ok(())
 }

@@ -29,7 +29,9 @@ use libspa::param::audio::{AudioFormat, AudioInfoRaw};
 use libspa::pod::Pod;
 use pipewire::properties::properties;
 use pipewire::stream::StreamFlags;
+use std::cell::RefCell;
 use std::io::Cursor;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 /// DeepFilterNet operates at exactly this rate. The reference machine's graph already
@@ -125,6 +127,13 @@ pub fn to_dbfs(linear: f32) -> f32 {
     }
 }
 
+/// How long the microphone is held after the last listener disappears.
+///
+/// Long enough to ride out an app renegotiating its format, short enough that the recording
+/// light does not stay on after a meeting ends. Two seconds is well past the millisecond
+/// scale of link churn and well under anyone's patience.
+const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Runs the PipeWire main loop with a capture stream and a source stream.
 ///
 /// Blocks until `stop` is signalled. Intended to own a dedicated thread: the PipeWire
@@ -143,6 +152,7 @@ impl VirtualMic {
         node_description: &str,
         mut process: F,
         should_stop: impl Fn() -> bool + 'static,
+        view: Arc<crate::registry::RegistryView>,
     ) -> Result<(), AudioError>
     where
         F: FnMut(&[f32; HOP], &mut [f32; HOP]) + 'static,
@@ -314,13 +324,111 @@ impl VirtualMic {
 
         tracing::info!(node = node_name, "virtual microphone published");
 
+        // --- registry: who is listening, and what else could we capture ----------------
+        //
+        // Our node id is only assigned once the stream is connected, which is why this is
+        // here rather than up with the other setup.
+        let tracker = Rc::new(RefCell::new(crate::registry::LinkTracker::new()));
+        tracker.borrow_mut().set_node_id(playback.node_id());
+
+        let registry = core.get_registry_rc()?;
+        let t_add = tracker.clone();
+        let t_del = tracker.clone();
+        let _reg_listener = registry
+            .add_listener_local()
+            .global(move |g| {
+                let Some(props) = g.props else { return };
+                match g.type_ {
+                    pipewire::types::ObjectType::Link => {
+                        let id_of = |k: &str| props.get(k).and_then(|v| v.parse::<u32>().ok());
+                        t_add.borrow_mut().add_link(
+                            g.id,
+                            id_of(*pipewire::keys::LINK_OUTPUT_NODE),
+                            id_of(*pipewire::keys::LINK_INPUT_NODE),
+                        );
+                    }
+                    pipewire::types::ObjectType::Node => {
+                        let class = props.get(*pipewire::keys::MEDIA_CLASS).unwrap_or("");
+                        let name = props.get(*pipewire::keys::NODE_NAME).unwrap_or("");
+                        let desc = props.get(*pipewire::keys::NODE_DESCRIPTION);
+                        if !name.is_empty() {
+                            t_add.borrow_mut().add_node(g.id, class, name, desc);
+                        }
+                    }
+                    _ => {}
+                }
+            })
+            .global_remove(move |id| t_del.borrow_mut().remove_global(id))
+            .register();
+
         // Poll the stop flag from a timer rather than blocking forever, so shutdown does
         // not depend on the main loop noticing a signal.
+        //
+        // The same tick decides whether the hardware microphone is still needed. Doing it
+        // on a timer rather than directly in the registry callback is deliberate: link
+        // churn arrives in bursts during renegotiation, and reacting to each event
+        // individually would toggle the stream several times for what is really one change.
         let loop_ref = mainloop.loop_();
         let quit = mainloop.clone();
+        // `add_timer` takes an `Fn`, not an `FnMut`, so anything the tick mutates needs
+        // interior mutability. Single-threaded — the PipeWire loop owns this — so Cell and
+        // RefCell rather than anything atomic.
+        let idle = RefCell::new(crate::registry::IdlePolicy::new(RELEASE_GRACE));
+        let capture_active = std::cell::Cell::new(true);
+        let capture_for_timer = capture.clone();
+        let playback_for_timer = playback.clone();
         let _timer = loop_ref.add_timer(move |_| {
             if should_stop() {
                 quit.quit();
+                return;
+            }
+
+            // Our node id is not assigned when `connect()` returns — the stream has to be
+            // negotiated on this loop first — so keep asking until it is real. Doing it
+            // here rather than once at setup is the difference between a working release
+            // and a permanently silent microphone.
+            {
+                let mut t = tracker.borrow_mut();
+                if !t.node_known() {
+                    t.set_node_id(playback_for_timer.node_id());
+                }
+            }
+
+            let t = tracker.borrow();
+            let listeners = t.listeners();
+            view.publish(t.sources(), listeners.unwrap_or(0));
+            drop(t);
+
+            // Unknown is not idle. Until we know which node is ours we cannot know whether
+            // anyone is listening, and releasing the microphone on a guess is exactly the
+            // silent-mic failure this feature exists to avoid — the same contract the
+            // camera's consumer detection follows.
+            let want = match listeners {
+                None => true,
+                Some(n) => idle
+                    .borrow_mut()
+                    .should_capture(n, std::time::Instant::now()),
+            };
+            if want != capture_active.get() {
+                // set_active rather than disconnect: reconnecting means renegotiating the
+                // format, which suspends the node and is exactly the churn we are trying to
+                // avoid. Deactivating is enough for the hardware device to suspend.
+                match capture_for_timer.set_active(want) {
+                    Ok(()) => {
+                        capture_active.set(want);
+                        tracing::info!(
+                            listeners,
+                            capturing = want,
+                            "microphone {} because nothing is listening",
+                            if want { "resumed" } else { "released" }
+                        );
+                    }
+                    Err(e) => {
+                        // Not fatal: the worst case is holding the microphone open, which
+                        // is what we did before this existed.
+                        tracing::warn!(error = %e, "could not change capture stream state");
+                    }
+                }
             }
         });
         _timer
