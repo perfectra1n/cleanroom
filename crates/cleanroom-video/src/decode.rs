@@ -303,10 +303,10 @@ mod tests {
         let (w, h) = (2u32, 1u32);
         let mut out = vec![0u8; 4];
 
-        rgb_to_yuy2(&vec![0u8; 6], w, h, &mut out);
+        rgb_to_yuy2(&[0u8; 6], w, h, &mut out);
         assert_eq!(out[0], 16, "black must be Y=16, not 0");
 
-        rgb_to_yuy2(&vec![255u8; 6], w, h, &mut out);
+        rgb_to_yuy2(&[255u8; 6], w, h, &mut out);
         assert!(
             (out[0] as i32 - 235).abs() <= 1,
             "white must be Y=235, got {}",

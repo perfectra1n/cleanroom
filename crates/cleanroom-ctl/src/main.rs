@@ -104,8 +104,8 @@ async fn status(proxy: &CleanroomProxy<'_>) -> Result<()> {
     let st = &s.stats;
     println!();
     println!(
-        "video    {:.1} fps   {:.2} ms/frame gpu   {:.2} ms matting   {} dropped",
-        st.fps, st.gpu_ms, st.matting_ms, st.dropped
+        "video    {:.1} fps   decode {:.2} ms   gpu {:.2} ms   matting {:.2} ms   {} dropped",
+        st.fps, st.decode_ms, st.gpu_ms, st.matting_ms, st.dropped
     );
     println!(
         "         {} consumer(s) reading the virtual camera",

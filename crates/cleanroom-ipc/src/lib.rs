@@ -81,6 +81,10 @@ pub struct DeviceInfo {
 pub struct PipelineStats {
     /// Frames delivered to the virtual camera in the last second.
     pub fps: f64,
+    /// Mean CPU decode time per frame, milliseconds. MJPEG decode is the one CPU step
+    /// in the video path, so it gets its own bucket — folding it into gpu_ms would hide
+    /// which half of the pipeline is actually slow.
+    pub decode_ms: f64,
     /// Mean GPU time per frame, milliseconds. Covers colour conversion, matting and
     /// compositing — everything between upload and readback.
     pub gpu_ms: f64,

@@ -181,14 +181,30 @@ impl LoopbackSink {
             OUTPUT_FORMAT.as_str()
         );
 
-        Ok(Self {
+        let mut sink = Self {
             device,
             stream: None,
             path,
             width: granted.width,
             height: granted.height,
             frame_bytes,
-        })
+        };
+
+        // Prime the node immediately, and do not treat this as optional.
+        //
+        // With exclusive_caps=1 the node advertises VIDEO_OUTPUT until a producer
+        // actually *starts streaming* — merely holding the fd open is not enough. Until
+        // that happens the device is not a capture device at all, and any consumer that
+        // tries to open it gets "Not a video capture device / No such device".
+        //
+        // That creates a deadlock with power save: idle-at-startup means no frames are
+        // written, so the node never flips, so no consumer can open it, so no consumer
+        // event ever fires to wake us. Writing one frame here breaks it, and has the
+        // separate benefit of making the camera present *before* Zoom, Chrome or Discord
+        // launch — they enumerate cameras once at startup and never look again.
+        sink.write_placeholder()?;
+
+        Ok(sink)
     }
 
     pub fn frame_bytes(&self) -> usize {
@@ -277,6 +293,31 @@ mod tests {
                 "must explain why exclusive_caps matters: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn opening_a_sink_makes_the_node_a_capture_device() {
+        // Regression test for a deadlock found by integration testing: with
+        // exclusive_caps=1 the node stays VIDEO_OUTPUT until a producer *streams*, so a
+        // lazily-primed sink left the device unopenable — and because no consumer could
+        // open it, no consumer event could ever fire to wake power save. Priming on open
+        // is what breaks the cycle.
+        let Ok(dev) = select_device("Cleanroom Camera") else {
+            eprintln!("no free loopback device; skipping");
+            return;
+        };
+        let Ok(sink) = LoopbackSink::open(&dev, 640, 480, 30) else {
+            eprintln!("could not open loopback sink; skipping");
+            return;
+        };
+        let after = crate::device::probe(&dev.path);
+        assert_eq!(
+            after.kind,
+            NodeKind::Capture,
+            "after a producer attaches and writes, the node must advertise CAPTURE or no \
+             consumer can open it"
+        );
+        drop(sink);
     }
 
     #[test]

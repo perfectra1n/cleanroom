@@ -7,6 +7,7 @@ mod doctor;
 mod service;
 mod settings;
 mod state;
+mod video_pipeline;
 
 use anyhow::{Context, Result};
 use cleanroom_core::{ConfigPaths, LoadOutcome};
@@ -86,6 +87,10 @@ async fn main() -> Result<()> {
         "cleanroomd is up"
     );
 
+    // Started after the name is held, so a losing second instance never touches the
+    // camera. Failures inside surface as health over D-Bus rather than as a dead daemon.
+    let mut video = video_pipeline::VideoPipeline::start(shared.clone());
+
     run_until_shutdown(&shared).await;
 
     // Controlled teardown.
@@ -96,7 +101,9 @@ async fn main() -> Result<()> {
     // exit becomes an endless restart loop, so the GPU-owning subsystems have to be shut
     // down in order, before we return.
     tracing::info!("shutting down");
-    shutdown_pipelines(&shared).await;
+    // Joined, not detached: the thread owns the camera and the loopback fd, and exiting
+    // while it still holds them leaves the device half-streaming for the next process.
+    video.shutdown();
     drop(connection);
     tracing::info!("clean exit");
     Ok(())
@@ -111,11 +118,6 @@ async fn run_until_shutdown(shared: &Shared) {
         _ = sigterm.recv() => tracing::info!("SIGTERM"),
         _ = shared.wait_for_shutdown() => tracing::info!("shutdown requested"),
     }
-}
-
-async fn shutdown_pipelines(_shared: &Shared) {
-    // Video and audio teardown hook in here as those subsystems land. Ordering will
-    // matter: the GPU context must go last, after anything that submits work to it.
 }
 
 fn init_logging() {
