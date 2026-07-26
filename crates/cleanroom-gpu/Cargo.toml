@@ -1,0 +1,22 @@
+[package]
+name = "cleanroom-gpu"
+description = "wgpu device management and the WGSL effect kernels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cleanroom-core = { path = "../cleanroom-core" }
+thiserror = "2"
+tracing.workspace = true
+
+# Pinned to 29 by Slint: slint 1.17 offers unstable-wgpu-28 and -29 and nothing newer,
+# and the GUI must be able to import textures this crate produces. Bumping this without
+# bumping Slint means the wgpu types stop unifying across the two crates.
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

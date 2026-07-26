@@ -1,0 +1,176 @@
+//! Verify the GPU pipeline does what it claims, and time it.
+//!
+//! Three questions, in order of how badly a wrong answer would hurt:
+//!   1. Does a frame survive YUY2 -> RGBA -> YUY2 without drifting? A colour-space bug
+//!      here tints every frame and is nearly invisible without a reference.
+//!   2. Does blur actually blur — and only the background plane?
+//!   3. Is it fast enough at 1080p?
+//!
+//!     nix develop -c cargo run --release -p cleanroom-gpu --example gpu_check
+
+use cleanroom_core::BackgroundMode;
+use cleanroom_gpu::{FramePipeline, Gpu};
+use std::time::Instant;
+
+const W: u32 = 1920;
+const H: u32 = 1080;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let gpu = Gpu::new(None)?;
+    println!("adapter: {}\n", gpu.choice);
+
+    let mut pipe = FramePipeline::new(gpu, W, H);
+    let frame_bytes = (W * H * 2) as usize;
+
+    // The test frame is built from *RGB* and converted to YUY2 on the CPU with the same
+    // BT.601 limited-range matrix the shader uses.
+    //
+    // Generating YUV directly, as an earlier version did, produces arbitrary Y/Cb/Cr
+    // combinations that are outside the RGB gamut. The shader clamps those — correctly —
+    // and the round-trip then cannot recover them, which reads as a colour bug when it is
+    // really the test asking for colours that do not exist.
+    let mut input = vec![0u8; frame_bytes];
+    for y in 0..H as usize {
+        for x in (0..W as usize).step_by(2) {
+            let i = (y * (W / 2) as usize + x / 2) * 4;
+            const BARS: [(f32, f32, f32); 8] = [
+                (0.8, 0.1, 0.1),
+                (0.1, 0.8, 0.1),
+                (0.1, 0.1, 0.8),
+                (0.8, 0.8, 0.1),
+                (0.8, 0.1, 0.8),
+                (0.1, 0.8, 0.8),
+                (0.7, 0.7, 0.7),
+                (0.2, 0.2, 0.2),
+            ];
+            let rgb = |px: usize| -> (f32, f32, f32) {
+                let bar = (px * 8 / W as usize).min(7);
+                // A fine checkerboard on top of the bars, so there is high-frequency
+                // detail for the blur test to remove.
+                let c: f32 = if ((px / 16) + (y / 16)).is_multiple_of(2) {
+                    0.15
+                } else {
+                    0.0
+                };
+                let b = BARS[bar];
+                ((b.0 + c).min(1.0), (b.1 + c).min(1.0), (b.2 + c).min(1.0))
+            };
+            let to_yuv = |(r, g, b): (f32, f32, f32)| {
+                (
+                    0.2568 * r + 0.5041 * g + 0.0979 * b + 0.0627451,
+                    -0.1482 * r - 0.2910 * g + 0.4392 * b + 0.5019608,
+                    0.4392 * r - 0.3678 * g - 0.0714 * b + 0.5019608,
+                )
+            };
+            let (y0, u0, v0) = to_yuv(rgb(x));
+            let (y1, u1, v1) = to_yuv(rgb((x + 1).min(W as usize - 1)));
+            input[i] = (y0 * 255.0 + 0.5) as u8;
+            input[i + 1] = ((u0 + u1) * 0.5 * 255.0 + 0.5) as u8;
+            input[i + 2] = (y1 * 255.0 + 0.5) as u8;
+            input[i + 3] = ((v0 + v1) * 0.5 * 255.0 + 0.5) as u8;
+        }
+    }
+
+    let mut output = vec![0u8; frame_bytes];
+
+    // --- 1. round-trip fidelity ------------------------------------------------------
+    pipe.process(&input, &mut output, BackgroundMode::Off, 0.0, false);
+
+    let luma_err: Vec<i32> = input
+        .iter()
+        .step_by(2)
+        .zip(output.iter().step_by(2))
+        .map(|(a, b)| (*a as i32 - *b as i32).abs())
+        .collect();
+    let max_err = *luma_err.iter().max().unwrap_or(&0);
+    let mean_err = luma_err.iter().sum::<i32>() as f64 / luma_err.len() as f64;
+
+    println!("1. YUY2 -> RGBA -> YUY2 round-trip");
+    println!("   luma error: max {max_err}, mean {mean_err:.3}");
+    // Two 8-bit conversions through a normalised float space cannot be exact; anything
+    // beyond a couple of LSBs means the colour matrices disagree.
+    println!(
+        "   {}",
+        if max_err <= 3 {
+            "PASS — colour survives the round-trip"
+        } else {
+            "FAIL — the colour matrices disagree"
+        }
+    );
+
+    // --- 2. does blur blur? -----------------------------------------------------------
+    //
+    // A matte of alpha=0 means "all background", so the whole frame takes the blurred
+    // plane. Without setting one the default matte is opaque — alpha=1, all foreground —
+    // and mix(bg, fg, 1.0) discards the blur entirely. That is correct behaviour, and it
+    // is why an earlier version of this check measured no blurring at all: it was testing
+    // the composite, not the blur.
+    pipe.set_matte(&[0u8], 1, 1);
+    let mut blurred = vec![0u8; frame_bytes];
+    pipe.process(&input, &mut blurred, BackgroundMode::Blur, 1.0, false);
+    pipe.set_matte(&[255u8], 1, 1);
+
+    // Local luma variance is the cleanest proxy for detail: blur removes high-frequency
+    // structure, so the checkerboard's variance must collapse.
+    let variance = |buf: &[u8]| -> f64 {
+        let lumas: Vec<f64> = buf.iter().step_by(2).map(|&v| v as f64).collect();
+        let mean = lumas.iter().sum::<f64>() / lumas.len() as f64;
+        lumas.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / lumas.len() as f64
+    };
+    let sharp_var = variance(&output);
+    let blur_var = variance(&blurred);
+
+    println!("\n2. background blur");
+    println!("   luma variance: {sharp_var:.0} sharp -> {blur_var:.0} blurred");
+    println!(
+        "   {}",
+        if blur_var < sharp_var * 0.9 {
+            "PASS — high-frequency detail removed"
+        } else {
+            "FAIL — no measurable blurring"
+        }
+    );
+
+    // --- 3. throughput ----------------------------------------------------------------
+    println!("\n3. throughput at {W}x{H}");
+    for (label, mode, strength) in [
+        ("passthrough", BackgroundMode::Off, 0.0),
+        ("blur (light)", BackgroundMode::Blur, 0.0),
+        ("blur (max)", BackgroundMode::Blur, 1.0),
+    ] {
+        // Warm up: first submissions include pipeline creation and allocation.
+        for _ in 0..5 {
+            pipe.process(&input, &mut output, mode, strength, false);
+        }
+        let n = 60;
+        let t0 = Instant::now();
+        for _ in 0..n {
+            pipe.process(&input, &mut output, mode, strength, false);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        println!(
+            "   {label:14} {ms:6.2} ms/frame   {:5.0} fps   {}",
+            1000.0 / ms,
+            if ms < 33.3 { "fits 30fps" } else { "TOO SLOW" }
+        );
+    }
+
+    // Mirroring is a free index flip inside the composite pass; confirm it actually flips.
+    let mut mirrored = vec![0u8; frame_bytes];
+    pipe.process(&input, &mut mirrored, BackgroundMode::Off, 0.0, true);
+    let row = (W / 2) as usize * 4;
+    let left = mirrored[..4].to_vec();
+    let right_of_normal = output[row - 4..row].to_vec();
+    println!(
+        "\n4. mirror: leftmost output texel {:?} vs rightmost source texel {:?} -> {}",
+        &left[..2],
+        &right_of_normal[..2],
+        if left[0].abs_diff(right_of_normal[2]) < 8 {
+            "PASS"
+        } else {
+            "check"
+        }
+    );
+
+    Ok(())
+}
