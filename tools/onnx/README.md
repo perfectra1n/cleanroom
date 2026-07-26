@@ -34,3 +34,24 @@ CLEANROOM_RVM_MODEL=out.onnx \
 (`forceCpuNodeNames`) is inert on this ORT build — forcing all 353 nodes to the CPU still
 returns the GPU's wrong answer at GPU speed, which is the control proving the option is
 ignored rather than that the nodes are innocent.
+
+## The fix: `pad_conv_channels.py`
+
+This is the one that matters. ONNX Runtime's WebGPU provider computes `Conv` wrongly when
+the input channel count is divisible by 3 and not by 4; RVM hits it in exactly one node.
+
+```sh
+run tools/onnx/pad_conv_channels.py \
+  ~/.local/share/cleanroom/rvm_mobilenetv3_fp32.onnx \
+  ~/.local/share/cleanroom/rvm_mobilenetv3_fp32.padded.onnx
+```
+
+`find_model()` prefers `*.padded.onnx` over the stock name in every search directory, so
+writing it there is all that is needed — nothing else has to be configured.
+
+Measured in the live daemon at 1080p30, RTX 5090:
+
+| matting backend | daemon CPU | fps | matting | matte resolution |
+|-----------------|-----------|-----|---------|------------------|
+| gpu (padded model) | **46%** | 30.1 | 9.91 ms | 512x288 |
+| cpu | 136% | 30.0 | 11.21 ms | 320x180 |

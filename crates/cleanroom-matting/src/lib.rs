@@ -185,19 +185,44 @@ pub enum MattingError {
     Inference(String),
 }
 
+/// The channel-padded export, preferred over the stock one wherever both exist.
+///
+/// Not an optimisation — a correctness fix. ONNX Runtime's WebGPU provider computes `Conv`
+/// wrongly when the input channel count is divisible by 3 and not by 4, and RVM's decoder
+/// hits that in exactly one node (`Conv_200`, 171 input channels) because it concatenates
+/// the 3-channel source image onto a skip connection. Padding that conv to 172 channels is
+/// an exact identity — the added weights are zero — and it is the difference between a
+/// correct matte on the GPU at 7.3 ms and a dead one.
+///
+/// Produced by `tools/onnx/pad_conv_channels.py`. See `docs/pitfalls.md`.
+pub const PADDED_MODEL: &str = "rvm_mobilenetv3_fp32.padded.onnx";
+
+/// The stock upstream export.
+pub const STOCK_MODEL: &str = "rvm_mobilenetv3_fp32.onnx";
+
 fn candidate_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(p) = std::env::var_os("CLEANROOM_RVM_MODEL") {
         out.push(PathBuf::from(p));
     }
-    let file = "rvm_mobilenetv3_fp32.onnx";
-    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        out.push(PathBuf::from(d).join("cleanroom").join(file));
-    } else if let Some(h) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(h).join(".local/share/cleanroom").join(file));
+    // Padded first in every directory, so a machine that has both silently gets the one
+    // that is correct on the GPU rather than the one that happens to be named upstream.
+    let dirs: Vec<PathBuf> = {
+        let mut d = Vec::new();
+        if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+            d.push(PathBuf::from(x).join("cleanroom"));
+        } else if let Some(h) = std::env::var_os("HOME") {
+            d.push(PathBuf::from(h).join(".local/share/cleanroom"));
+        }
+        d.push(PathBuf::from("/usr/share/cleanroom"));
+        d.push(PathBuf::from("/usr/local/share/cleanroom"));
+        d
+    };
+    for file in [PADDED_MODEL, STOCK_MODEL] {
+        for dir in &dirs {
+            out.push(dir.join(file));
+        }
     }
-    out.push(PathBuf::from("/usr/share/cleanroom").join(file));
-    out.push(PathBuf::from("/usr/local/share/cleanroom").join(file));
     out
 }
 

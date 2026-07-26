@@ -13,7 +13,9 @@ m = onnx.load(src)
 node = m.graph.node[idx]
 out = node.output[0]
 
-inferred = src + ".inferred"
+# Beside the *output*, never beside the input: the input usually lives in the
+# user's model directory, and littering that with intermediates is rude.
+inferred = dst + ".inferred"
 onnx.save(shape_inference.infer_shapes(m), inferred)
 ins = [i.name for i in m.graph.input]
 try:
