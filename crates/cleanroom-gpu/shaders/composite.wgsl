@@ -7,6 +7,15 @@ struct CompositeParams {
     // Pulls the background toward luma. Applied only to the background plane.
     desaturate: f32,
     dim: f32,
+    // Non-zero when comp_ab holds a valid guided-filter coefficient field. Zero falls back
+    // to sampling the matte directly, which is what happens before the first inference.
+    guided: u32,
+    // Pulls the alpha edge inward. Replace needs more of this than blur: against a blurred
+    // version of the same room a slightly generous silhouette is invisible, but against a
+    // swapped background it is a bright halo tracing the shoulders and ears.
+    tighten: f32,
+    _pad0: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var comp_fg: texture_2d<f32>;
@@ -19,6 +28,9 @@ struct CompositeParams {
 // cannot be optimised out — and defaults to a 1x1 texel when no image is loaded, the same
 // trick the matte uses to stay a valid binding before the first inference.
 @group(0) @binding(6) var comp_bg_image: texture_2d<f32>;
+// Guided-filter coefficients (a in .r, b in .g) at matte resolution. Two smooth fields,
+// which is exactly what bilinear upsampling is good at — unlike the matte itself.
+@group(0) @binding(7) var comp_ab: texture_2d<f32>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -43,7 +55,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // rather than loaded — bilinear interpolation is what keeps the edge smooth instead
     // of blocky.
     let uv = (vec2<f32>(src) + 0.5) / vec2<f32>(dims);
-    let alpha = clamp(textureSampleLevel(comp_matte, comp_samp, uv, 0.0).r, 0.0, 1.0);
+
+    var alpha: f32;
+    if (comp.guided != 0u) {
+        // Evaluate the local linear model at full resolution. `ab` is smooth, so sampling
+        // it bilinearly is legitimate; the sharpness comes from `i`, which is this pixel's
+        // own luma at full resolution rather than anything interpolated.
+        let ab = textureSampleLevel(comp_ab, comp_samp, uv, 0.0).rg;
+        let i = dot(fg, vec3<f32>(0.299, 0.587, 0.114));
+        alpha = clamp(ab.r * i + ab.g, 0.0, 1.0);
+    } else {
+        alpha = clamp(textureSampleLevel(comp_matte, comp_samp, uv, 0.0).r, 0.0, 1.0);
+    }
+
+    // Erode the edge by remapping the ramp rather than by a morphological pass: a real
+    // erode would need another full-resolution pass and a second texture, and this is a
+    // matte whose edge is already a soft gradient, so moving the 0.5 crossing outward
+    // achieves the same thing for free. tighten = 0 leaves alpha untouched.
+    if (comp.tighten > 0.0) {
+        alpha = clamp((alpha - comp.tighten) / max(1.0 - comp.tighten, 0.001), 0.0, 1.0);
+    }
 
     var bg: vec3<f32>;
     if (comp.mode == 3u) {

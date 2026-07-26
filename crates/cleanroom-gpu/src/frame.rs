@@ -19,6 +19,42 @@ struct CompositeParams {
     mirror: u32,
     desaturate: f32,
     dim: f32,
+    guided: u32,
+    tighten: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+/// Guided-filter window radius, in matte pixels.
+///
+/// 3 gives a 7x7 window: 49 taps over 512x288, which is 7.2M texture reads a frame. That is
+/// nothing on a discrete GPU and still affordable on the 2-CU iGPU that is this project's
+/// slow-hardware conformance target. Larger windows smooth more but start pulling in
+/// structure that has nothing to do with the subject's edge.
+const GUIDED_RADIUS: i32 = 3;
+
+/// Guided-filter regularisation.
+///
+/// Sets what counts as a "flat" region: below this variance the filter smooths, above it
+/// the alpha is allowed to follow the image. 1e-4 on luma in 0..1 corresponds to roughly a
+/// 1% contrast step, which keeps sensor noise on a plain wall from being read as an edge
+/// while still tracking a real shoulder against a similarly-lit background.
+const GUIDED_EPS: f32 = 1e-4;
+
+/// How far Replace pulls the alpha edge in, against Blur's zero.
+///
+/// Against a blurred copy of the same room a slightly generous silhouette is invisible,
+/// because what bleeds through is the same colours. Against a swapped background it is a
+/// bright fringe tracing shoulders and ears — the single most recognisable "bad virtual
+/// background" artifact, and the reason replace wants tighter morphology than blur rather
+/// than the same.
+const REPLACE_TIGHTEN: f32 = 0.12;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GuidedParams {
+    radius: i32,
+    eps: f32,
 }
 
 /// How many down/up pairs the blur runs.
@@ -68,6 +104,14 @@ pub struct FramePipeline {
     /// Sized by the caller so this crate does not need to know the network's geometry.
     matte_input: Option<(wgpu::Texture, wgpu::Buffer, u32, u32, u32)>,
     downscale: wgpu::ComputePipeline,
+
+    /// Guided-filter coefficient field (a, b) at matte resolution, and its pass.
+    /// `None` until a matte has been set, since there is nothing to filter before that.
+    guided_ab: Option<wgpu::Texture>,
+    guided: wgpu::ComputePipeline,
+    guided_params: wgpu::Buffer,
+    /// Whether `guided_ab` holds coefficients for the current matte.
+    guided_ready: bool,
 
     /// Staging buffer for the readback. Persistent so the hot path allocates nothing.
     readback: wgpu::Buffer,
@@ -250,6 +294,11 @@ impl FramePipeline {
             include_str!("../shaders/downscale.wgsl"),
             false,
         );
+        let m_guided = module(
+            "guided-ab",
+            include_str!("../shaders/guided_ab.wgsl"),
+            false,
+        );
 
         let pipeline = |label: &str, m: &wgpu::ShaderModule, entry: &str| {
             dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -271,6 +320,26 @@ impl FramePipeline {
             blur_up: pipeline("blur-up", &m_blur, "up"),
             composite: pipeline("composite", &m_comp, "main"),
             downscale: pipeline("downscale", &m_down, "main"),
+            guided: pipeline("guided-ab", &m_guided, "main"),
+            guided_ab: None,
+            guided_ready: false,
+            guided_params: {
+                let b = dev.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("guided-params"),
+                    size: std::mem::size_of::<GuidedParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                gpu.queue.write_buffer(
+                    &b,
+                    0,
+                    bytemuck::bytes_of(&GuidedParams {
+                        radius: GUIDED_RADIUS,
+                        eps: GUIDED_EPS,
+                    }),
+                );
+                b
+            },
             matte_input: None,
             packed_in,
             rgba,
@@ -402,6 +471,91 @@ impl FramePipeline {
                 depth_or_array_layers: 1,
             },
         );
+
+        self.run_guided(width, height);
+    }
+
+    /// Compute the guided-filter coefficients for the matte just uploaded.
+    ///
+    /// Runs here rather than in `process` on purpose. The guidance image has to be the frame
+    /// the matte was actually computed from, and that is exactly what `matte_input` still
+    /// holds at this moment — `process` overwrites it on the next frame. Pairing a matte
+    /// with the wrong guidance is subtle and ugly: the edge locks onto structure the subject
+    /// has already moved away from, so fast motion smears instead of sharpening.
+    fn run_guided(&mut self, width: u32, height: u32) {
+        let Some((guide, _, gw, gh, _)) = self.matte_input.as_ref() else {
+            // No matting input configured, so there is no guidance image and nothing to do.
+            self.guided_ready = false;
+            return;
+        };
+
+        // The guidance and the matte must be the same size for the window arithmetic to
+        // line up. They always are in practice (both INFER_W x INFER_H), so a mismatch is a
+        // caller bug rather than a case to paper over.
+        if (*gw, *gh) != (width, height) {
+            self.guided_ready = false;
+            return;
+        }
+
+        let needs_alloc = self
+            .guided_ab
+            .as_ref()
+            .is_none_or(|t| t.width() != width || t.height() != height);
+        if needs_alloc {
+            // rgba16float: `a` is unbounded in principle and `b` is signed, so an 8-bit unorm
+            // pair would clip both. Half floats are exact enough for coefficients that get
+            // multiplied by a 0..1 luma.
+            self.guided_ab = Some(self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("guided-ab"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }));
+        }
+
+        let guide_view = guide.create_view(&Default::default());
+        let matte_view = self.matte.create_view(&Default::default());
+        let ab_view = self
+            .guided_ab
+            .as_ref()
+            .expect("just allocated")
+            .create_view(&Default::default());
+
+        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+        self.dispatch(
+            &mut enc,
+            &self.guided,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&guide_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&matte_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&ab_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.guided_params.as_entire_binding(),
+                },
+            ],
+            width,
+            height,
+        );
+        self.gpu.queue.submit(Some(enc.finish()));
+        self.guided_ready = true;
     }
 
     /// Prepare a downscaled RGBA readback at `w`x`h`, for feeding a matting network.
@@ -566,6 +720,14 @@ impl FramePipeline {
             mirror: mirror as u32,
             desaturate: 0.0,
             dim: 0.0,
+            guided: self.guided_ready as u32,
+            tighten: if matches!(mode, BackgroundMode::Replace) {
+                REPLACE_TIGHTEN
+            } else {
+                0.0
+            },
+            _pad0: 0,
+            _pad1: 0,
         };
         self.gpu
             .queue
@@ -669,6 +831,16 @@ impl FramePipeline {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&v(&self.bg_image)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    // Falls back to the matte's own view when no coefficients exist yet.
+                    // The shader will not read it (guided == 0), but the binding still has
+                    // to be filled with something of the right dimension.
+                    resource: wgpu::BindingResource::TextureView(&v(self
+                        .guided_ab
+                        .as_ref()
+                        .unwrap_or(&self.matte))),
                 },
             ],
             self.width,

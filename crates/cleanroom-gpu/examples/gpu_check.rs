@@ -172,5 +172,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
+    // --- 5. background replace --------------------------------------------------------
+    //
+    // Replace used to be indistinguishable from off: the shader had no mode==2 branch, so
+    // it sampled the live frame as its own background. The check is therefore not "does it
+    // run" but "is the output actually the plate and not the camera".
+    let plate_w = 64u32;
+    let plate_h = 36u32;
+    let mut plate = vec![0u8; (plate_w * plate_h * 4) as usize];
+    for px in plate.chunks_exact_mut(4) {
+        px[0] = 200; // a colour nothing in the test pattern produces
+        px[1] = 40;
+        px[2] = 160;
+        px[3] = 255;
+    }
+    pipe.set_background_image(&plate, plate_w, plate_h);
+    pipe.set_matte(&[0u8], 1, 1); // all background, so the plate should be all we see
+
+    let mut replaced = vec![0u8; frame_bytes];
+    pipe.process(&input, &mut replaced, BackgroundMode::Replace, 0.0, false);
+
+    // Compare in luma: the plate is a single flat colour, so a correct replace has almost
+    // no luma variance, where the checkerboard has a great deal.
+    let replaced_var = variance(&replaced);
+    println!("\n5. background replace");
+    println!("   luma variance: {sharp_var:.0} camera -> {replaced_var:.0} replaced");
+    println!(
+        "   {}",
+        if replaced_var < sharp_var * 0.05 {
+            "PASS — output is the plate, not the camera"
+        } else {
+            "FAIL — the camera is still showing through"
+        }
+    );
+
+    // --- 6. guided-filter upsample ----------------------------------------------------
+    //
+    // The coefficient pass only runs when a matte-input (guidance) texture exists, so this
+    // also confirms the wiring: without enable_matte_input the composite must fall back to
+    // sampling the matte directly rather than reading an uninitialised coefficient field.
+    pipe.enable_matte_input(128, 72);
+    let mut guided_out = vec![0u8; frame_bytes];
+    pipe.process(&input, &mut guided_out, BackgroundMode::Blur, 1.0, false);
+    let mut small = vec![0u8; 128 * 72 * 4];
+    let got_guidance = pipe.read_matte_input(&mut small);
+    // A half-and-half matte at guidance resolution: the guided filter should keep the
+    // boundary where it is rather than smearing it across the frame.
+    let mut half = vec![0u8; 128 * 72];
+    for y in 0..72usize {
+        for x in 0..128usize {
+            half[y * 128 + x] = if x < 64 { 0 } else { 255 };
+        }
+    }
+    pipe.set_matte(&half, 128, 72);
+    let mut split = vec![0u8; frame_bytes];
+    pipe.process(&input, &mut split, BackgroundMode::Blur, 1.0, false);
+
+    // Compare halves statistically rather than probing single pixels. Two lone texels can
+    // agree by coincidence on a checkerboard, which is exactly what an earlier version of
+    // this check did — it reported "identical" while the composite was working fine.
+    let half_variance = |buf: &[u8], from: u32, to: u32| -> f64 {
+        let mut lumas = Vec::new();
+        for y in (0..H).step_by(4) {
+            let row = y as usize * W as usize * 2;
+            for x in from..to {
+                lumas.push(buf[row + x as usize * 2] as f64);
+            }
+        }
+        let mean = lumas.iter().sum::<f64>() / lumas.len() as f64;
+        lumas.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / lumas.len() as f64
+    };
+    // Left half has matte 0 (all background -> blurred); right half has matte 1 (all
+    // foreground -> sharp). So the left must have measurably less high-frequency detail.
+    let left_var = half_variance(&split, 0, W / 2 - 32);
+    let right_var = half_variance(&split, W / 2 + 32, W);
+
+    println!("\n6. guided-filter upsample");
+    println!(
+        "   guidance readback: {}",
+        if got_guidance { "ok" } else { "unavailable" }
+    );
+    println!("   luma variance: background half {left_var:.0} vs foreground half {right_var:.0}");
+    println!(
+        "   {}",
+        if left_var < right_var * 0.95 {
+            "PASS — the matte reaches the shader and separates the two planes"
+        } else {
+            "FAIL — both halves composite the same, so the matte is not being applied"
+        }
+    );
+
     Ok(())
 }

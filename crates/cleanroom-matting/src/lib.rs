@@ -57,6 +57,22 @@ const DOWNSAMPLE_RATIO: f32 = if INFER_W > 512 {
     1.0
 };
 
+/// Weight given to a *rising* alpha sample when the matte is otherwise stable.
+///
+/// Higher than `ALPHA_FALL` because gaining subject early is invisible, where losing it
+/// early punches a hole in a moving limb.
+const ALPHA_RISE: f32 = 0.55;
+
+/// Weight given to a *falling* alpha sample when the matte is otherwise stable.
+const ALPHA_FALL: f32 = 0.22;
+
+/// The per-pixel alpha change at which temporal damping is fully released.
+///
+/// Below this, a change is treated as noise and averaged; at or above it, the new sample is
+/// taken essentially whole, because a jump that large is the network reporting real motion
+/// and averaging it is what produces ghost trails.
+const MOTION_FULL: f32 = 0.25;
+
 #[derive(Debug, thiserror::Error)]
 pub enum MattingError {
     #[error(
@@ -134,6 +150,10 @@ pub struct Matter {
     alpha: Vec<u8>,
     /// Previous alpha, kept so a degenerate frame can be replaced rather than shown.
     prev_alpha: Vec<u8>,
+    /// Temporally smoothed alpha in f32, carried between frames. Kept at full precision
+    /// rather than reusing the quantised `prev_alpha`: an EMA that reads back its own 8-bit
+    /// output cannot resolve changes below 1/255 and stalls short of its target.
+    smoothed: Vec<f32>,
     /// How many frames were rejected by the degenerate-alpha guard.
     pub rejected: u64,
     frames: u64,
@@ -193,6 +213,7 @@ impl Matter {
             input: vec![0.0; 3 * px],
             alpha: vec![0; px],
             prev_alpha: vec![255; px],
+            smoothed: Vec::new(),
             rejected: 0,
             frames: 0,
         })
@@ -213,6 +234,10 @@ impl Matter {
     pub fn reset(&mut self) {
         self.state = (0..4).map(|_| (vec![1, 1, 1, 1], vec![0.0f32])).collect();
         self.prev_alpha.fill(255);
+        // Drop the smoothing history too: it is an average of frames from a scene that is
+        // no longer in front of the camera, so blending the next frame into it would fade
+        // the old subject out rather than showing the new one.
+        self.smoothed.clear();
         self.frames = 0;
     }
 
@@ -295,12 +320,61 @@ impl Matter {
             return Ok(&self.prev_alpha);
         }
 
-        for (dst, &v) in self.alpha.iter_mut().zip(pha.iter()) {
+        // Field-level rather than `self.smooth(..)`: `pha` still borrows `self.session`
+        // through `outputs`, so a method taking `&mut self` would be a second borrow of the
+        // whole struct. Naming the one field it touches keeps the borrows disjoint and
+        // avoids copying the matte out just to satisfy the checker.
+        Self::smooth_into(&mut self.smoothed, self.frames, pha);
+        for (dst, &v) in self.alpha.iter_mut().zip(self.smoothed.iter()) {
             *dst = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
         self.prev_alpha.copy_from_slice(&self.alpha);
         self.frames += 1;
         Ok(&self.alpha)
+    }
+
+    /// Motion-adaptive, asymmetric temporal smoothing of the alpha matte.
+    ///
+    /// Two things are going on, and both are asymmetries.
+    ///
+    /// **Motion-adaptive.** A per-pixel exponential average kills the frame-to-frame
+    /// shimmer that makes an edge look like it is boiling, but applied uniformly it also
+    /// smears anything that moves. So the blend weight is driven by how much that pixel
+    /// actually changed: where the matte is stable, smooth hard; where it jumped, trust the
+    /// new value and barely smooth at all. A large jump is the network reporting real
+    /// motion, and averaging it with history is precisely how you get a limb dragging a
+    /// ghost behind it.
+    ///
+    /// **Asymmetric in direction.** Falling alpha — foreground becoming background — is
+    /// damped harder than rising. Getting this wrong is very visible: when someone moves,
+    /// the trailing edge of an arm turns to background a frame or two before the network is
+    /// confident, and the hole punched there shows the *blurred* room through the middle of
+    /// their sleeve. Rising alpha has no equivalent failure; the worst case is a few
+    /// milliseconds of extra subject, which nobody sees.
+    fn smooth_into(smoothed: &mut Vec<f32>, frames: u64, pha: &[f32]) {
+        // First real frame: nothing to blend against, so take it as-is. Blending against
+        // the seeded matte would fade the subject in over the first few frames.
+        if frames == 0 || smoothed.len() != pha.len() {
+            smoothed.clear();
+            smoothed.extend(pha.iter().map(|v| v.clamp(0.0, 1.0)));
+            return;
+        }
+
+        for (prev, &now) in smoothed.iter_mut().zip(pha.iter()) {
+            let now = now.clamp(0.0, 1.0);
+            let delta = now - *prev;
+
+            // Base weight on the new sample, by direction.
+            let base = if delta < 0.0 { ALPHA_FALL } else { ALPHA_RISE };
+
+            // Release the damping in proportion to how big the change is, so a genuine
+            // movement is followed immediately while noise around zero is averaged away.
+            // At |delta| >= MOTION_FULL the new sample is taken essentially whole.
+            let motion = (delta.abs() / MOTION_FULL).min(1.0);
+            let w = base + (1.0 - base) * motion;
+
+            *prev += delta * w;
+        }
     }
 }
 
@@ -358,6 +432,59 @@ mod tests {
     fn no_gpu_error_explains_why_there_is_no_cpu_fallback() {
         let m = MattingError::NoGpu("dawn sad".into()).to_string();
         assert!(m.contains("deliberate"), "must not read like a bug: {m}");
+    }
+
+    /// The asymmetry is the point, so it gets a test rather than a comment.
+    ///
+    /// Alpha falling means foreground turning into background. If that is allowed to happen
+    /// as readily as the reverse, the trailing edge of a moving arm becomes background a
+    /// frame early and the blurred room shows through the middle of a sleeve. Gaining
+    /// subject early has no equivalent cost, so rising is allowed to move faster.
+    #[test]
+    fn falling_alpha_is_damped_harder_than_rising() {
+        let step = 0.1; // well below MOTION_FULL, so the direction weights dominate
+
+        let mut rising = vec![0.5f32];
+        Self_smooth(&mut rising, &[0.5 + step]);
+        let gained = rising[0] - 0.5;
+
+        let mut falling = vec![0.5f32];
+        Self_smooth(&mut falling, &[0.5 - step]);
+        let lost = 0.5 - falling[0];
+
+        assert!(
+            lost < gained,
+            "falling must move less than rising: fell {lost}, rose {gained}"
+        );
+    }
+
+    /// Without this, the smoothing that removes shimmer also produces ghost trails: a real
+    /// movement gets averaged with where the subject used to be.
+    #[test]
+    fn a_large_change_is_followed_almost_immediately() {
+        let mut s = vec![0.0f32];
+        Self_smooth(&mut s, &[1.0]);
+        assert!(
+            s[0] > 0.95,
+            "a full-range jump must be taken nearly whole, got {}",
+            s[0]
+        );
+    }
+
+    /// Small changes are noise on a stationary subject, and averaging them is the entire
+    /// reason this filter exists.
+    #[test]
+    fn small_changes_are_averaged_away() {
+        let mut s = vec![0.5f32];
+        Self_smooth(&mut s, &[0.52]);
+        assert!(s[0] < 0.515, "a 0.02 wobble should be damped, got {}", s[0]);
+    }
+
+    /// Helper: run one smoothing step against an established history.
+    #[allow(non_snake_case)]
+    fn Self_smooth(state: &mut Vec<f32>, next: &[f32]) {
+        // frames > 0 so the first-frame passthrough does not apply.
+        Matter::smooth_into(state, 1, next);
     }
 
     /// Guards a bug that produced a *plausible* matte rather than an error.
