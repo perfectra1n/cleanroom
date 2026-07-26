@@ -49,6 +49,34 @@ impl Service {
             .collect()
     }
 
+    /// Which autostart mechanism applies here, whether it is on, and anything the user
+    /// has to do by hand. Returns (mechanism, instruction, enabled).
+    async fn autostart(&self) -> (String, String, bool) {
+        match zbus::Connection::session().await {
+            Ok(c) => {
+                let r = crate::autostart::status(&c).await;
+                (r.mechanism.as_str().to_string(), r.instruction, r.enabled)
+            }
+            Err(e) => ("unknown".into(), e.to_string(), false),
+        }
+    }
+
+    /// Turn autostart on or off. Returns (mechanism, instruction).
+    ///
+    /// The instruction is non-empty exactly when this session supports neither standard
+    /// mechanism, in which case it holds the compositor line to paste. Returning it rather
+    /// than silently succeeding is the point: a checkbox that claims to have done something
+    /// it could not do is worse than one that explains itself.
+    async fn set_autostart(&self, on: bool) -> zbus::fdo::Result<(String, String)> {
+        let connection = zbus::Connection::session()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let r = crate::autostart::set(&connection, on)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        Ok((r.mechanism.as_str().to_string(), r.instruction))
+    }
+
     async fn get(&self, key: &str) -> zbus::fdo::Result<String> {
         settings::get(&self.shared.config(), key)
             .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))

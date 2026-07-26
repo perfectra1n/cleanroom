@@ -155,6 +155,16 @@ pub trait Cleanroom {
     /// invite the user to create a feedback loop.
     fn list_microphones(&self) -> zbus::Result<Vec<DeviceInfo>>;
 
+    /// Which autostart mechanism applies, whether it is on, and any manual step.
+    ///
+    /// Evaluated at call time rather than stored, because the answer depends on the
+    /// session that happens to be running — the same machine can boot into GNOME one day
+    /// and bare Hyprland the next, and only one of those honours XDG autostart.
+    fn autostart(&self) -> zbus::Result<(String, String, bool)>;
+
+    /// Turn autostart on or off. Returns the mechanism used and any manual step left.
+    fn set_autostart(&self, on: bool) -> zbus::Result<(String, String)>;
+
     /// Read a setting by dotted path, e.g. `video.blur_strength`.
     ///
     /// Stringly-typed on purpose: it keeps the CLI and any shell script honest without

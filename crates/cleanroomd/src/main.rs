@@ -4,6 +4,7 @@
 //! driven over the D-Bus session bus so the GUI, the CLI and `busctl` are equal.
 
 mod audio_pipeline;
+mod autostart;
 mod background;
 mod doctor;
 mod realtime;

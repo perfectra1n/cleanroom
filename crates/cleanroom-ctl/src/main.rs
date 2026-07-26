@@ -38,6 +38,11 @@ enum Command {
     Keys,
     /// List cameras and microphones the daemon can use.
     Devices,
+    /// Show or change whether the daemon starts with your session.
+    Autostart {
+        /// `on` or `off`. Omit to show the current state.
+        state: Option<String>,
+    },
     /// Check the environment for the things that usually go wrong.
     Doctor,
     /// Re-read the config file, discarding unsaved runtime changes.
@@ -71,6 +76,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Devices => devices(&proxy).await?,
+        Command::Autostart { state } => autostart(&proxy, state).await?,
         Command::Doctor => {
             for line in proxy.doctor().await? {
                 println!("{line}");
@@ -130,6 +136,41 @@ async fn status(proxy: &CleanroomProxy<'_>) -> Result<()> {
         "audio    mic {:.1} dBFS in -> {:.1} dBFS out",
         st.mic_level_db, st.mic_level_out_db
     );
+    Ok(())
+}
+
+async fn autostart(proxy: &CleanroomProxy<'_>, state: Option<String>) -> Result<()> {
+    match state.as_deref() {
+        None => {
+            let (mechanism, instruction, enabled) = proxy.autostart().await?;
+            println!(
+                "autostart is {} (via {mechanism})",
+                if enabled { "on" } else { "off" }
+            );
+            if !instruction.is_empty() {
+                println!("\n{instruction}");
+            }
+        }
+        Some(s) => {
+            let on = matches!(s, "on" | "true" | "yes" | "1" | "enable");
+            if !on && !matches!(s, "off" | "false" | "no" | "0" | "disable") {
+                anyhow::bail!("expected `on` or `off`, got `{s}`");
+            }
+            let (mechanism, instruction) = proxy.set_autostart(on).await?;
+            // A non-empty instruction means the daemon could not do it — this session
+            // supports neither mechanism — so saying "enabled" would be exactly the lie
+            // the whole three-way decision exists to avoid.
+            if instruction.is_empty() {
+                println!(
+                    "autostart {} (via {mechanism})",
+                    if on { "enabled" } else { "disabled" }
+                );
+            } else {
+                println!("autostart was NOT changed: this session needs a manual step.");
+                println!("\n{instruction}");
+            }
+        }
+    }
     Ok(())
 }
 
