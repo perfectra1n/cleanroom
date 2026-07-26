@@ -81,15 +81,16 @@ impl fmt::Display for Check {
     }
 }
 
-pub fn run(config: &Config) -> Vec<Check> {
+pub fn run(config: &Config, rt: &crate::realtime::RtStatus) -> Vec<Check> {
     let mut out = Vec::new();
     out.extend(check_gpu(config));
     out.extend(check_v4l2loopback());
     out.extend(check_secure_boot());
     out.extend(check_cameras());
     out.extend(check_pipewire());
-    out.extend(check_realtime());
+    out.extend(check_realtime(rt));
     out.extend(check_browsers());
+    out.extend(check_models());
     out
 }
 
@@ -168,6 +169,41 @@ fn check_gpu(config: &Config) -> Vec<Check> {
                     ),
                 ),
             }
+        }
+    }
+
+    // Which adapter would actually be selected.
+    //
+    // Arguably the single most consequential thing doctor can report. On the reference
+    // machine the measured matting gap between the discrete GPU and the iGPU is 4.53 ms
+    // against 38.77 ms — same binary, same model — so "it works but it is slow" is almost
+    // always this. Enumerating costs a Vulkan instance, which is why it is done once here
+    // rather than being inferred from the DRM node list above.
+    let adapters = cleanroom_gpu::Gpu::list_adapters();
+    if adapters.is_empty() {
+        out.push(Check::fail("vulkan adapters", "none enumerated").with_fix(
+            "wgpu dlopens libvulkan.so.1 at runtime. Check that a Vulkan ICD and loader \
+                 are installed and that libvulkan.so.1 is on the library path.",
+        ));
+    } else {
+        // list_adapters is already in the pipeline's preference order, so the first entry
+        // is what would be chosen when nothing is pinned.
+        let would_pick = &adapters[0];
+        let all = adapters
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push(Check::info("vulkan adapters", all));
+        match config.gpu.render_node.as_deref() {
+            Some(pin) => out.push(Check::ok(
+                "gpu selection",
+                format!("pinned to {}", pin.display()),
+            )),
+            None => out.push(Check::info(
+                "gpu selection",
+                format!("would select {would_pick}"),
+            )),
         }
     }
 
@@ -390,7 +426,7 @@ fn check_pipewire() -> Vec<Check> {
 
 // --- realtime -----------------------------------------------------------------------
 
-fn check_realtime() -> Vec<Check> {
+fn check_realtime(rt: &crate::realtime::RtStatus) -> Vec<Check> {
     // The audio thread wants RT priority. PAM's limits.conf does NOT apply to systemd
     // user units, so an RLIMIT_RTPRIO of 0 is normal here and is not itself a failure —
     // rtkit or the Realtime portal is the supported route.
@@ -399,10 +435,35 @@ fn check_realtime() -> Vec<Check> {
         || Path::new("/run/current-system/sw/share/dbus-1/system-services/org.freedesktop.RealtimeKit1.service").exists()
         || Path::new("/proc/self").exists() && rtkit_running();
 
+    // What was actually *granted* leads, because that is the question. An earlier version
+    // reported only that rtkit exists, which is a fact about the machine rather than about
+    // Cleanroom — and it read as a pass on systems where the request was being refused.
+    match rt {
+        crate::realtime::RtStatus::Granted { via, policy } => {
+            return vec![Check::ok(
+                "realtime scheduling",
+                format!("granted via {via}; audio thread is on SCHED policy {policy}"),
+            )];
+        }
+        crate::realtime::RtStatus::Denied { why } => {
+            return vec![
+                Check::warn("realtime scheduling", format!("not granted: {why}")).with_fix(
+                    "without RT priority the audio thread can be preempted and glitch under \
+                     load. Install rtkit, or raise DefaultLimitRTPRIO in \
+                     /etc/systemd/system.conf. PAM limits.conf does not apply to systemd \
+                     user units, so RLIMIT_RTPRIO of 0 is normal there.",
+                ),
+            ];
+        }
+        // Not asked yet — the audio thread may not have started. Fall through to reporting
+        // whether the machinery is even present.
+        crate::realtime::RtStatus::Unknown => {}
+    }
+
     if rtkit {
-        vec![Check::ok(
+        vec![Check::info(
             "realtime scheduling",
-            "rtkit is available; the audio thread will request RT priority through it",
+            "rtkit is available; the audio thread has not asked for RT priority yet",
         )]
     } else {
         vec![
@@ -413,6 +474,46 @@ fn check_realtime() -> Vec<Check> {
             ),
         ]
     }
+}
+
+// --- model weights -------------------------------------------------------------------
+
+/// Are the model weights actually on disk?
+///
+/// Neither set is vendored — RVM's are 15 MB and GPL-3.0, and DeepFilterNet's carry no
+/// licence grant at all — so a fresh install has working code and no weights, and both
+/// subsystems degrade to passthrough. That degradation is reported in health, but doctor is
+/// where someone looks *first*, and "why is nothing happening" deserves a direct answer.
+fn check_models() -> Vec<Check> {
+    let mut out = Vec::new();
+
+    match cleanroom_matting::find_model() {
+        Ok(p) => out.push(Check::ok("matting weights", format!("{}", p.display()))),
+        Err(e) => out.push(
+            Check::warn(
+                "matting weights",
+                "not found — background effects cannot run",
+            )
+            .with_fix(format!(
+                "run `cleanroom-ctl fetch-models`, or place the file by hand. {e}"
+            )),
+        ),
+    }
+
+    match cleanroom_audio::find_model() {
+        Ok(p) => out.push(Check::ok("denoise weights", format!("{}", p.display()))),
+        Err(e) => out.push(
+            Check::warn(
+                "denoise weights",
+                "not found — the microphone runs as passthrough",
+            )
+            .with_fix(format!(
+                "run `cleanroom-ctl fetch-models`, or place the file by hand. {e}"
+            )),
+        ),
+    }
+
+    out
 }
 
 fn rtkit_running() -> bool {
@@ -476,7 +577,7 @@ mod tests {
     fn doctor_runs_without_panicking_and_says_something() {
         // It must be safe to run on any machine, including one missing every optional
         // piece — a diagnostic that crashes is worse than no diagnostic.
-        let checks = run(&Config::default());
+        let checks = run(&Config::default(), &crate::realtime::RtStatus::Unknown);
         assert!(!checks.is_empty());
         for c in &checks {
             assert!(!c.name.is_empty());
@@ -487,7 +588,7 @@ mod tests {
     #[test]
     fn every_actionable_check_says_what_to_do() {
         // A Fail or Warn with no fix is a dead end for the user.
-        for c in run(&Config::default()) {
+        for c in run(&Config::default(), &crate::realtime::RtStatus::Unknown) {
             if matches!(c.level, Level::Fail | Level::Warn) {
                 assert!(
                     c.fix.is_some(),

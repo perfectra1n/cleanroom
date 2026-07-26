@@ -78,6 +78,10 @@ pub struct Shared {
     /// before dropping the delay inhibitor, so the machine does not suspend mid-teardown.
     suspend_ack: AtomicBool,
 
+    /// What happened when the audio thread asked for real-time scheduling. Published so
+    /// doctor reports what was *granted* rather than only that rtkit exists.
+    rt_status: RwLock<crate::realtime::RtStatus>,
+
     /// What the PipeWire registry watcher sees. Owned here rather than by the audio
     /// pipeline because the D-Bus side must be able to answer ListMicrophones whether or
     /// not the audio thread happens to be running.
@@ -103,6 +107,7 @@ impl Shared {
             pw_node: RwLock::new(String::new()),
             suspend: AtomicBool::new(false),
             suspend_ack: AtomicBool::new(false),
+            rt_status: RwLock::new(crate::realtime::RtStatus::default()),
             audio_registry: cleanroom_audio::RegistryView::new(),
             shutdown: Notify::new(),
         })
@@ -176,6 +181,14 @@ impl Shared {
     }
 
     /// Ask the video thread to release its devices.
+    pub fn set_rt_status(&self, s: crate::realtime::RtStatus) {
+        *self.rt_status.write().expect("rt lock poisoned") = s;
+    }
+
+    pub fn rt_status(&self) -> crate::realtime::RtStatus {
+        self.rt_status.read().expect("rt lock poisoned").clone()
+    }
+
     pub fn request_suspend(&self) {
         self.suspend_ack.store(false, Ordering::SeqCst);
         self.suspend.store(true, Ordering::SeqCst);

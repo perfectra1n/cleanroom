@@ -88,7 +88,7 @@ impl Service {
     }
 
     async fn doctor(&self) -> Vec<String> {
-        doctor::run(&self.shared.config())
+        doctor::run(&self.shared.config(), &self.shared.rt_status())
             .into_iter()
             .map(|c| c.to_string())
             .collect()

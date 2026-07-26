@@ -170,6 +170,11 @@ fn run_once(
         cfg.audio.device.clone(),
     );
 
+    // Ask for real-time scheduling before the loop starts, so a slow or absent rtkit costs
+    // startup latency rather than a glitch mid-stream. This runs on the audio thread
+    // because rtkit promotes a *thread*, not a process.
+    crate::realtime::publish(shared, crate::realtime::request_for_current_thread());
+
     VirtualMic::run(
         audio.clone(),
         target,

@@ -1101,6 +1101,7 @@ dependencies = [
  "cleanroom-video",
  "futures-util",
  "image",
+ "libc",
  "serde",
  "thiserror 2.0.19",
  "tokio",

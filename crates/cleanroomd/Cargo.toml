@@ -41,6 +41,8 @@ futures-util = { version = "0.3", default-features = false }
 toml = "0.9"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# setrlimit / sched_setscheduler / gettid for the real-time request.
+libc = "0.2"
 
 # Background plates only. default-features = false drops the dozen codecs we have no reason
 # to accept — a background image is something the user picked from their own disk, so the

@@ -6,6 +6,7 @@
 mod audio_pipeline;
 mod background;
 mod doctor;
+mod realtime;
 mod service;
 mod settings;
 mod sleep;
