@@ -18,9 +18,16 @@ impl Service {
     }
 
     async fn list_cameras(&self) -> Vec<DeviceInfo> {
-        // Populated by cleanroom-video once the capture backend lands. Returning an
-        // empty list is honest; inventing entries would not be.
-        Vec::new()
+        // Only nodes that can actually capture, and never a virtual camera — offering
+        // one would let a user point Cleanroom at its own output, or at OBS's.
+        cleanroom_video::capture_devices()
+            .into_iter()
+            .map(|d| DeviceInfo {
+                id: d.path.display().to_string(),
+                description: d.card,
+                available: d.accessible,
+            })
+            .collect()
     }
 
     async fn list_microphones(&self) -> Vec<DeviceInfo> {

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/cleanroom-core",
     "crates/cleanroom-ipc",
+    "crates/cleanroom-video",
     "crates/cleanroomd",
     "crates/cleanroom-ctl",
     "spikes/ort-rvm",

@@ -224,10 +224,11 @@ fn check_v4l2loopback() -> Vec<Check> {
     let mut conflicting = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/etc/modprobe.d") {
         for e in entries.flatten() {
-            if let Ok(text) = std::fs::read_to_string(e.path()) {
-                if text.contains("v4l2loopback") && text.contains("options") {
-                    conflicting.push(e.file_name().to_string_lossy().to_string());
-                }
+            if let Ok(text) = std::fs::read_to_string(e.path())
+                && text.contains("v4l2loopback")
+                && text.contains("options")
+            {
+                conflicting.push(e.file_name().to_string_lossy().to_string());
             }
         }
     }
@@ -285,56 +286,66 @@ fn check_secure_boot() -> Vec<Check> {
 // --- cameras ------------------------------------------------------------------------
 
 fn check_cameras() -> Vec<Check> {
+    use cleanroom_video::NodeKind;
+
     let mut out = Vec::new();
-    let mut real = Vec::new();
-    let mut skipped = Vec::new();
+    let all = cleanroom_video::enumerate();
 
-    if let Ok(entries) = std::fs::read_dir("/dev") {
-        let mut paths: Vec<_> = entries
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with("video"))
-            .collect();
-        paths.sort_by_key(|n| n[5..].parse::<u32>().unwrap_or(u32::MAX));
+    let usable: Vec<String> = all
+        .iter()
+        .filter(|d| d.is_usable_input())
+        .map(|d| format!("{} ({})", d.path.display(), d.card))
+        .collect();
 
-        for name in paths {
-            let idx: u32 = match name[5..].parse() {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-            // Read the capability name from sysfs rather than opening the device: a
-            // camera held by another process must still be listable.
-            let sys = format!("/sys/class/video4linux/{name}/name");
-            let label = std::fs::read_to_string(&sys)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-
-            // A UVC camera exposes several nodes and only some are capturable; the rest
-            // are metadata. Offering a metadata node in a camera picker is a classic way
-            // to produce "the camera does not work".
-            let is_metadata =
-                std::fs::read_to_string(format!("/sys/class/video4linux/{name}/device/modalias"))
-                    .map(|_| false)
-                    .unwrap_or(false)
-                    || label.to_lowercase().contains("metadata");
-
-            if is_metadata {
-                skipped.push(format!("/dev/{name} ({label}, metadata)"));
+    // Everything we deliberately will not offer as an input, and why. Naming the reason
+    // matters: "my camera isn't listed" is a common report, and for a UVC metadata node
+    // the honest answer is "that node cannot capture video, use the other one".
+    let excluded: Vec<String> = all
+        .iter()
+        .filter(|d| !d.is_usable_input())
+        .map(|d| {
+            let why = if d.is_virtual {
+                "virtual camera"
             } else {
-                real.push(format!("/dev/{name} [{idx}] {label}"));
-            }
-        }
+                match d.kind {
+                    NodeKind::Metadata => "metadata node, cannot capture",
+                    NodeKind::Output => "output only",
+                    NodeKind::Capture => "unavailable",
+                    NodeKind::Other => "not a video node",
+                }
+            };
+            format!("{} ({why})", d.path.display())
+        })
+        .collect();
+
+    if usable.is_empty() {
+        out.push(
+            Check::warn("cameras", "no usable capture device found").with_fix(
+                "check that a camera is plugged in and that your user is in the 'video' group",
+            ),
+        );
+    } else {
+        out.push(Check::ok("cameras", usable.join("; ")));
     }
 
-    if real.is_empty() {
-        out.push(Check::warn("cameras", "no V4L2 capture devices found"));
-    } else {
-        out.push(Check::ok("cameras", real.join("; ")));
+    if !excluded.is_empty() {
+        out.push(Check::info("cameras (not offered)", excluded.join("; ")));
     }
-    if !skipped.is_empty() {
-        out.push(Check::info("cameras (skipped)", skipped.join("; ")));
+
+    // An inaccessible node is nearly always another process holding the camera, which is
+    // the single most common cause of "Cleanroom says the camera is busy".
+    let busy: Vec<String> = all
+        .iter()
+        .filter(|d| !d.accessible)
+        .map(|d| d.path.display().to_string())
+        .collect();
+    if !busy.is_empty() {
+        out.push(Check::warn("cameras (in use)", busy.join(", ")).with_fix(
+            "another process holds these. Common culprits: a browser tab with camera \
+                 permission, OBS, or PipeWire itself streaming the v4l2 node.",
+        ));
     }
+
     out
 }
 
