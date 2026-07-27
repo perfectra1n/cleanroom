@@ -14,10 +14,12 @@ struct CompositeParams {
     // version of the same room a slightly generous silhouette is invisible, but against a
     // swapped background it is a bright halo tracing the shoulders and ears.
     tighten: f32,
-    // Widens the alpha ramp about its crossing, without moving the crossing. Independent of
-    // `tighten`, which moves the crossing and — being a shift-and-rescale — actually makes
-    // the ramp *steeper* as it does so.
-    feather: f32,
+    // Radius, in full-resolution pixels, over which the alpha is spatially averaged. Zero
+    // disables the average entirely, which is bit-for-bit the un-feathered path.
+    //
+    // A *spatial* radius rather than an alpha-space width, because the latter cannot work.
+    // See `resolve_alpha` below.
+    feather_px: f32,
     _pad0: u32,
 }
 
@@ -34,6 +36,27 @@ struct CompositeParams {
 // Guided-filter coefficients (a in .r, b in .g) at matte resolution. Two smooth fields,
 // which is exactly what bilinear upsampling is good at — unlike the matte itself.
 @group(0) @binding(7) var comp_ab: texture_2d<f32>;
+
+// Alpha at one point, before any edge shaping.
+//
+// Two sources, and the branch is on whether the guided coefficient field has been fitted
+// for the matte currently uploaded. Before the first inference it has not.
+fn resolve_alpha(uv: vec2<f32>) -> f32 {
+    if (comp.guided != 0u) {
+        // Evaluate the local linear model at full resolution. `ab` is smooth, so sampling it
+        // bilinearly is legitimate; the sharpness comes from the luma, which is this point's
+        // own at full resolution rather than anything upsampled from the matte.
+        let ab = textureSampleLevel(comp_ab, comp_samp, uv, 0.0).rg;
+        let i = dot(
+            textureSampleLevel(comp_fg, comp_samp, uv, 0.0).rgb,
+            vec3<f32>(0.299, 0.587, 0.114),
+        );
+        return clamp(ab.r * i + ab.g, 0.0, 1.0);
+    }
+    // The matte is smaller than the frame, so it is sampled rather than loaded — bilinear
+    // interpolation is what keeps the edge smooth instead of blocky.
+    return clamp(textureSampleLevel(comp_matte, comp_samp, uv, 0.0).r, 0.0, 1.0);
+}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -54,43 +77,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // The matte is computed at a lower resolution than the frame, so it is *sampled*
-    // rather than loaded — bilinear interpolation is what keeps the edge smooth instead
-    // of blocky.
     let uv = (vec2<f32>(src) + 0.5) / vec2<f32>(dims);
 
-    var alpha: f32;
-    if (comp.guided != 0u) {
-        // Evaluate the local linear model at full resolution. `ab` is smooth, so sampling
-        // it bilinearly is legitimate; the sharpness comes from `i`, which is this pixel's
-        // own luma at full resolution rather than anything interpolated.
-        let ab = textureSampleLevel(comp_ab, comp_samp, uv, 0.0).rg;
-        let i = dot(fg, vec3<f32>(0.299, 0.587, 0.114));
-        alpha = clamp(ab.r * i + ab.g, 0.0, 1.0);
-    } else {
-        alpha = clamp(textureSampleLevel(comp_matte, comp_samp, uv, 0.0).r, 0.0, 1.0);
+    var alpha = resolve_alpha(uv);
+
+    // Feather: a genuine spatial average, because there is no other way to do it.
+    //
+    // This control used to remap alpha *values* — `smoothstep(c - w, c + w, alpha)` for a
+    // width `w` grown from the slider. That cannot feather, and the reason is worth keeping.
+    // Remapping values can move where the edge sits and reshape its profile, but the
+    // transition still occupies exactly the same *pixels*. Worse, `w` was clamped to 0.5,
+    // and at `tighten = 0` — the default for blur — `(1 - 0) * 0.5` already sat on that
+    // ceiling, so every non-zero feather produced the identical curve. The slider had two
+    // states, and the one it reached had gradient 1.5 at the midpoint: it made the edge
+    // *harder* through the transition and only softened the tails.
+    //
+    // Averaging over a disc is what actually spreads the ramp across more pixels. It has to
+    // happen here, at full resolution, and not on the matte: anything softened at 512x288 is
+    // re-sharpened by `a*I + b` on the way up.
+    if (comp.feather_px > 0.0) {
+        // A Vogel disc — radius sqrt((i + 0.5)/N), golden-angle rotation — rather than a
+        // ring or a box.
+        //
+        // What matters for an edge is how the taps project onto the edge *normal*, and a
+        // single ring projects terribly: six points at radius r land on just three distinct
+        // offsets (0, +/-r/2, +/-r) with a hole between, so a straight edge comes out as four
+        // coarse steps instead of a ramp. Measured on a hard test edge that was alpha
+        // 0.14 / 0.43 / 0.57 / 0.86 and nothing in between. The Vogel spiral spreads twelve
+        // taps evenly over the disc, so every normal direction sees twelve distinct offsets
+        // and the ramp is smooth whichever way the edge runs.
+        //
+        // Only paid when the control is non-zero, and the branch is on a uniform, so it is
+        // coherent across the dispatch rather than divergent.
+        let r = comp.feather_px / vec2<f32>(dims);
+        var sum = alpha;
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.204124,  0.000000) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>(-0.260699,  0.238822) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.039904, -0.454688) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.328595,  0.428593) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>(-0.603011, -0.106664) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.571225, -0.363367) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>(-0.191064,  0.710747) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>(-0.364379, -0.701590) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.790557,  0.288710) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>(-0.822442,  0.339492) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.396472, -0.847237) * r);
+        sum = sum + resolve_alpha(uv + vec2<f32>( 0.292982,  0.934074) * r);
+        alpha = sum / 13.0;
     }
 
-    // Shape the edge by remapping the ramp rather than by a morphological pass: a real
-    // erode would need another full-resolution pass and a second texture, and this is a
-    // matte whose edge is already a soft gradient, so remapping achieves the same thing
-    // for free.
-    //
-    // Two independent controls, and it is worth being clear that they are not the same
-    // knob. `tighten` moves where alpha crosses 0.5, pulling the silhouette inward — and
-    // because it is a shift-and-rescale with gain 1/(1-tighten), it also makes the ramp
-    // steeper, which is the opposite of softening. `feather` widens the ramp around
-    // whatever crossing `tighten` chose, leaving the crossing itself alone.
-    if (comp.feather > 0.0) {
-        // Same crossing as the linear remap below, a wider and C1-smooth ramp around it.
-        // The 3x is what makes the top of the slider a genuinely soft edge rather than a
-        // barely-perceptible change.
-        let c = (1.0 + comp.tighten) * 0.5;
-        let w = clamp((1.0 - comp.tighten) * 0.5 * (1.0 + 3.0 * comp.feather), 0.01, 0.5);
-        alpha = smoothstep(c - w, c + w, alpha);
-    } else if (comp.tighten > 0.0) {
-        // feather = 0 keeps the original behaviour exactly, so an existing config that
-        // never sets feather composites bit for bit as it did before.
+    // Tighten: unchanged, and applied *after* the average so the two controls are finally
+    // independent. Feather decides how wide the ramp is; this decides where it sits, by
+    // moving the 0.5 crossing inward. Being a shift-and-rescale its gain is 1/(1-tighten),
+    // so it still steepens as it erodes — which is why the two are separate knobs and why
+    // softening is feather's job, not a smaller tighten's.
+    if (comp.tighten > 0.0) {
         alpha = clamp((alpha - comp.tighten) / max(1.0 - comp.tighten, 0.001), 0.0, 1.0);
     }
 

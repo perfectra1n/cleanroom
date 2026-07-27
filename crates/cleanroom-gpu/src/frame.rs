@@ -21,9 +21,17 @@ struct CompositeParams {
     dim: f32,
     guided: u32,
     tighten: f32,
-    feather: f32,
+    feather_px: f32,
     _pad0: u32,
 }
+
+/// Feather radius at 1080p, in full-resolution pixels, for `feather = 1.0`.
+///
+/// Scaled by frame height at use, so 720p and 1080p soften the same *fraction* of the
+/// picture rather than the same pixel count — a 12 px ramp is soft at 1080p and mush at
+/// 480p. 12 px is about three matte pixels at the default 512x288 inference size, which is
+/// roughly where an edge stops reading as cut out with scissors and starts reading as mist.
+const FEATHER_MAX_PX_AT_1080P: f32 = 12.0;
 
 /// Guided-filter window radius, in matte pixels.
 ///
@@ -72,8 +80,15 @@ pub struct Look {
     pub tighten: f32,
     /// Widen the alpha ramp, 0.0..=1.0, without moving where it crosses 0.5.
     ///
-    /// The knob for "make the cut-out less like a sticker". `tighten` decides *where* the
-    /// silhouette ends; this decides how abruptly. 0.0 is the historical behaviour exactly.
+    /// The knob for "make the cut-out less like a sticker". [`tighten`](Self::tighten)
+    /// decides *where* the silhouette ends; this decides how abruptly. 0.0 leaves the alpha
+    /// untouched, so a config that never sets it composites exactly as before.
+    ///
+    /// Implemented as a spatial average of the alpha over a disc whose radius scales with
+    /// this value — see [`FEATHER_MAX_PX_AT_1080P`]. It has to be spatial: an earlier
+    /// version remapped alpha *values* through a widening `smoothstep`, which cannot widen
+    /// an edge, because the transition still lands on the same pixels. It also saturated
+    /// immediately, so the whole slider had two states.
     pub feather: f32,
 }
 
@@ -931,7 +946,9 @@ impl FramePipeline {
             dim: look.dim.clamp(0.0, 1.0),
             guided: self.guided_ready as u32,
             tighten: look.tighten.clamp(0.0, 0.9),
-            feather: look.feather.clamp(0.0, 1.0),
+            feather_px: look.feather.clamp(0.0, 1.0)
+                * FEATHER_MAX_PX_AT_1080P
+                * (self.height as f32 / 1080.0),
             _pad0: 0,
         };
         self.gpu
@@ -1207,9 +1224,9 @@ mod tests {
     /// Build a YUY2 frame from a per-pixel RGB function, via the same BT.601 limited-range
     /// matrix `colour.wgsl` uses. Generating YUV directly would ask for colours outside the
     /// RGB gamut, which the shader clamps — correctly — and the test then reads as a bug.
-    fn yuy2_from(rgb: impl Fn(u32) -> (f32, f32, f32)) -> Vec<u8> {
-        let pw = (W / 2) as usize;
-        let mut out = vec![0u8; pw * H as usize * 4];
+    fn yuy2_from(w: u32, h: u32, rgb: impl Fn(u32) -> (f32, f32, f32)) -> Vec<u8> {
+        let pw = (w / 2) as usize;
+        let mut out = vec![0u8; pw * h as usize * 4];
         let to_yuv = |(r, g, b): (f32, f32, f32)| {
             (
                 0.2568 * r + 0.5041 * g + 0.0979 * b + 0.0627451,
@@ -1217,7 +1234,7 @@ mod tests {
                 0.4392 * r - 0.3678 * g - 0.0714 * b + 0.5019608,
             )
         };
-        for y in 0..H as usize {
+        for y in 0..h as usize {
             for xq in 0..pw {
                 let x = xq as u32 * 2;
                 let (y0, u0, v0) = to_yuv(rgb(x));
@@ -1232,21 +1249,31 @@ mod tests {
         out
     }
 
-    /// Luma of pixel `x` on row `y` of a packed YUY2 buffer.
-    fn luma(buf: &[u8], x: u32, y: u32) -> i32 {
-        let pw = (W / 2) as usize;
+    /// Luma of pixel `x` on row `y` of a packed YUY2 buffer `w` pixels wide.
+    fn luma_at(buf: &[u8], w: u32, x: u32, y: u32) -> i32 {
+        let pw = (w / 2) as usize;
         buf[(y as usize * pw + (x / 2) as usize) * 4 + (x % 2) as usize * 2] as i32
     }
 
-    /// A frame that is white on one half and black on the other.
-    fn split_frame(white_left: bool) -> Vec<u8> {
-        yuy2_from(|x| {
-            if (x < W / 2) == white_left {
+    /// Luma at this module's default frame size.
+    fn luma(buf: &[u8], x: u32, y: u32) -> i32 {
+        luma_at(buf, W, x, y)
+    }
+
+    /// A frame that is white on one half and black on the other, at an arbitrary size.
+    fn split_frame_at(w: u32, h: u32, white_left: bool) -> Vec<u8> {
+        yuy2_from(w, h, |x| {
+            if (x < w / 2) == white_left {
                 (1.0, 1.0, 1.0)
             } else {
                 (0.0, 0.0, 0.0)
             }
         })
+    }
+
+    /// A split frame at this module's default size.
+    fn split_frame(white_left: bool) -> Vec<u8> {
+        split_frame_at(W, H, white_left)
     }
 
     /// A matte at `mw`x`mh` that is opaque over the same half as `split_frame`.
@@ -1382,6 +1409,179 @@ mod tests {
                 },
             );
         }
+    }
+
+    // --- edge feather -----------------------------------------------------------------
+    //
+    // These run on a larger frame than the tests above, and not for realism: the feather
+    // radius scales with frame height (12 px at 1080p), so on this module's 32-row frame the
+    // widest possible radius is a third of a pixel and there would be nothing to measure.
+
+    const FW: u32 = 640;
+    const FH: u32 = 360;
+
+    /// The band of pixels around the centre seam where the two planes are being mixed.
+    ///
+    /// Measured from composited luma rather than from alpha, because that is what anyone
+    /// actually sees. `Remove` keys the background to flat green, so any luma strictly
+    /// between the two plateaux is a pixel whose alpha is neither 0 nor 1.
+    fn transition_band(out: &[u8], w: u32, y: u32) -> Option<(u32, u32)> {
+        let (lo, hi) = (BG_GREEN + 3, FG_WHITE - 3);
+        let (mut first, mut last) = (None, None);
+        for x in 0..w {
+            let v = luma_at(out, w, x, y);
+            if v > lo && v < hi {
+                first.get_or_insert(x);
+                last = Some(x);
+            }
+        }
+        first.zip(last)
+    }
+
+    fn transition_width(out: &[u8], w: u32, y: u32) -> u32 {
+        transition_band(out, w, y).map_or(0, |(a, b)| b - a + 1)
+    }
+
+    /// Composite a hard-edged split matte at `feather`/`tighten` and hand back the frame.
+    ///
+    /// The *frame* is uniform white and only the matte splits, which is the whole point.
+    /// A white/black split frame — what the tests above use — puts a colour edge in the same
+    /// place as the alpha edge, and `Remove` then mixes flat green against black on one side,
+    /// so the composited luma dips *below* the background plateau instead of ramping between
+    /// the two. Measured, that reads as 97 in the middle of a 145..235 ramp, and any
+    /// threshold-based band detector loses half the transition. Uniform white makes luma a
+    /// direct, monotone readout of alpha: 235 at alpha 1, 145 at alpha 0.
+    fn feathered(pipe: &mut FramePipeline, feather: f32, tighten: f32) -> Vec<u8> {
+        let mut out = vec![0u8; (FW * FH * 2) as usize];
+        pipe.begin_frame(&yuy2_from(FW, FH, |_| (1.0, 1.0, 1.0)), None);
+        pipe.set_matte(&split_matte(true, FW, FH), FW, FH);
+        pipe.finish_frame(
+            &mut out,
+            Look {
+                mode: BackgroundMode::Remove,
+                feather,
+                tighten,
+                ..Default::default()
+            },
+        );
+        out
+    }
+
+    fn feather_pipeline() -> Option<FramePipeline> {
+        let gpu = match Gpu::new(None) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("no GPU available ({e}); skipping");
+                return None;
+            }
+        };
+        let mut pipe = FramePipeline::new(gpu, FW, FH);
+        // Sample the matte directly. These tests are about the spatial average, not about
+        // the guided filter's reconstruction.
+        pipe.set_guided(false, 3, 1e-4);
+        Some(pipe)
+    }
+
+    /// The regression this rewrite exists for.
+    ///
+    /// The old implementation remapped alpha *values* through `smoothstep(c - w, c + w, a)`
+    /// with `w = clamp((1 - tighten) * 0.5 * (1 + 3 * feather), 0.01, 0.5)`. At `tighten = 0`
+    /// — the default for blur — `(1 - 0) * 0.5` already sat on the clamp ceiling, so every
+    /// non-zero feather produced the identical curve. Measured across the slider, `w` was
+    /// 0.5 at feather 0.05, 0.1, 0.5 and 1.0 alike: the control had two states.
+    ///
+    /// Nothing caught it, because the only tests on feather checked that it round-trips
+    /// through the config and does not restart the pipeline. This measures the thing the
+    /// knob claims to do.
+    #[test]
+    fn feather_widens_the_edge_monotonically() {
+        let Some(mut pipe) = feather_pipeline() else {
+            return;
+        };
+
+        let mut widths = Vec::new();
+        for feather in [0.0f32, 0.25, 0.5, 1.0] {
+            let out = feathered(&mut pipe, feather, 0.0);
+            let width = transition_width(&out, FW, FH / 2);
+            widths.push(width);
+            // The profile itself, not just its width: a ramp that is wide but takes only two
+            // or three distinct values reads as banding rather than as a soft edge, and the
+            // width alone cannot tell the two apart. This is what caught the first attempt,
+            // a hexagonal ring, producing four coarse steps instead of a ramp.
+            let profile: Vec<i32> = (FW / 2 - 10..FW / 2 + 10)
+                .map(|x| luma_at(&out, FW, x, FH / 2))
+                .collect();
+            eprintln!("  feather {feather:<4}  width {width:>2}  {profile:?}");
+        }
+
+        for pair in widths.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "feather must widen the edge at every step, got {widths:?}; \
+                 a flat run means it has saturated, which is the original bug"
+            );
+        }
+
+        // Pins the scaling constant as well as the direction. At 360 rows the widest radius
+        // is 12 * 360/1080 = 4 px, so the ring spans about 8 px either side of the seam.
+        // A 1-2 px result means FEATHER_MAX_PX_AT_1080P was dropped; 80 means the height
+        // scaling is off by an order of magnitude.
+        let widest = *widths.last().expect("four measurements");
+        assert!(
+            (5..=14).contains(&widest),
+            "feather = 1.0 gave a {widest} px transition; expected roughly 8 px at {FH} rows"
+        );
+    }
+
+    /// Zero must mean *nothing*, or every existing config silently changes look.
+    #[test]
+    fn feather_zero_leaves_the_edge_hard() {
+        let Some(mut pipe) = feather_pipeline() else {
+            return;
+        };
+        let out = feathered(&mut pipe, 0.0, 0.0);
+        let width = transition_width(&out, FW, FH / 2);
+        assert!(
+            width <= 1,
+            "feather = 0 produced a {width} px ramp; the spatial average must collapse to \
+             the centre tap so an unfeathered config composites exactly as before"
+        );
+    }
+
+    /// The two edge controls must finally be independent, which is what the docs claim.
+    ///
+    /// `tighten` moves where alpha crosses 0.5 and — being a shift-and-rescale with gain
+    /// `1/(1 - t)` — steepens the ramp as it does so. Under the old value-remap that
+    /// steepening fought feather directly, and `tighten` also fed feather's own width term,
+    /// so the two were tangled. Now feather works in screen space: raising tighten must move
+    /// the edge without collapsing the softening back to nothing.
+    #[test]
+    fn tighten_moves_the_edge_without_undoing_feather() {
+        let Some(mut pipe) = feather_pipeline() else {
+            return;
+        };
+
+        let hard = transition_width(&feathered(&mut pipe, 0.0, 0.0), FW, FH / 2);
+
+        let soft = feathered(&mut pipe, 1.0, 0.0);
+        let tight = feathered(&mut pipe, 1.0, 0.3);
+
+        let (a0, b0) = transition_band(&soft, FW, FH / 2).expect("a feathered edge has a band");
+        let (a1, b1) = transition_band(&tight, FW, FH / 2).expect("still a band once tightened");
+        let (mid_soft, mid_tight) = ((a0 + b0) as f32 / 2.0, (a1 + b1) as f32 / 2.0);
+
+        // The subject is on the left, so eroding it moves the crossing left.
+        assert!(
+            mid_tight < mid_soft,
+            "tighten must pull the silhouette inward: crossing sat at {mid_soft} and moved \
+             to {mid_tight}"
+        );
+        assert!(
+            (b1 - a1 + 1) > hard + 2,
+            "tighten collapsed the feather back to a hard edge ({} px against {hard} px \
+             unfeathered); the two controls are supposed to be independent",
+            b1 - a1 + 1
+        );
     }
 
     /// `begin_frame` must hand back the frame it was just given, not the one before it.

@@ -78,9 +78,14 @@ pub struct VideoConfig {
 
     /// Widen the alpha ramp, 0.0..=1.0, without moving where it crosses 0.5.
     ///
-    /// The knob for "the cut-out looks like a sticker". [`matte_tighten`] decides *where*
-    /// the silhouette ends; this decides how abruptly it gets there. 0.0 is the historical
-    /// behaviour exactly, so an existing config composites unchanged.
+    /// The knob for "the cut-out looks like a sticker". [`VideoConfig::matte_tighten`]
+    /// decides *where* the silhouette ends; this decides how abruptly it gets there. 0.0
+    /// leaves the alpha untouched, so a config that never sets it composites unchanged.
+    ///
+    /// It is a spatial average of the alpha at full resolution — roughly a 12 px radius at
+    /// 1080p for 1.0, scaled by frame height. Softening the matte itself would not work:
+    /// anything smoothed at the network's 512x288 is re-sharpened by the guided filter's
+    /// `a*I + b` on the way back up to frame size.
     #[serde(default)]
     pub matte_feather: f32,
 
