@@ -7,9 +7,19 @@
 //!   3. Is it fast enough at 1080p?
 //!
 //!     nix develop -c cargo run --release -p cleanroom-gpu --example gpu_check
+//!
+//! An optional argument pins the adapter to one DRM render node:
+//!
+//!     ... --example gpu_check -- /dev/dri/renderD129
+//!
+//! That matters for the throughput numbers. Without it the same adapter selection the daemon
+//! uses picks the fastest thing present, so on a machine with a discrete GPU the slow-hardware
+//! conformance target — the iGPU, measured at 8x the frame time during the spikes — is never
+//! exercised at all, and "fits 30fps" is answered for the wrong device.
 
 use cleanroom_core::BackgroundMode;
 use cleanroom_gpu::{FramePipeline, Gpu, Look};
+use std::path::PathBuf;
 use std::time::Instant;
 
 /// The three settings these checks vary, with everything else left at its default.
@@ -26,7 +36,8 @@ const W: u32 = 1920;
 const H: u32 = 1080;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let gpu = Gpu::new(None)?;
+    let pin: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+    let gpu = Gpu::new(pin.as_deref())?;
     println!("adapter: {}\n", gpu.choice);
 
     let mut pipe = FramePipeline::new(gpu, W, H);

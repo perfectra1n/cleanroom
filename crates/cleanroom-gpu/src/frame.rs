@@ -139,6 +139,20 @@ const MAX_BLUR_LEVELS: u32 = 5;
 /// starts to alias visibly rather than smooth.
 const MIN_BLUR_SIDE: u32 = 16;
 
+/// Storage format for the blur pyramid.
+///
+/// Half floats rather than 8-bit unorm, and the reason is the weighting. The pyramid carries
+/// the background *premultiplied* by how much of each tap was background, and the composite
+/// divides that weight back out — so quantisation error is amplified by `1/w`. An isolated
+/// background pixel in a narrow gap, say between an arm and the torso, can sit at `w ≈ 0.05`,
+/// where 8-bit would recover with about 0.04 of error: roughly ten levels of 255, and plainly
+/// visible as banding across a smoothly blurred region.
+///
+/// The cost is about 2.7 MB more across the pyramid, some 330 MB/s at 30 fps, which is
+/// nothing against even an iGPU's bandwidth. `guided_ab` already writes and linearly samples
+/// this format, including under lavapipe in CI, so it is known to work on this stack.
+const BLUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 pub struct FramePipeline {
     gpu: Gpu,
     width: u32,
@@ -176,6 +190,8 @@ pub struct FramePipeline {
     unpack: wgpu::ComputePipeline,
     pack: wgpu::ComputePipeline,
     blur_down: wgpu::ComputePipeline,
+    /// Level 0 only: the same kernel, weighted so the subject is kept out of its own blur.
+    blur_down_weighted: wgpu::ComputePipeline,
     blur_up: wgpu::ComputePipeline,
     composite: wgpu::ComputePipeline,
 
@@ -264,13 +280,7 @@ impl FramePipeline {
             if lw < MIN_BLUR_SIDE || lh < MIN_BLUR_SIDE {
                 break;
             }
-            blur_levels.push(make_tex(
-                "blur-level",
-                lw,
-                lh,
-                wgpu::TextureFormat::Rgba8Unorm,
-                true,
-            ));
+            blur_levels.push(make_tex("blur-level", lw, lh, BLUR_FORMAT, true));
             lw /= 2;
             lh /= 2;
         }
@@ -280,7 +290,7 @@ impl FramePipeline {
                 "blur-level",
                 (width / 2).max(1),
                 (height / 2).max(1),
-                wgpu::TextureFormat::Rgba8Unorm,
+                BLUR_FORMAT,
                 true,
             ));
         }
@@ -424,6 +434,7 @@ impl FramePipeline {
             unpack: pipeline("unpack", &m_unpack, "main"),
             pack: pipeline("pack", &m_pack, "main"),
             blur_down: pipeline("blur-down", &m_blur, "down"),
+            blur_down_weighted: pipeline("blur-down-weighted", &m_blur, "down_weighted"),
             blur_up: pipeline("blur-up", &m_blur, "up"),
             composite: pipeline("composite", &m_comp, "main"),
             downscale: pipeline("downscale", &m_down, "main"),
@@ -994,15 +1005,11 @@ impl FramePipeline {
 
             // Down: full frame into level 0, then each level into the next one down. The
             // halving is what makes the radius grow geometrically.
+            // Level 0 is the only pass that reads the full-resolution frame, and therefore
+            // the only place the matte can be applied. Everything below it inherits the
+            // weighting for free, because the remaining passes sum `vec4` linearly.
             let l0 = &self.blur_levels[0];
-            self.blur_pass(
-                &mut enc,
-                &self.blur_down,
-                &self.rgba,
-                l0,
-                l0.width(),
-                l0.height(),
-            );
+            self.blur_pass_weighted(&mut enc, &self.rgba, l0, l0.width(), l0.height());
             for i in 1..levels {
                 let (src, dst) = (&self.blur_levels[i - 1], &self.blur_levels[i]);
                 self.blur_pass(
@@ -1167,6 +1174,50 @@ impl FramePipeline {
         pass.set_bind_group(0, &bg, &[]);
         // Workgroups are 8x8, matching the @workgroup_size in every kernel.
         pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+    }
+
+    /// Level 0 of the down chain, with the matte bound so the subject can be weighted out.
+    ///
+    /// Separate from [`blur_pass`](Self::blur_pass) rather than a flag on it because the bind
+    /// group layouts genuinely differ — this entry point reads a fifth binding — and wgpu
+    /// derives the layout per entry point, so the two cannot share one helper.
+    fn blur_pass_weighted(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        src: &wgpu::Texture,
+        dst: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) {
+        let v = |t: &wgpu::Texture| t.create_view(&Default::default());
+        self.dispatch(
+            enc,
+            &self.blur_down_weighted,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&v(src)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&v(dst)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.blur_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&v(&self.matte)),
+                },
+            ],
+            w,
+            h,
+        );
     }
 
     fn blur_pass(
@@ -1467,7 +1518,11 @@ mod tests {
         out
     }
 
-    fn feather_pipeline() -> Option<FramePipeline> {
+    /// A pipeline big enough for the edge and blur tests, with the guided filter off.
+    ///
+    /// Larger than this module's default frame on purpose: the feather radius scales with
+    /// frame height, so at 32 rows the widest possible radius is a third of a pixel.
+    fn wide_pipeline() -> Option<FramePipeline> {
         let gpu = match Gpu::new(None) {
             Ok(g) => g,
             Err(e) => {
@@ -1495,7 +1550,7 @@ mod tests {
     /// knob claims to do.
     #[test]
     fn feather_widens_the_edge_monotonically() {
-        let Some(mut pipe) = feather_pipeline() else {
+        let Some(mut pipe) = wide_pipeline() else {
             return;
         };
 
@@ -1536,7 +1591,7 @@ mod tests {
     /// Zero must mean *nothing*, or every existing config silently changes look.
     #[test]
     fn feather_zero_leaves_the_edge_hard() {
-        let Some(mut pipe) = feather_pipeline() else {
+        let Some(mut pipe) = wide_pipeline() else {
             return;
         };
         let out = feathered(&mut pipe, 0.0, 0.0);
@@ -1557,7 +1612,7 @@ mod tests {
     /// the edge without collapsing the softening back to nothing.
     #[test]
     fn tighten_moves_the_edge_without_undoing_feather() {
-        let Some(mut pipe) = feather_pipeline() else {
+        let Some(mut pipe) = wide_pipeline() else {
             return;
         };
 
@@ -1582,6 +1637,129 @@ mod tests {
              unfeathered); the two controls are supposed to be independent",
             b1 - a1 + 1
         );
+    }
+
+    // --- the background blur must not contain the subject -------------------------------
+
+    /// Luma of a flat RGB level once it has been through this pipeline's colour conversion.
+    fn expected_luma(level: f32) -> i32 {
+        (((0.2568 + 0.5041 + 0.0979) * level + 0.0627451) * 255.0).round() as i32
+    }
+
+    /// The reported symptom, as a test.
+    ///
+    /// The blur pyramid used to be built from the whole frame, subject included, so a
+    /// low-frequency copy of the subject lived inside their own background. Standing still it
+    /// is invisible; under quick movement the smear slides around behind them, and their
+    /// colours halo out around the silhouette.
+    ///
+    /// The frame here is white on the subject's half and mid-grey on the background's. If any
+    /// of the subject reaches the background plane, the grey is pulled measurably toward
+    /// white — at this blur strength the whole-frame average would land near luma 180 against
+    /// a true background of 126, which is not a difference any tolerance can hide.
+    #[test]
+    fn the_blur_source_excludes_the_subject() {
+        let Some(mut pipe) = wide_pipeline() else {
+            return;
+        };
+
+        const SUBJECT: f32 = 1.0;
+        const BACKDROP: f32 = 0.5;
+
+        // Subject on the left, backdrop on the right, with the matte agreeing.
+        let frame = yuy2_from(FW, FH, |x| {
+            let v = if x < FW / 2 { SUBJECT } else { BACKDROP };
+            (v, v, v)
+        });
+        let matte = split_matte(true, FW, FH);
+
+        let mut out = vec![0u8; (FW * FH * 2) as usize];
+        pipe.begin_frame(&frame, None);
+        pipe.set_matte(&matte, FW, FH);
+        pipe.finish_frame(
+            &mut out,
+            Look {
+                mode: BackgroundMode::Blur,
+                blur_strength: 1.0,
+                ..Default::default()
+            },
+        );
+
+        let want = expected_luma(BACKDROP);
+        let mut worst = (0u32, want);
+        for x in (FW / 2 + 4..FW - 4).step_by(8) {
+            let got = luma_at(&out, FW, x, FH / 2);
+            if (got - want).abs() > (worst.1 - want).abs() {
+                worst = (x, got);
+            }
+        }
+
+        eprintln!(
+            "background luma: wanted {want}, worst {} at x={} (subject is luma {})",
+            worst.1,
+            worst.0,
+            expected_luma(SUBJECT)
+        );
+        assert!(
+            (worst.1 - want).abs() <= 4,
+            "background reads {} at x={}, against a true backdrop of {want}: the subject is \
+             bleeding into its own blurred background",
+            worst.1,
+            worst.0
+        );
+    }
+
+    /// The degenerate case the weight division has to survive.
+    ///
+    /// With no matting model loaded the matte is a single opaque texel, so every tap in the
+    /// pyramid has zero background weight and the composite's divide falls onto its `max()`
+    /// floor. That is fine only because alpha is 1 everywhere, so the foreground is taken
+    /// whole and the meaningless background is never sampled. This asserts that rather than
+    /// leaving it as an argument in a comment — a regression here would show as the whole
+    /// frame going black the moment the model failed to load.
+    #[test]
+    fn an_all_foreground_matte_still_composites_the_subject() {
+        let Some(mut pipe) = wide_pipeline() else {
+            return;
+        };
+
+        let frame = yuy2_from(FW, FH, |x| {
+            let v = if x < FW / 2 { 1.0 } else { 0.5 };
+            (v, v, v)
+        });
+        pipe.set_matte(&[255u8], 1, 1);
+
+        let mut passthrough = vec![0u8; (FW * FH * 2) as usize];
+        let mut blurred = vec![0u8; (FW * FH * 2) as usize];
+        pipe.process(
+            &frame,
+            &mut passthrough,
+            Look {
+                mode: BackgroundMode::Off,
+                ..Default::default()
+            },
+        );
+        pipe.process(
+            &frame,
+            &mut blurred,
+            Look {
+                mode: BackgroundMode::Blur,
+                blur_strength: 1.0,
+                ..Default::default()
+            },
+        );
+
+        for x in (0..FW).step_by(16) {
+            let (a, b) = (
+                luma_at(&passthrough, FW, x, FH / 2),
+                luma_at(&blurred, FW, x, FH / 2),
+            );
+            assert!(
+                (a - b).abs() <= 2,
+                "an all-foreground matte must composite as a passthrough, but x={x} reads \
+                 {b} against {a} — the zero-weight background is leaking through"
+            );
+        }
     }
 
     /// `begin_frame` must hand back the frame it was just given, not the one before it.

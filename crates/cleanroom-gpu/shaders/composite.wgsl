@@ -147,7 +147,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let plate_uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
         bg = textureSampleLevel(comp_bg_image, comp_samp, plate_uv, 0.0).rgb;
     } else {
-        bg = textureSampleLevel(comp_bg, comp_samp, uv, 0.0).rgb;
+        // Blur. The pyramid carries the background *premultiplied* by how much of each tap
+        // was background, with that weight in `.a` — see `down_weighted` in blur.wgsl. Divide
+        // it back out, and the subject never appears in its own blurred background.
+        //
+        // `s.rgb <= s.a` by construction, so the quotient is already in range and needs no
+        // clamp. The floor only bites where a point's entire blur support was subject, and
+        // there alpha is 1 and the composite takes the foreground whole — so the value it
+        // produces is never seen. `an_all_foreground_matte_still_composites_the_subject` is
+        // the guard on that being true rather than merely argued.
+        let s = textureSampleLevel(comp_bg, comp_samp, uv, 0.0);
+        bg = s.rgb / max(s.a, 1e-4);
     }
 
     if (comp.desaturate > 0.0) {
