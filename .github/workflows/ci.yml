@@ -49,6 +49,34 @@ jobs:
           cargo-cache-key: clippy
       - run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 
+  ratchet:
+    name: complexity ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-nix
+        with:
+          # By far the cheapest cache here: xtask depends on syn, serde, toml and walkdir
+          # and on nothing from the workspace, so this target/ never contains ORT, Slint,
+          # wgpu or the PipeWire bindings. Sharing a key with clippy or test would mean
+          # restoring a multi-gigabyte cache to compile four crates.
+          cargo-cache-key: ratchet
+
+      # Two failures, deliberately distinguishable, because they mean opposite things:
+      #
+      #   exit 1  a number got worse than its recorded ceiling, or crossed a limit with no
+      #           entry at all. Split the function, or take the debt on purpose with
+      #           `ratchet except` and a written reason. `ratchet record` will not do it
+      #           for you — if it could, it would be `--bless`, and the ledger would be a
+      #           landfill inside six months.
+      #   exit 2  a number got BETTER and ratchet.toml was not re-recorded. Not a
+      #           complaint about the change; it is the ratchet doing its only job. A floor
+      #           that can drift back up is not a floor.
+      #
+      # Both messages name the exact command that resolves them, and GITHUB_ACTIONS makes
+      # them land as annotations on the offending line rather than as a wall of log.
+      - run: nix develop -c cargo run -q -p xtask -- ratchet check
+
   test:
     name: tests
     runs-on: ubuntu-latest
@@ -182,7 +210,7 @@ jobs:
     name: all checks passed
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, clippy, test, gpu, flake-check, nix-build]
+    needs: [fmt, clippy, ratchet, test, gpu, flake-check, nix-build]
     steps:
       - name: results
         run: echo '${{ toJSON(needs) }}'

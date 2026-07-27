@@ -69,6 +69,10 @@ spikes/       Day-1 go/no-go probes. Kept because a proof that no longer compile
   ort-rvm/          Can we run Robust Video Matting on a vendor-neutral GPU EP?
   slint-hyprland/   Does the GUI toolkit actually work on Wayland/Hyprland?
 
+xtask/        Repository chores that are easier to get right in Rust than in shell.
+              Currently the complexity ratchet: `mise run ratchet`, and a CI job.
+              The ledger it enforces is ratchet.toml at the repo root.
+
 docs/
   pitfalls.md       Every trap that cost real time, with the code that resolves it
   spike-results.md  The measured numbers behind the design decisions

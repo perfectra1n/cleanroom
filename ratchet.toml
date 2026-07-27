@@ -1,0 +1,195 @@
+# Cleanroom complexity ratchet — the floor only moves down.
+#
+# Rewritten by `mise run ratchet:record`. Two ways this file fails CI, and they mean
+# opposite things:
+#
+#   a number went UP past its ceiling   -> split the function, or take the debt on
+#                                          purpose with `ratchet except <key> --note '<why>'`
+#   a number went DOWN, unrecorded      -> `mise run ratchet:record`
+#
+# `record` can only ever lower a ceiling or drop an entry. It cannot raise one and it
+# cannot add one — that is deliberate, and it is what stops this file becoming a landfill
+# of blessed regressions.
+#
+# Nothing under the limits appears here: this is a ledger of exceptions, not a census.
+# Cognitive complexity is the gate; length is loose on purpose. Measured on this tree,
+# the second-longest function in the workspace (FramePipeline::new, 235 lines) is a flat
+# sequence of constructor calls, while doctor::check_gpu is dense at 95 — so ranking by
+# length gets them backwards. See xtask/src/metrics.rs for the exact rules.
+#
+# `lines` counts effective lines: blank and comment-only lines are excluded, and a
+# function's doc comment does not count against it. Writing down *why* is free.
+
+[meta]
+schema = 1
+syn = "2"
+
+# Ceilings for code that is not grandfathered below.
+[limits]
+cognitive  = 15
+cyclomatic = 25
+nesting    = 3
+lines      = 100
+file_lines = 900
+
+# Ratcheted totals across production `src/`. These may only fall.
+[totals]
+allow_lints   = 1
+unsafe_blocks = 13
+unwraps       = 4
+panics        = 0
+
+# Grandfathered. Each number is that function's personal ceiling.
+# Fix the code and re-record; do not edit a ceiling by hand.
+
+[[over]]
+key  = "cleanroom_audio::node::VirtualMic::run"
+file = "crates/cleanroom-audio/src/node.rs"
+cognitive  = 47
+cyclomatic = 36
+lines      = 211
+note = "Owns a dedicated thread and drives the PipeWire main loop, which is not async and expects to drive itself: capture stream, source stream, format negotiation and the process callback all share one scope. The second-worst cognitive score in the workspace, and unlike the frame.rs entries the score is real branching rather than length. Lifting stream setup out of the loop body is the obvious first cut."
+
+[[over]]
+key  = "cleanroom_gpu::frame::FramePipeline::begin_frame"
+file = "crates/cleanroom-gpu/src/frame.rs"
+lines      = 115
+note = "Length only — cognitive and nesting are both inside budget. Upload, colour conversion, matte inference and the small 512x288 readback, in the order the function's own doc comment argues for. A sequence of GPU passes, not a thicket."
+
+[[over]]
+key  = "cleanroom_gpu::frame::FramePipeline::finish_frame"
+file = "crates/cleanroom-gpu/src/frame.rs"
+cognitive  = 21
+lines      = 175
+note = "Composite plus the YUY2 readback. It deliberately takes no image, so a caller cannot composite one frame with another frame's matte — that was a real bug, and this shape is what makes it unspellable. Splitting it is not free: it risks handing back the ordering the split was designed to prevent."
+
+[[over]]
+key  = "cleanroom_gpu::frame::FramePipeline::new"
+file = "crates/cleanroom-gpu/src/frame.rs"
+lines      = 232
+note = "Length only. 232 effective lines at a cognitive score well inside budget, because it is a flat sequence of create_shader_module and create_bind_group_layout calls with almost no branching. Kept here as the workspace's clearest long-but-not-complex case: if a future limit change ever makes this the tool's loudest complaint, the limit is wrong and not the function."
+
+[[over]]
+key  = "file:crates/cleanroom-gpu/src/frame.rs"
+file = "crates/cleanroom-gpu/src/frame.rs"
+lines      = 910
+note = "The whole wgpu pipeline in one file: the 32-field FramePipeline, eight compute pipelines, the blur pyramid and the guided filter. 910 effective production lines — the file is 1796 raw, the rest being comments and its inline test module. Splitting it means separating the bind-group layouts from the passes that consume them."
+
+[[over]]
+key  = "cleanroom_gui::poll"
+file = "crates/cleanroom-gui/src/main.rs"
+lines      = 111
+note = "Length only. Flattens a D-Bus Status into the GUI Snapshot field by field, reconnecting fresh each cycle so a daemon started after the GUI is picked up automatically. Long because Snapshot has 18 fields, not because it branches."
+
+[[over]]
+key  = "cleanroom_gui::wire_controls"
+file = "crates/cleanroom-gui/src/main.rs"
+cognitive  = 20
+nesting    = 4
+lines      = 143
+note = "Registers every Slint callback in one place. The nesting is closures inside closures — on_foo(move || ... upgrade_in_event_loop(move |h| ...)) — rather than conditional logic, which is why the cognitive score sits far below what the raw indentation (40 columns) would suggest."
+
+[[over]]
+key  = "cleanroom_gui::preview::run"
+file = "crates/cleanroom-gui/src/preview.rs"
+nesting    = 4
+note = "Nesting only. The same closure-in-closure shape as wire_controls: the preview thread posts pixels into the event loop, and slint::Image is neither Send nor Sync, so the image has to be built inside the innermost closure."
+
+[[over]]
+key  = "cleanroom_video::pw_source::PwSource::run"
+file = "crates/cleanroom-video/src/pw_source.rs"
+cognitive  = 20
+lines      = 111
+note = "Publishes the PipeWire Video/Source node and runs its main loop on a dedicated thread, because the video thread is already blocked in V4L2 DQBUF and cannot host it. Format negotiation and buffer handling share the scope with the loop."
+
+[[over]]
+key  = "cleanroomd::audio_pipeline::run"
+file = "crates/cleanroomd/src/audio_pipeline.rs"
+nesting    = 4
+note = "Nesting only, and only just: the supervisor loop around run_once, with stop-flag and thread-join teardown nested inside it."
+
+[[over]]
+key  = "cleanroomd::audio_pipeline::run_once"
+file = "crates/cleanroomd/src/audio_pipeline.rs"
+cognitive  = 19
+note = "One pass of the audio pipeline — virtual mic, DeepFilterNet, config reconciliation. Four points over the cognitive limit, so this is the cheapest entry on the list to pay down."
+
+[[over]]
+key  = "cleanroomd::doctor::check_gpu"
+file = "crates/cleanroomd/src/doctor.rs"
+cognitive  = 26
+nesting    = 4
+note = "The counterexample that set this tool's thresholds. 95 effective lines — a third of FramePipeline::new — and the third-densest function in the workspace, because it walks Vulkan ICD directories inside per-adapter checks. Ranking by length puts these two functions the wrong way round; ranking by cognitive complexity does not."
+
+[[over]]
+key  = "cleanroomd::sleep::watch"
+file = "crates/cleanroomd/src/sleep.rs"
+cognitive  = 17
+note = "The logind suspend/resume handshake. Two points over the limit. The branching is the several ways logind can be absent or uncooperative, each handled explicitly rather than swallowed by a catch-all — which is the house rule, so this one may simply be the right shape."
+
+[[over]]
+key  = "cleanroomd::video_pipeline::run"
+file = "crates/cleanroomd/src/video_pipeline.rs"
+nesting    = 4
+note = "Nesting only: the supervisor loop around run_once, carrying the restart-versus-stop decision and the thread teardown."
+
+[[over]]
+key  = "cleanroomd::video_pipeline::run_once"
+file = "crates/cleanroomd/src/video_pipeline.rs"
+cognitive  = 104
+cyclomatic = 65
+nesting    = 6
+lines      = 298
+note = "By a wide margin the worst function in the workspace — cognitive 104 against 47 for the next one, and the only function to reach nesting 6. It does camera open, v4l2loopback sink, the PipeWire publisher thread, GPU pipeline construction and matting init, and then the entire per-frame hot loop: decode timing, matte inference, error-run detection and reset, background-plate sync, stats and live-settings reconciliation. The matting-error block and the suspend/resume region are the two self-contained pieces and the obvious first extractions."
+
+# Code this tool cannot see into: syn keeps macro bodies as raw tokens.
+# Recorded rather than skipped, so "not measured" is a visible number.
+# No line numbers, so this churns only when a new macro appears in a new file.
+
+[[unmeasured]]
+file  = "crates/cleanroom-audio/src/node.rs"
+macro = "properties"
+
+[[unmeasured]]
+file  = "crates/cleanroom-ctl/src/fetch.rs"
+macro = "bail"
+
+[[unmeasured]]
+file  = "crates/cleanroom-ctl/src/main.rs"
+macro = "anyhow::bail"
+
+[[unmeasured]]
+file  = "crates/cleanroom-gui/src/main.rs"
+macro = "slint::include_modules"
+
+[[unmeasured]]
+file  = "crates/cleanroom-gui/src/main.rs"
+macro = "thread_local"
+
+[[unmeasured]]
+file  = "crates/cleanroom-gui/src/main.rs"
+macro = "tokio::select"
+
+[[unmeasured]]
+file  = "crates/cleanroom-matting/src/lib.rs"
+macro = "ort::inputs"
+
+[[unmeasured]]
+file  = "crates/cleanroom-video/src/consumers.rs"
+macro = "nix::ioctl_read"
+
+[[unmeasured]]
+file  = "crates/cleanroom-video/src/consumers.rs"
+macro = "nix::ioctl_write_ptr"
+
+[[unmeasured]]
+file  = "crates/cleanroom-video/src/device.rs"
+macro = "nix::ioctl_read"
+
+[[unmeasured]]
+file  = "crates/cleanroom-video/src/pw_source.rs"
+macro = "properties"
+
+[[unmeasured]]
+file  = "crates/cleanroomd/src/main.rs"
+macro = "tokio::select"

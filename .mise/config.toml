@@ -61,9 +61,31 @@ nix develop -c cargo fmt --all -- --check
 nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 '''
 
+# The complexity ratchet. Deliberately NOT folded into `lint`: that task is the exact pair
+# of commands the `rustfmt` and `clippy` CI jobs run, and keeping it 1:1 is what stops local
+# and CI behaviour drifting — the same argument the workflow header makes about RUSTFLAGS.
+# It joins `check`, which is documented as everything that must pass before committing, so
+# the two-directional failure is discovered here rather than on a pull request.
+
+[tasks.ratchet]
+description = "Complexity ratchet: fail if anything got worse, or got better unrecorded"
+run = "nix develop -c cargo run -q -p xtask -- ratchet check"
+
+[tasks."ratchet:record"]
+description = "Move the floors down after an improvement. Cannot raise a ceiling."
+run = "nix develop -c cargo run -q -p xtask -- ratchet record"
+
+[tasks."ratchet:report"]
+description = "Rank every function by cognitive complexity, worst first; ignores the ledger"
+run = "nix develop -c cargo run -q -p xtask -- ratchet report"
+
+[tasks."ratchet:except"]
+description = "Take on debt on purpose: mise run ratchet:except -- <key> --note '<why>'"
+run = "nix develop -c cargo run -q -p xtask -- ratchet except"
+
 [tasks.check]
 description = "Everything that must pass before committing"
-depends = ["lint", "test"]
+depends = ["lint", "test", "ratchet"]
 
 [tasks.clean]
 description = "Remove build artifacts"

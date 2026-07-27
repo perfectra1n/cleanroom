@@ -1,0 +1,33 @@
+[package]
+name = "xtask"
+description = "Repository chores that are easier to get right in Rust than in shell. Currently: the complexity ratchet."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+
+# `full` is required, not a nicety: syn's default feature set parses the derive-input
+# subset only and cannot see a function *body*, which is the sole thing this crate
+# measures. `visit` gives the immutable visitor. `printing` and `proc-macro` stay off —
+# nothing here emits tokens, and a plain binary has no business linking the compiler's
+# `proc_macro` crate.
+syn = { version = "2", default-features = false, features = [
+    "parsing",
+    "full",
+    "visit",
+    "clone-impls",
+] }
+
+# Without `span-locations` every `Span::start()` returns line 0 — silently, with no
+# warning and no compile error. Every function would measure as one line long and every
+# error message would point at the top of its file. See the `spans_carry_real_line_numbers`
+# test in src/metrics.rs, which exists solely to make that failure loud.
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+walkdir = "2"

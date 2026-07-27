@@ -12,6 +12,11 @@ members = [
     "crates/cleanroom-ctl",
     "spikes/ort-rvm",
     "spikes/slint-hyprland",
+    # Not a product. A member so that `cargo fmt --all`, `cargo clippy --workspace` and
+    # `cargo test --workspace` cover it for free — the tool that enforces the repo's
+    # standards is held to them. `nix build` is unaffected: cargoBuildFlags in flake.nix
+    # names the three shipped binaries explicitly.
+    "xtask",
 ]
 
 [workspace.package]
