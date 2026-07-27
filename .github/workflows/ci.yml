@@ -14,63 +14,62 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Fail on a warning the same way `mise run lint` does locally.
-  RUSTFLAGS: -D warnings
+
+# Every job below is a sibling: they start together and report independently, so a rustfmt
+# nit no longer hides whether the tests pass or the shaders still compile. `all checks
+# passed` at the bottom is the single status check to point branch protection at.
+#
+# The repeated checkout/Nix/cache preamble lives in .github/actions/setup-nix, which is
+# also where the argument for running everything through `nix develop` is written down.
+#
+# Deliberately NOT set here: `RUSTFLAGS: -D warnings`. It used to be, under a comment
+# claiming it matched `mise run lint` — but mise passes `-D warnings` to clippy alone and
+# sets no RUSTFLAGS at all, so the workflow-level version was a divergence from local
+# behaviour rather than a mirror of it, and it changed the build fingerprint for every
+# other job too. clippy denies warnings on its own line below, exactly as mise does.
 
 jobs:
-  check:
-    name: fmt, clippy, tests
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # No cargo cache. rustfmt reads source plus `cargo metadata --no-deps`; it compiles
+      # nothing, so there is nothing in target/ worth carrying between runs.
+      - uses: ./.github/actions/setup-nix
+      - run: nix develop -c cargo fmt --all -- --check
 
-      # Everything runs inside the flake's dev shell, because the build genuinely needs
-      # it: pipewire-sys and v4l2-sys-mit both run bindgen over system headers and need
-      # LIBCLANG_PATH, turbojpeg-sys needs TURBOJPEG_SOURCE=pkg-config or it builds its
-      # own libjpeg-turbo with cmake and nasm, and wgpu dlopens libvulkan.so.1 rather than
-      # linking it. Reproducing that by hand in the workflow would be a second, divergent
-      # definition of the build environment.
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache cargo and target
-        uses: actions/cache@v4
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-nix
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          cargo-cache-key: clippy
+      - run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: fmt
-        run: nix develop -c cargo fmt --all -- --check
-
-      - name: clippy
-        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: tests
-        # Hardware- and weight-dependent tests skip themselves rather than failing, so this
-        # is meaningful on a runner with no camera, no microphone and no model files.
-        run: nix develop -c cargo test --workspace
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-nix
+        with:
+          cargo-cache-key: test
+      # Hardware- and weight-dependent tests skip themselves rather than failing, so this
+      # is meaningful on a runner with no camera, no microphone and no model files.
+      - run: nix develop -c cargo test --workspace
 
   gpu:
-    name: GPU path on lavapipe
+    name: gpu (lavapipe)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Cache cargo and target
-        uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-nix
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-gpu-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-gpu-
+          # --release, unlike clippy and test, so it gets its own cache namespace.
+          cargo-cache-key: gpu
 
       # The whole GPU path is exercisable headlessly. Gpu::pick_best ranks Cpu last
       # deliberately, so lavapipe is never chosen while real hardware exists but is
@@ -78,28 +77,122 @@ jobs:
       #
       # This is the only job that proves the shaders compile and the passes produce the
       # right pixels; the unit tests above cannot, because they have no adapter.
+      #
+      # The ICD path comes from the dev shell rather than from a `find /nix/store` in this
+      # file — see the CLEANROOM_LAVAPIPE_ICD export in flake.nix for why the search
+      # approach failed silently. The guards below exist so that a future regression in
+      # that export reports itself as a missing ICD rather than as `NoAdapter`, which is
+      # what sent the last investigation in the wrong direction.
       - name: gpu_check under lavapipe
         run: |
-          nix develop -c bash -eo pipefail -c '
-            export VK_DRIVER_FILES="$(dirname "$(find /nix/store -name "lvp_icd.x86_64.json" 2>/dev/null | head -1)")/lvp_icd.x86_64.json"
+          # SC2016 is wrong here: the single quotes are the point. These expansions must
+          # happen in the inner bash that `nix develop` starts, not in this outer shell,
+          # where CLEANROOM_LAVAPIPE_ICD does not exist yet.
+          # shellcheck disable=SC2016
+          nix develop -c bash -euo pipefail -c '
+            icd="${CLEANROOM_LAVAPIPE_ICD:-}"
+            if [ -z "$icd" ]; then
+              echo "::error::the dev shell did not export CLEANROOM_LAVAPIPE_ICD"
+              exit 1
+            fi
+            if [ ! -f "$icd" ]; then
+              echo "::error::lavapipe ICD does not exist: $icd"
+              exit 1
+            fi
+            export VK_DRIVER_FILES="$icd"
             echo "using ICD: $VK_DRIVER_FILES"
+            vulkaninfo --summary | grep -E "deviceName|driverName" || true
             cargo run --release -p cleanroom-gpu --example gpu_check
           '
 
-  package:
+  flake-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # No cargo cache: nix builds in its own sandbox and never reads ~/.cargo or target/.
+      - uses: ./.github/actions/setup-nix
+      - run: nix flake check
+
+  nix-build:
     name: nix build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-nix
 
       # Builds the actual shipped artefact, including the fixed-output derivation for
       # ort's WebGPU prebuilt. Catches the class of breakage that only shows up outside
       # the dev shell — a wrong rpath, a missing runtime library, a hash that drifted.
-      - run: nix flake check
       - run: nix build .#cleanroom
-      - name: the built binaries run
+
+      # What "the binaries work" can mean here is narrower than it looks:
+      #
+      #   * cleanroom-ctl uses clap, so `--help` genuinely exercises it and exits 0.
+      #   * cleanroomd parses no arguments at all. It ignores `--help` and goes straight
+      #     for the config directory and the D-Bus session bus, neither of which exists on
+      #     a runner. `cleanroomd --help` therefore failed on every single run and was
+      #     papered over with `|| true`.
+      #   * cleanroom-gui needs a compositor, so it cannot be launched here either.
+      #
+      # So test the property this job actually exists to defend — that the shipped
+      # binaries find their libraries — by launching each one and failing only on a
+      # dynamic linker error. cleanroomd and cleanroom-gui are *expected* to exit
+      # non-zero here; what they must not do is die in the loader.
+      #
+      # Three tempting alternatives, all of which silently pass a broken binary. Each was
+      # measured, not reasoned about:
+      #
+      #   * `ldd result/bin/cleanroomd` — postInstall wrapProgram's all three binaries, so
+      #     that path is a bash script. ldd prints "not a dynamic executable", exit 0.
+      #   * `ldd` on the real .cleanroomd-wrapped ELF — ldd exits 0 even when it prints
+      #     "not found", so `set -e` sails straight past a genuine failure.
+      #   * `LD_TRACE_LOADED_OBJECTS=1 result/bin/cleanroomd` — the loader traces bash,
+      #     the shebang interpreter, and exits before bash ever execs the real binary. It
+      #     prints a healthy-looking trace for a binary whose libraries are missing.
+      #
+      # This catches libraries needed at startup, which is the rpath-and-closure class the
+      # job is named for. It cannot catch a dlopen failure such as libvulkan.so.1 — the
+      # gpu job is what covers that.
+      - name: every shipped binary finds its libraries
         run: |
           ./result/bin/cleanroom-ctl --help > /dev/null
-          ./result/bin/cleanroomd --help > /dev/null || true
+          echo "cleanroom-ctl --help: ok"
+
+          failed=0
+          for bin in cleanroomd cleanroom-gui; do
+            out="$(timeout 60 "./result/bin/$bin" 2>&1 </dev/null || true)"
+            if grep -qE 'error while loading shared libraries|cannot open shared object file' <<< "$out"; then
+              echo "::error::$bin died in the dynamic loader"
+              head -20 <<< "$out"
+              failed=1
+            else
+              echo "$bin: cleared the loader"
+            fi
+          done
+          exit "$failed"
+
+  # Single required check. Branch protection points here instead of re-listing every job,
+  # so adding a job above does not mean editing repository settings.
+  #
+  # `if: always()` is load-bearing: without it this job is skipped the moment any
+  # dependency fails, and a skipped required check leaves a pull request stuck rather than
+  # failed. It has to run and then decide.
+  ci:
+    name: all checks passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [fmt, clippy, test, gpu, flake-check, nix-build]
+    steps:
+      - name: results
+        run: echo '${{ toJSON(needs) }}'
+
+      # 'skipped' counts as a failure too: the only way a job above gets skipped is if
+      # something upstream went wrong, and treating that as success would make this gate
+      # green on a run that tested nothing.
+      - name: fail if any job did not succeed
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled') ||
+          contains(needs.*.result, 'skipped')
+        run: exit 1

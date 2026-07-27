@@ -1,0 +1,49 @@
+name: Set up Nix
+description: >
+  Installs Nix, wires up the binary cache, and optionally restores the cargo registry and
+  target directory. Every CI job starts with this; it is the one definition of the build
+  environment shared between them.
+
+# Why every job goes through `nix develop` rather than installing a toolchain directly:
+# the build genuinely needs the dev shell. pipewire-sys and v4l2-sys-mit both run bindgen
+# over system headers and need LIBCLANG_PATH, turbojpeg-sys needs TURBOJPEG_SOURCE=pkg-config
+# or it builds its own libjpeg-turbo with cmake and nasm, and wgpu dlopens libvulkan.so.1
+# rather than linking it. Reproducing that by hand in the workflow would be a second,
+# divergent definition of the build environment — see .mise/config.toml, which makes the
+# same argument for the local task runner.
+#
+# This action does NOT check out the repository. It cannot: a local `uses: ./.github/...`
+# is only resolvable once the repo is already on disk, so the caller must run
+# actions/checkout first.
+
+inputs:
+  cargo-cache-key:
+    description: >
+      Namespace for the ~/.cargo and target/ cache. Jobs that compile must each pass a
+      DISTINCT value. Sharing one key across jobs looks like it saves space but does the
+      opposite: clippy writes .rmeta, `cargo test` writes test binaries and the GPU job
+      builds --release, so the three populate target/ differently. Under a shared key
+      whichever job finishes first saves the cache and the others are silently discarded,
+      so every run rebuilds most of what it restored.
+
+      Leave empty to skip cargo caching altogether — correct for any job that never
+      invokes cargo directly, where the Nix store cache is already doing the work.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@v22
+    - uses: DeterminateSystems/magic-nix-cache-action@v14
+
+    - name: Cache cargo and target
+      if: inputs.cargo-cache-key != ''
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ inputs.cargo-cache-key }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-${{ inputs.cargo-cache-key }}-
