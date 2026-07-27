@@ -213,12 +213,12 @@ fn run_once(
     let mut gpu = gpu;
     let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
 
+    // Seeded from the config this run opened against, then re-checked every frame in the
+    // loop below. See [`LiveSettings`] for why these need remembering where blur strength
+    // and mirror do not.
+    let mut live = LiveSettings::from(&cfg);
     if let Some(pipe) = gpu.as_mut() {
-        pipe.set_guided(
-            cfg.video.guided_filter,
-            cfg.video.guided_radius,
-            cfg.video.guided_eps,
-        );
+        live.apply(pipe);
     }
 
     // Matting. Only *run* when a background effect actually needs a matte — with the mode
@@ -360,6 +360,18 @@ fn run_once(
             *matting_demoted = true;
             tracing::info!("matting backend changed; restarting to re-size the matte");
             return Ok(Outcome::Restart);
+        }
+
+        // Settings that reconfigure the pipeline rather than riding along in `Look`. Applied
+        // here, per frame, and never through `needs_restart`: reopening the devices to change
+        // a filter radius would blank the camera for every app in the call.
+        if let Some(pipe) = gpu.as_mut() {
+            let wanted = LiveSettings::from(&now_cfg);
+            if wanted != live {
+                tracing::debug!(?wanted, "applying changed live settings");
+                live = wanted;
+                live.apply(pipe);
+            }
         }
 
         // The replacement plate is reloaded, never restarted. Changing the picture does not
@@ -756,6 +768,50 @@ fn describe_engine(m: &Matter) -> String {
     s
 }
 
+/// Settings pushed into a *running* pipeline, without reopening anything.
+///
+/// The counterpart to [`needs_restart`], and the reason this type exists at all.
+/// `needs_restart` is a deny-list: a setting it does not name is *assumed* to be live. For
+/// almost everything that assumption holds for free, because `Look` and `Smoothing` are
+/// rebuilt from the live config on every frame and cost nothing to pass again. `video.guided_*`
+/// is the exception — `set_guided` reconfigures the pipeline rather than being a per-frame
+/// argument — and it fell straight through the gap: it was pushed in once, before the frame
+/// loop, and never again.
+///
+/// The symptom was worse than a control that does nothing. The value was written, persisted,
+/// and read back correctly by `ctl get` and by the GUI slider, while changing no pixels until
+/// something unrelated restarted the pipeline. Toggling blur off and on made it appear to
+/// take, which is a maddening way to find a bug.
+///
+/// Remembering the last applied value is what makes the change detectable. Same shape as
+/// `audio_pipeline`'s `applied_atten`, which has always done this correctly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LiveSettings {
+    guided_filter: bool,
+    guided_radius: u32,
+    guided_eps: f32,
+}
+
+impl From<&Config> for LiveSettings {
+    fn from(c: &Config) -> Self {
+        Self {
+            guided_filter: c.video.guided_filter,
+            guided_radius: c.video.guided_radius,
+            guided_eps: c.video.guided_eps,
+        }
+    }
+}
+
+impl LiveSettings {
+    /// Push these into the pipeline. Takes effect on the next `set_matte`.
+    ///
+    /// `set_guided` clamps the radius itself, so a typo'd value in a config file is a slow
+    /// filter rather than a hung GPU.
+    fn apply(&self, pipe: &mut FramePipeline) {
+        pipe.set_guided(self.guided_filter, self.guided_radius, self.guided_eps);
+    }
+}
+
 /// Whether a config change needs the devices reopened.
 ///
 /// Split out of the frame loop so the policy can be tested without a camera. The
@@ -984,6 +1040,142 @@ mod tests {
             (s.rise, s.fall, s.motion_release),
             "cleanroom-core's serde defaults have drifted from Smoothing::default"
         );
+    }
+
+    /// The guided knobs are live, and the bug was that nothing noticed when they moved.
+    ///
+    /// `pipe.set_guided` was called once before the frame loop and never again, so a `set`
+    /// wrote the config, persisted it, and read back correctly in the GUI while changing no
+    /// pixels. [`LiveSettings`] is what notices; this is the guard on it. Both halves matter:
+    /// a change must be *detected*, and it must not be detected by reopening the devices.
+    #[test]
+    fn a_change_to_any_guided_setting_is_noticed_without_a_restart() {
+        let base = Config::default();
+
+        for (name, mutate) in [
+            (
+                "guided_filter",
+                (|c: &mut Config| c.video.guided_filter = !c.video.guided_filter)
+                    as fn(&mut Config),
+            ),
+            ("guided_radius", |c: &mut Config| c.video.guided_radius = 12),
+            ("guided_eps", |c: &mut Config| c.video.guided_eps = 1e-2),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+
+            assert_ne!(
+                LiveSettings::from(&base),
+                LiveSettings::from(&changed),
+                "{name} moved but the frame loop would not have applied it"
+            );
+            assert!(
+                !needs_restart(&base, &changed, CAM),
+                "{name} is live; reopening the devices for it would blank the camera for \
+                 every app in the call"
+            );
+        }
+
+        // …and an unrelated change must NOT trigger a reconfigure, or every frame would
+        // re-push settings that have not moved.
+        let mut unrelated = base.clone();
+        unrelated.video.blur_strength = 0.95;
+        assert_eq!(LiveSettings::from(&base), LiveSettings::from(&unrelated));
+    }
+
+    /// Every `video.*` setting must be *classified*: live, a restart, or deliberately inert.
+    ///
+    /// This is the guard on the gap the guided knobs fell through. `needs_restart` is a
+    /// deny-list, so a newly added setting is silently assumed live and nothing anywhere
+    /// checks that a single line of code reads it. Adding a knob now fails the build until
+    /// somebody says which of the three it is.
+    ///
+    /// **What this cannot do**, and the reason it is a guard rather than a proof: it checks
+    /// that a key was classified, not that the frame loop actually reads it. It would have
+    /// caught this bug — `video.guided_*` was in neither list — and it would not catch a
+    /// `LIVE` entry whose read is deleted later. For that, see the behavioural tests beside
+    /// the code each setting drives.
+    #[test]
+    fn every_video_setting_is_classified_as_live_restart_or_inert() {
+        /// Read fresh from the config on every frame, or pushed in by `LiveSettings`.
+        const LIVE: &[&str] = &[
+            "video.blur_strength",
+            "video.background_desaturate",
+            "video.background_dim",
+            "video.background_image",
+            "video.matte_tighten",
+            "video.matte_feather",
+            "video.matte_fade_rise",
+            "video.matte_fade_fall",
+            "video.matte_motion_release",
+            "video.guided_filter",
+            "video.guided_radius",
+            "video.guided_eps",
+            "video.mirror",
+            "video.power_save",
+        ];
+
+        /// Changes the negotiated mode, the session, or a buffer sized from it. Named in
+        /// `needs_restart`, and the reopen is the point.
+        const RESTART: &[&str] = &[
+            "video.enabled",
+            "video.device",
+            "video.width",
+            "video.height",
+            "video.fps",
+            "video.background",
+            "video.pipewire_source",
+            "video.matting_backend",
+            "video.matting_width",
+            "video.matting_height",
+        ];
+
+        /// Deliberately takes effect only on the next daemon start, with the reason.
+        const INERT: &[&str] = &[
+            // Selects which free loopback node to claim at open. Once a producer is
+            // attached the node cannot be swapped without the camera vanishing from every
+            // app that already enumerated it, so honouring this live would cost far more
+            // than the rename is worth.
+            "video.card_label",
+        ];
+
+        let cfg = Config::default();
+        let keys: Vec<String> = crate::settings::keys(&cfg)
+            .expect("the schema must enumerate")
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("video."))
+            .collect();
+
+        assert!(!keys.is_empty(), "precondition: there are video settings");
+
+        for key in &keys {
+            let hits: Vec<&str> = [("live", LIVE), ("restart", RESTART), ("inert", INERT)]
+                .iter()
+                .filter(|(_, list)| list.contains(&key.as_str()))
+                .map(|(name, _)| *name)
+                .collect();
+
+            assert_eq!(
+                hits.len(),
+                1,
+                "'{key}' is classified as {hits:?}, but every video setting must be exactly \
+                 one of live / restart / inert. A new knob lands here unclassified, which is \
+                 how `video.guided_*` came to write, persist and read back while changing \
+                 nothing."
+            );
+        }
+
+        // The lists must not name settings that no longer exist, or they quietly stop
+        // covering anything.
+        for list in [LIVE, RESTART, INERT] {
+            for named in list {
+                assert!(
+                    keys.iter().any(|k| k == named),
+                    "'{named}' is classified but is not a real setting any more"
+                );
+            }
+        }
     }
 
     /// `video.device = None` means "first usable camera". That is the camera already open,
