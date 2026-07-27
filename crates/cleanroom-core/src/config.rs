@@ -71,7 +71,40 @@ pub struct VideoConfig {
     /// where a generous silhouette against a blurred copy of the same room is invisible,
     /// and a little for replace, where the same generosity is a bright halo tracing the
     /// shoulders and ears. Set a number to force one value for every mode.
+    ///
+    /// Note this also *sharpens*: the remap has gain `1/(1 - tighten)`, so 0.34 is a 51%
+    /// steeper ramp as well as a tighter cut. To soften, reach for [`matte_feather`].
     pub matte_tighten: Option<f32>,
+
+    /// Widen the alpha ramp, 0.0..=1.0, without moving where it crosses 0.5.
+    ///
+    /// The knob for "the cut-out looks like a sticker". [`matte_tighten`] decides *where*
+    /// the silhouette ends; this decides how abruptly it gets there. 0.0 is the historical
+    /// behaviour exactly, so an existing config composites unchanged.
+    #[serde(default)]
+    pub matte_feather: f32,
+
+    /// How readily the matte follows alpha *increasing* at a pixel, 0.01..=1.0.
+    ///
+    /// Higher follows the network more closely and shimmers more; lower is calmer and
+    /// slower. Rising is allowed to move faster than falling by default, because gaining a
+    /// little subject early is invisible where losing it early punches a hole in a limb.
+    #[serde(default = "default_fade_rise")]
+    pub matte_fade_rise: f32,
+
+    /// How readily the matte follows alpha *decreasing* at a pixel, 0.01..=1.0.
+    ///
+    /// The trailing edge of anything that moves. See [`matte_fade_rise`].
+    #[serde(default = "default_fade_fall")]
+    pub matte_fade_fall: f32,
+
+    /// The per-pixel alpha change at which the fade damping is fully released, 0.01..=1.0.
+    ///
+    /// Below it a change is treated as noise and averaged; at or above it the new value is
+    /// taken essentially whole, because a jump that large is the network reporting real
+    /// motion and averaging that is what produces ghost trails. Lower reacts sooner.
+    #[serde(default = "default_motion_release")]
+    pub matte_motion_release: f32,
 
     /// Edge-aware upsampling of the matte, instead of a plain bilinear stretch.
     ///
@@ -123,6 +156,19 @@ pub struct VideoConfig {
     pub card_label: String,
 }
 
+// Serde needs these as functions so an existing config.toml that predates the fields still
+// deserialises. They mirror `cleanroom_matting::Smoothing::default`, which is the authority
+// — this crate cannot depend on that one, so the test below pins the two together.
+fn default_fade_rise() -> f32 {
+    0.55
+}
+fn default_fade_fall() -> f32 {
+    0.22
+}
+fn default_motion_release() -> f32 {
+    0.25
+}
+
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
@@ -137,6 +183,10 @@ impl Default for VideoConfig {
             background_desaturate: 0.0,
             background_dim: 0.0,
             matte_tighten: None,
+            matte_feather: 0.0,
+            matte_fade_rise: default_fade_rise(),
+            matte_fade_fall: default_fade_fall(),
+            matte_motion_release: default_motion_release(),
             guided_filter: true,
             guided_radius: 3,
             guided_eps: 1e-4,

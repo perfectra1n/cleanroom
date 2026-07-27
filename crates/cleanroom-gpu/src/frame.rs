@@ -21,8 +21,8 @@ struct CompositeParams {
     dim: f32,
     guided: u32,
     tighten: f32,
+    feather: f32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 /// Guided-filter window radius, in matte pixels.
@@ -66,7 +66,15 @@ pub struct Look {
     /// because what bleeds through is the same colours. Against a swapped background it is a
     /// bright fringe tracing shoulders and ears — the single most recognisable "bad virtual
     /// background" artifact, and the reason replace wants tighter morphology than blur.
+    ///
+    /// Note this *sharpens* as it erodes: the remap has gain `1/(1 - tighten)`, so 0.34 is
+    /// a 51% steeper ramp. Reach for [`feather`] to soften, not for a smaller `tighten`.
     pub tighten: f32,
+    /// Widen the alpha ramp, 0.0..=1.0, without moving where it crosses 0.5.
+    ///
+    /// The knob for "make the cut-out less like a sticker". `tighten` decides *where* the
+    /// silhouette ends; this decides how abruptly. 0.0 is the historical behaviour exactly.
+    pub feather: f32,
 }
 
 impl Default for Look {
@@ -78,6 +86,7 @@ impl Default for Look {
             desaturate: 0.0,
             dim: 0.0,
             tighten: 0.0,
+            feather: 0.0,
         }
     }
 }
@@ -167,6 +176,9 @@ pub struct FramePipeline {
     guided_params: wgpu::Buffer,
     /// Whether `guided_ab` holds coefficients for the current matte.
     guided_ready: bool,
+    /// Set by `set_matte`, cleared by `finish_frame` once it has refitted the coefficients.
+    /// Without it a frame that reuses the previous matte would refit it for nothing.
+    matte_dirty: bool,
     /// Live guided-filter settings, from `video.guided_*`. See [`FramePipeline::set_guided`].
     guided_enabled: bool,
     guided_radius: i32,
@@ -403,6 +415,7 @@ impl FramePipeline {
             guided: pipeline("guided-ab", &m_guided, "main"),
             guided_ab: None,
             guided_ready: false,
+            matte_dirty: false,
             guided_enabled: true,
             guided_radius: GUIDED_RADIUS,
             guided_eps: GUIDED_EPS,
@@ -511,6 +524,10 @@ impl FramePipeline {
 
     /// Replace the alpha matte.
     ///
+    /// Call between [`begin_frame`] and [`finish_frame`], with a matte derived from the
+    /// buffer `begin_frame` handed back. That is the whole contract: a matte set here
+    /// applies to the frame currently in flight, not to the next one.
+    ///
     /// `data` is single-channel R8, `alpha = 1` meaning foreground. It is normally much
     /// smaller than the frame — the matting network runs at 512x288 — and the composite
     /// pass samples it bilinearly, which is what keeps the edge smooth rather than blocky.
@@ -555,36 +572,28 @@ impl FramePipeline {
             },
         );
 
-        self.run_guided(width, height);
+        self.matte_dirty = true;
     }
 
-    /// Compute the guided-filter coefficients for the matte just uploaded.
+    /// Whether the guided filter can run against the matte currently uploaded.
     ///
-    /// Runs here rather than in `process` on purpose. The guidance image has to be the frame
-    /// the matte was actually computed from, and that is exactly what `matte_input` still
-    /// holds at this moment — `process` overwrites it on the next frame. Pairing a matte
-    /// with the wrong guidance is subtle and ugly: the edge locks onto structure the subject
-    /// has already moved away from, so fast motion smears instead of sharpening.
-    fn run_guided(&mut self, width: u32, height: u32) {
+    /// The guidance and the matte must be the same size for the window arithmetic to line
+    /// up. They always are in practice (both INFER_W x INFER_H), so a mismatch is a caller
+    /// bug rather than a case to paper over.
+    fn guided_possible(&self) -> bool {
         if !self.guided_enabled {
             // Turned off in config. The composite falls back to sampling the matte directly.
-            self.guided_ready = false;
-            return;
+            return false;
         }
-        let Some((guide, _, gw, gh, _)) = self.matte_input.as_ref() else {
-            // No matting input configured, so there is no guidance image and nothing to do.
-            self.guided_ready = false;
-            return;
-        };
+        // No matting input configured means no guidance image, so there is nothing to fit.
+        self.matte_input.as_ref().is_some_and(|(_, _, gw, gh, _)| {
+            (*gw, *gh) == (self.matte.width(), self.matte.height())
+        })
+    }
 
-        // The guidance and the matte must be the same size for the window arithmetic to
-        // line up. They always are in practice (both INFER_W x INFER_H), so a mismatch is a
-        // caller bug rather than a case to paper over.
-        if (*gw, *gh) != (width, height) {
-            self.guided_ready = false;
-            return;
-        }
-
+    /// Allocate the coefficient field for the current matte size, if it is not already.
+    fn ensure_guided_ab(&mut self) {
+        let (width, height) = (self.matte.width(), self.matte.height());
         let needs_alloc = self
             .guided_ab
             .as_ref()
@@ -608,13 +617,35 @@ impl FramePipeline {
                 view_formats: &[],
             }));
         }
+    }
+
+    /// Encode the guided-coefficient pass into the caller's encoder.
+    ///
+    /// Encoding rather than submitting is the point. The guidance image has to be the frame
+    /// the matte was computed from, *and* the coefficients have to be consumed by the
+    /// composite of that same frame. Putting both in one command buffer is what makes the
+    /// second half true: `finish_frame` fits and uses them without a frame boundary in
+    /// between, so there is no window in which `matte_input` could move on.
+    ///
+    /// Pairing a matte with the wrong guidance is subtle and ugly. `a` is large at an edge
+    /// by design, so stale coefficients do not decay into soft ghosting — they extrapolate,
+    /// and a moving edge picks up a luminance-keyed fringe.
+    ///
+    /// Caller guarantees [`guided_possible`] and that [`ensure_guided_ab`] has run.
+    fn encode_guided(&self, enc: &mut wgpu::CommandEncoder) {
+        let (width, height) = (self.matte.width(), self.matte.height());
+        let guide = &self
+            .matte_input
+            .as_ref()
+            .expect("guided_possible checked this")
+            .0;
 
         let guide_view = guide.create_view(&Default::default());
         let matte_view = self.matte.create_view(&Default::default());
         let ab_view = self
             .guided_ab
             .as_ref()
-            .expect("just allocated")
+            .expect("ensure_guided_ab ran")
             .create_view(&Default::default());
 
         // Written every time rather than only on change: this is 8 bytes against a pass that
@@ -629,9 +660,8 @@ impl FramePipeline {
             }),
         );
 
-        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
         self.dispatch(
-            &mut enc,
+            enc,
             &self.guided,
             &[
                 wgpu::BindGroupEntry {
@@ -654,8 +684,6 @@ impl FramePipeline {
             width,
             height,
         );
-        self.gpu.queue.submit(Some(enc.finish()));
-        self.guided_ready = true;
     }
 
     /// Prepare a downscaled RGBA readback at `w`x`h`, for feeding a matting network.
@@ -692,21 +720,89 @@ impl FramePipeline {
         self.matte_input = Some((tex, buf, w, h, padded));
     }
 
-    /// Downscale the current frame and read it back as tightly-packed RGBA8.
+    /// Upload a YUY2 frame, unpack it, and read back the matting network's input.
     ///
-    /// Call after [`process`], which is what leaves the unpacked RGBA in place. Returns
-    /// false if [`enable_matte_input`] was never called.
+    /// The first half of a frame. Pair it with [`finish_frame`], optionally calling
+    /// [`set_matte`] in between with a matte derived from the very buffer this returns.
+    ///
+    /// Returns false when no matte was asked for, or when [`enable_matte_input`] was never
+    /// called — in both cases the frame is still uploaded and unpacked, so `finish_frame`
+    /// composites it normally against whatever matte is already set.
+    ///
+    /// ## Why the split exists
+    ///
+    /// This used to be one `process` call that composited *and then* downscaled, so the
+    /// caller could only ever infer a matte for a frame it had already sent to the virtual
+    /// camera. The matte therefore landed on the *next* frame — 33 ms of misalignment
+    /// between an image and its own alpha at 30 fps, which is plainly visible as a fringe
+    /// dragging behind anything that moves.
+    ///
+    /// The old arrangement was justified as avoiding a pipeline stall. It did not: `process`
+    /// already blocked on a readback and the downscale blocked on a second one, for three
+    /// queue submissions a frame. This split has the same two stalls and two submissions,
+    /// and the matte belongs to the frame it is composited onto.
     ///
     /// The readback is small on purpose: 512x288 RGBA is 590 KB, where reading back a full
     /// 1080p frame to downscale on the CPU would be 8 MB and put the scaling on the wrong
     /// processor.
-    pub fn read_matte_input(&mut self, out: &mut [u8]) -> bool {
-        let Some((tex, buf, w, h, padded)) = self.matte_input.take() else {
-            return false;
-        };
+    pub fn begin_frame(&mut self, input: &[u8], matte_in: Option<&mut [u8]>) -> bool {
+        let packed_w = self.width.div_ceil(2);
+
+        self.gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.packed_in,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            input,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(packed_w * 4),
+                rows_per_image: Some(self.height),
+            },
+            wgpu::Extent3d {
+                width: packed_w,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
 
         let v = |t: &wgpu::Texture| t.create_view(&Default::default());
         let mut enc = self.gpu.device.create_command_encoder(&Default::default());
+
+        // 1. unpack YUY2 -> RGBA, which is what every later pass reads.
+        self.dispatch(
+            &mut enc,
+            &self.unpack,
+            &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&v(&self.packed_in)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&v(&self.rgba)),
+                },
+            ],
+            packed_w,
+            self.height,
+        );
+
+        // 2. downscale for the matting network, when one is wired up and wanted.
+        let Some(out) = matte_in else {
+            // Nothing to read back. Submit the unpack so `finish_frame` sees it, and skip
+            // the stall entirely — with no matting this is now one submission and no wait,
+            // where the old `process` always paid for a full round trip.
+            self.gpu.queue.submit([enc.finish()]);
+            return false;
+        };
+        // Taken and put back so `dispatch` can borrow `&self` while these are in hand.
+        let Some((tex, buf, w, h, padded)) = self.matte_input.take() else {
+            self.gpu.queue.submit([enc.finish()]);
+            return false;
+        };
+
         self.dispatch(
             &mut enc,
             &self.downscale,
@@ -790,32 +886,39 @@ impl FramePipeline {
         self.guided_eps = eps.max(1e-8);
     }
 
-    /// Run one frame: upload YUY2, apply effects, read YUY2 back.
+    /// Upload, composite and read back in one call, for callers with no matting of their own.
+    ///
+    /// Exactly `begin_frame(input, None)` then `finish_frame`. The matte is whatever was
+    /// last handed to [`set_matte`], which is fine here and emphatically not fine in the
+    /// daemon — hence the split. Note that the old bug cannot be written through this
+    /// entry point any more: there is no longer a way to ask for the frame back after
+    /// compositing it, so "composite now, infer later" has no way to spell itself.
     pub fn process(&mut self, input: &[u8], output: &mut [u8], look: Look) {
+        self.begin_frame(input, None);
+        self.finish_frame(output, look);
+    }
+
+    /// Composite the frame [`begin_frame`] uploaded, and read the result back as YUY2.
+    ///
+    /// The second half of a frame. Deliberately takes no image: the frame is whatever
+    /// `begin_frame` put in `rgba`, so there is no way for a caller to composite one frame
+    /// with another frame's matte. That used to be exactly the bug — the ordering was the
+    /// caller's to get right, and it got it wrong by one frame.
+    pub fn finish_frame(&mut self, output: &mut [u8], look: Look) {
         let (mode, blur_strength, mirror) = (look.mode, look.blur_strength, look.mirror);
         let packed_w = self.width.div_ceil(2);
+
+        // Refit the guided coefficients whenever a new matte has arrived. Both the fit and
+        // its use land in this frame's command buffer, below.
+        if self.matte_dirty {
+            self.guided_ready = self.guided_possible();
+            if self.guided_ready {
+                self.ensure_guided_ab();
+            }
+            self.matte_dirty = false;
+        }
+
         let dev = &self.gpu.device;
-
-        self.gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.packed_in,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            input,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(packed_w * 4),
-                rows_per_image: Some(self.height),
-            },
-            wgpu::Extent3d {
-                width: packed_w,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
-
         let params = CompositeParams {
             mode: match mode {
                 BackgroundMode::Off => 0,
@@ -828,8 +931,8 @@ impl FramePipeline {
             dim: look.dim.clamp(0.0, 1.0),
             guided: self.guided_ready as u32,
             tighten: look.tighten.clamp(0.0, 0.9),
+            feather: look.feather.clamp(0.0, 1.0),
             _pad0: 0,
-            _pad1: 0,
         };
         self.gpu
             .queue
@@ -838,23 +941,11 @@ impl FramePipeline {
         let v = |t: &wgpu::Texture| t.create_view(&Default::default());
         let mut enc = dev.create_command_encoder(&Default::default());
 
-        // 1. unpack
-        self.dispatch(
-            &mut enc,
-            &self.unpack,
-            &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&v(&self.packed_in)),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&v(&self.rgba)),
-                },
-            ],
-            packed_w,
-            self.height,
-        );
+        // 1. guided-filter coefficients, fitted on the frame this matte came from and
+        //    consumed by the composite two passes below — same frame, same command buffer.
+        if self.guided_ready {
+            self.encode_guided(&mut enc);
+        }
 
         // 2. blur pyramid, only when the mode needs a background plane
         //
@@ -1095,5 +1186,233 @@ impl FramePipeline {
             w,
             h,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: u32 = 64;
+    const H: u32 = 32;
+
+    /// Luma of white and of the `Remove` key colour, as this pipeline writes them.
+    ///
+    /// `Remove` composites pure green behind the subject, so reading luma back is enough to
+    /// say where alpha was 1 and where it was 0 — 235 against 145 is not a distinction any
+    /// tolerance can blur.
+    const FG_WHITE: i32 = 235;
+    const BG_GREEN: i32 = 145;
+
+    /// Build a YUY2 frame from a per-pixel RGB function, via the same BT.601 limited-range
+    /// matrix `colour.wgsl` uses. Generating YUV directly would ask for colours outside the
+    /// RGB gamut, which the shader clamps — correctly — and the test then reads as a bug.
+    fn yuy2_from(rgb: impl Fn(u32) -> (f32, f32, f32)) -> Vec<u8> {
+        let pw = (W / 2) as usize;
+        let mut out = vec![0u8; pw * H as usize * 4];
+        let to_yuv = |(r, g, b): (f32, f32, f32)| {
+            (
+                0.2568 * r + 0.5041 * g + 0.0979 * b + 0.0627451,
+                -0.1482 * r - 0.2910 * g + 0.4392 * b + 0.5019608,
+                0.4392 * r - 0.3678 * g - 0.0714 * b + 0.5019608,
+            )
+        };
+        for y in 0..H as usize {
+            for xq in 0..pw {
+                let x = xq as u32 * 2;
+                let (y0, u0, v0) = to_yuv(rgb(x));
+                let (y1, u1, v1) = to_yuv(rgb(x + 1));
+                let i = (y * pw + xq) * 4;
+                out[i] = (y0 * 255.0 + 0.5) as u8;
+                out[i + 1] = ((u0 + u1) * 0.5 * 255.0 + 0.5) as u8;
+                out[i + 2] = (y1 * 255.0 + 0.5) as u8;
+                out[i + 3] = ((v0 + v1) * 0.5 * 255.0 + 0.5) as u8;
+            }
+        }
+        out
+    }
+
+    /// Luma of pixel `x` on row `y` of a packed YUY2 buffer.
+    fn luma(buf: &[u8], x: u32, y: u32) -> i32 {
+        let pw = (W / 2) as usize;
+        buf[(y as usize * pw + (x / 2) as usize) * 4 + (x % 2) as usize * 2] as i32
+    }
+
+    /// A frame that is white on one half and black on the other.
+    fn split_frame(white_left: bool) -> Vec<u8> {
+        yuy2_from(|x| {
+            if (x < W / 2) == white_left {
+                (1.0, 1.0, 1.0)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        })
+    }
+
+    /// A matte at `mw`x`mh` that is opaque over the same half as `split_frame`.
+    fn split_matte(white_left: bool, mw: u32, mh: u32) -> Vec<u8> {
+        (0..mw * mh)
+            .map(|i| {
+                if ((i % mw) < mw / 2) == white_left {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
+
+    /// Every pixel outside a margin around the centre seam must be foreground on the white
+    /// half and keyed out on the black half. The margin exists because the matte is sampled
+    /// bilinearly, so the two texels straddling the boundary are legitimately in between.
+    fn assert_keyed(out: &[u8], white_left: bool, margin: u32, ctx: &str) {
+        for y in (0..H).step_by(7) {
+            for x in 0..W {
+                if x.abs_diff(W / 2) <= margin || x < margin || x >= W - margin {
+                    continue;
+                }
+                let want = if (x < W / 2) == white_left {
+                    FG_WHITE
+                } else {
+                    BG_GREEN
+                };
+                let got = luma(out, x, y);
+                assert!(
+                    (got - want).abs() <= 6,
+                    "{ctx}: pixel ({x},{y}) reads {got}, wanted {want} \
+                     ({}). The matte belongs to a different frame than the image.",
+                    if want == FG_WHITE {
+                        "subject, should be white"
+                    } else {
+                        "background, should be keyed green"
+                    }
+                );
+            }
+        }
+    }
+
+    fn new_pipeline() -> Option<FramePipeline> {
+        match Gpu::new(None) {
+            Ok(g) => Some(FramePipeline::new(g, W, H)),
+            Err(e) => {
+                eprintln!("no GPU available ({e}); skipping");
+                None
+            }
+        }
+    }
+
+    fn remove() -> Look {
+        Look {
+            mode: BackgroundMode::Remove,
+            ..Default::default()
+        }
+    }
+
+    /// The invariant this whole reordering exists to establish.
+    ///
+    /// A matte handed over between `begin_frame` and `finish_frame` must apply to *that*
+    /// frame. The second pass is the one that matters: it flips both the image and the
+    /// matte, so a pipeline that held either one from the previous call composites a
+    /// subject where there is now background and fails loudly.
+    ///
+    /// The bug this guards against was not in this file — `FramePipeline` faithfully
+    /// applied whatever matte was set — it was in the daemon's *ordering*, which
+    /// composited before inferring. `finish_frame` takes no frame argument precisely so
+    /// that ordering is no longer something a caller can get wrong.
+    #[test]
+    fn the_matte_applies_to_the_frame_it_was_derived_from() {
+        let Some(mut pipe) = new_pipeline() else {
+            return;
+        };
+        // Sample the matte directly, so this test is about *which frame* the alpha came
+        // from and not about the guided filter's reconstruction.
+        pipe.set_guided(false, 3, 1e-4);
+
+        let mut out = vec![0u8; (W * H * 2) as usize];
+        for white_left in [true, false] {
+            pipe.begin_frame(&split_frame(white_left), None);
+            pipe.set_matte(&split_matte(white_left, W, H), W, H);
+            pipe.finish_frame(&mut out, remove());
+            assert_keyed(
+                &out,
+                white_left,
+                2,
+                if white_left { "first frame" } else { "flipped" },
+            );
+        }
+    }
+
+    /// The same invariant for the guided path, which is where a stale matte does the real
+    /// damage.
+    ///
+    /// The composite evaluates `alpha = a*I + b` against the frame's own luma. `a` is large
+    /// at an edge by design, so coefficients fitted on the previous frame do not decay into
+    /// soft ghosting — they extrapolate, and a moving edge picks up a luminance-keyed
+    /// fringe. Fitting and consuming them within one `begin_frame`/`finish_frame` pair is
+    /// what keeps that from being possible.
+    #[test]
+    fn the_guided_coefficients_belong_to_the_frame_they_are_used_on() {
+        let Some(mut pipe) = new_pipeline() else {
+            return;
+        };
+        let (mw, mh) = (W / 2, H / 2);
+        pipe.set_guided(true, 3, 1e-4);
+        pipe.enable_matte_input(mw, mh);
+
+        let mut matte_in = vec![0u8; (mw * mh * 4) as usize];
+        let mut out = vec![0u8; (W * H * 2) as usize];
+
+        for white_left in [true, false] {
+            assert!(
+                pipe.begin_frame(&split_frame(white_left), Some(&mut matte_in)),
+                "matte input was enabled, so the readback must happen"
+            );
+            pipe.set_matte(&split_matte(white_left, mw, mh), mw, mh);
+            pipe.finish_frame(&mut out, remove());
+            // A wider margin than the direct-sample test: the guided window is 7 matte
+            // texels, which is 14 frame pixels here, so the seam is legitimately soft.
+            assert_keyed(
+                &out,
+                white_left,
+                8,
+                if white_left {
+                    "guided, first frame"
+                } else {
+                    "guided, flipped"
+                },
+            );
+        }
+    }
+
+    /// `begin_frame` must hand back the frame it was just given, not the one before it.
+    ///
+    /// This is what the daemon feeds to the matting network, so an off-by-one here would
+    /// reintroduce exactly the misalignment the reordering removes — silently, because a
+    /// network fed the previous frame still returns a perfectly plausible matte.
+    #[test]
+    fn the_matte_input_is_the_frame_just_uploaded() {
+        let Some(mut pipe) = new_pipeline() else {
+            return;
+        };
+        let (mw, mh) = (W / 2, H / 2);
+        pipe.enable_matte_input(mw, mh);
+        let mut matte_in = vec![0u8; (mw * mh * 4) as usize];
+
+        for white_left in [true, false] {
+            pipe.begin_frame(&split_frame(white_left), Some(&mut matte_in));
+            // Sample well inside each half, away from the bilinear seam.
+            let at = |x: u32| matte_in[((mh / 2) * mw + x) as usize * 4] as i32;
+            let (left, right) = (at(mw / 8), at(mw - mw / 8));
+            let (bright, dark) = if white_left {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            assert!(
+                bright > 200 && dark < 55,
+                "downscaled frame reads {bright}/{dark} for the white/black halves \
+                 (white_left = {white_left}); the readback is a frame behind"
+            );
+        }
     }
 }

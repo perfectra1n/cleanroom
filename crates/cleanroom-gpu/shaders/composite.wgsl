@@ -14,8 +14,11 @@ struct CompositeParams {
     // version of the same room a slightly generous silhouette is invisible, but against a
     // swapped background it is a bright halo tracing the shoulders and ears.
     tighten: f32,
+    // Widens the alpha ramp about its crossing, without moving the crossing. Independent of
+    // `tighten`, which moves the crossing and — being a shift-and-rescale — actually makes
+    // the ramp *steeper* as it does so.
+    feather: f32,
     _pad0: u32,
-    _pad1: u32,
 }
 
 @group(0) @binding(0) var comp_fg: texture_2d<f32>;
@@ -68,11 +71,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         alpha = clamp(textureSampleLevel(comp_matte, comp_samp, uv, 0.0).r, 0.0, 1.0);
     }
 
-    // Erode the edge by remapping the ramp rather than by a morphological pass: a real
+    // Shape the edge by remapping the ramp rather than by a morphological pass: a real
     // erode would need another full-resolution pass and a second texture, and this is a
-    // matte whose edge is already a soft gradient, so moving the 0.5 crossing outward
-    // achieves the same thing for free. tighten = 0 leaves alpha untouched.
-    if (comp.tighten > 0.0) {
+    // matte whose edge is already a soft gradient, so remapping achieves the same thing
+    // for free.
+    //
+    // Two independent controls, and it is worth being clear that they are not the same
+    // knob. `tighten` moves where alpha crosses 0.5, pulling the silhouette inward — and
+    // because it is a shift-and-rescale with gain 1/(1-tighten), it also makes the ramp
+    // steeper, which is the opposite of softening. `feather` widens the ramp around
+    // whatever crossing `tighten` chose, leaving the crossing itself alone.
+    if (comp.feather > 0.0) {
+        // Same crossing as the linear remap below, a wider and C1-smooth ramp around it.
+        // The 3x is what makes the top of the slider a genuinely soft edge rather than a
+        // barely-perceptible change.
+        let c = (1.0 + comp.tighten) * 0.5;
+        let w = clamp((1.0 - comp.tighten) * 0.5 * (1.0 + 3.0 * comp.feather), 0.01, 0.5);
+        alpha = smoothstep(c - w, c + w, alpha);
+    } else if (comp.tighten > 0.0) {
+        // feather = 0 keeps the original behaviour exactly, so an existing config that
+        // never sets feather composites bit for bit as it did before.
         alpha = clamp((alpha - comp.tighten) / max(1.0 - comp.tighten, 0.001), 0.0, 1.0);
     }
 

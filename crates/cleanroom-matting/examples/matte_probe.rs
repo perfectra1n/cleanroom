@@ -18,7 +18,7 @@
 //! network found no subject, which composites as "everything is background" — every pixel
 //! blurred, the person included.
 
-use cleanroom_matting::{INFER_H, INFER_W, Matter};
+use cleanroom_matting::{INFER_H, INFER_W, Matter, Smoothing};
 
 fn main() {
     let path = match std::env::args().nth(1) {
@@ -60,7 +60,9 @@ fn main() {
 
     let mut alpha = Vec::new();
     for pass in 0..passes {
-        let out = matter.infer(img.as_raw()).expect("inference");
+        let out = matter
+            .infer(img.as_raw(), Smoothing::default())
+            .expect("inference");
         alpha = out.to_vec();
         if pass + 1 == passes {
             break;

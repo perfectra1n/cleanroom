@@ -71,6 +71,10 @@ struct Snapshot {
     desaturate: f32,
     dim: f32,
     tighten: f32,
+    feather: f32,
+    fade_rise: f32,
+    fade_fall: f32,
+    motion_release: f32,
     guided_filter: bool,
     guided_radius: f32,
     matting_backend: i32,
@@ -306,6 +310,30 @@ async fn poll(with_devices: bool) -> Option<Snapshot> {
             .ok()?
             .parse()
             .unwrap_or(0.0),
+        feather: p
+            .get("video.matte_feather")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.0),
+        fade_rise: p
+            .get("video.matte_fade_rise")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.55),
+        fade_fall: p
+            .get("video.matte_fade_fall")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.22),
+        motion_release: p
+            .get("video.matte_motion_release")
+            .await
+            .ok()?
+            .parse()
+            .unwrap_or(0.25),
         guided_filter: p.get("video.guided_filter").await.ok()? == "true",
         guided_radius: p
             .get("video.guided_radius")
@@ -447,6 +475,10 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_desaturate(s.desaturate);
     ui.set_dim(s.dim);
     ui.set_tighten(s.tighten);
+    ui.set_feather(s.feather);
+    ui.set_fade_rise(s.fade_rise);
+    ui.set_fade_fall(s.fade_fall);
+    ui.set_motion_release(s.motion_release);
     ui.set_guided_filter(s.guided_filter);
     ui.set_guided_radius(s.guided_radius);
     ui.set_matting_backend(s.matting_backend);
@@ -596,6 +628,14 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     ui.on_set_dim(move |v| s("video.background_dim", format!("{v}")));
     let s = send.clone();
     ui.on_set_tighten(move |v| s("video.matte_tighten", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_feather(move |v| s("video.matte_feather", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_fade_rise(move |v| s("video.matte_fade_rise", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_fade_fall(move |v| s("video.matte_fade_fall", format!("{v}")));
+    let s = send.clone();
+    ui.on_set_motion_release(move |v| s("video.matte_motion_release", format!("{v}")));
     let s = send.clone();
     ui.on_set_guided_filter(move |b| s("video.guided_filter", b.to_string()));
     let s = send.clone();

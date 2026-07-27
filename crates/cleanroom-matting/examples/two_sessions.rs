@@ -21,7 +21,7 @@ fn main() {
             cleanroom_matting::INFER_H,
         ) {
             Ok(mut m) => {
-                match m.infer(&frame) {
+                match m.infer(&frame, cleanroom_matting::Smoothing::default()) {
                     Ok(a) => eprintln!("  inferred, matte {} bytes", a.len()),
                     Err(e) => eprintln!("  infer failed: {e}"),
                 }

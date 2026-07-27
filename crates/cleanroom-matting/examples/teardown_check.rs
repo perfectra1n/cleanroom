@@ -17,7 +17,7 @@
 //! Inference runs first on purpose: the fault appears *after* successful work, not on a
 //! session that was never used, so tearing down an idle session would prove nothing.
 
-use cleanroom_matting::{INFER_H, INFER_W, Matter};
+use cleanroom_matting::{INFER_H, INFER_W, Matter, Smoothing};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -48,7 +48,9 @@ fn main() {
 
     println!("running inference (the fault only shows up after real work)");
     for _ in 0..4 {
-        matter.infer(&frame).expect("inference must succeed");
+        matter
+            .infer(&frame, Smoothing::default())
+            .expect("inference must succeed");
     }
 
     // SAFETY-adjacent: this is the whole point of the example. If it segfaults, it segfaults.

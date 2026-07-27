@@ -434,6 +434,63 @@ mod tests {
         assert_eq!(original, Config::default());
     }
 
+    /// The edge and fade knobs must be reachable from the CLI and the GUI.
+    ///
+    /// They are plain floats rather than `Option`, so unlike `matte_tighten` they need no
+    /// entry in `OPTIONAL_KEYS` — they always serialise, so the generic walk finds them.
+    /// That is easy to assume and worth checking, because getting it wrong shows up as
+    /// "no such setting" on a knob the GUI happily draws a slider for.
+    #[test]
+    fn the_edge_and_fade_knobs_round_trip() {
+        let base = Config::default();
+        for (key, value, read) in [
+            ("video.matte_feather", "0.4", {
+                (|c: &Config| c.video.matte_feather) as fn(&Config) -> f32
+            }),
+            ("video.matte_fade_rise", "0.7", |c: &Config| {
+                c.video.matte_fade_rise
+            }),
+            ("video.matte_fade_fall", "0.35", |c: &Config| {
+                c.video.matte_fade_fall
+            }),
+            ("video.matte_motion_release", "0.15", |c: &Config| {
+                c.video.matte_motion_release
+            }),
+        ] {
+            let c = set(&base, key, value).unwrap_or_else(|e| panic!("set {key}: {e}"));
+            assert_eq!(read(&c).to_string(), value, "{key} did not take");
+            assert_eq!(get(&c, key).unwrap(), value, "{key} did not read back");
+            assert!(
+                keys(&base).unwrap().iter().any(|(k, _)| k == key),
+                "{key} is missing from `cleanroom-ctl keys`"
+            );
+        }
+    }
+
+    /// A config written before these fields existed must still load.
+    ///
+    /// Every one of them carries a serde default for exactly this reason: the alternative
+    /// is that adding a knob makes the daemon refuse to start against the config already on
+    /// the user's disk, which is a far worse failure than a missing slider.
+    #[test]
+    fn a_config_predating_the_new_knobs_still_loads() {
+        let old = r#"
+            schema_version = 1
+            [video]
+            enabled = true
+            background = "blur"
+            matte_tighten = 0.339
+            [audio]
+            enabled = true
+        "#;
+        let c: Config = toml::from_str(old).expect("an older config must still deserialise");
+        assert_eq!(c.video.matte_tighten, Some(0.339), "existing keys survive");
+        assert_eq!(c.video.matte_feather, 0.0, "feather defaults to no change");
+        assert_eq!(c.video.matte_fade_rise, 0.55);
+        assert_eq!(c.video.matte_fade_fall, 0.22);
+        assert_eq!(c.video.matte_motion_release, 0.25);
+    }
+
     #[test]
     fn keys_lists_leaves_only_and_is_sorted() {
         let ks = keys(&Config::default()).unwrap();

@@ -87,6 +87,10 @@ export component AppWindow inherits Window {
     in-out property <float> desaturate: 0;
     in-out property <float> dim: 0;
     in-out property <float> tighten: 0;
+    in-out property <float> feather: 0;
+    in-out property <float> fade-rise: 0.55;
+    in-out property <float> fade-fall: 0.22;
+    in-out property <float> motion-release: 0.25;
     in-out property <bool> guided-filter: true;
     // float, not int: it is two-way bound to a Slider, whose `value` is a float, and Slint
     // requires both sides of `<=>` to agree. Rounded on the way out to the daemon.
@@ -111,6 +115,10 @@ export component AppWindow inherits Window {
     callback set-desaturate(float);
     callback set-dim(float);
     callback set-tighten(float);
+    callback set-feather(float);
+    callback set-fade-rise(float);
+    callback set-fade-fall(float);
+    callback set-motion-release(float);
     callback set-guided-filter(bool);
     callback set-guided-radius(float);
     callback set-matting-backend(int);
@@ -339,6 +347,83 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     text: "Tighten pulls the cutout inward. Raise it if a bright fringe traces your shoulders against a replaced background.";
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    opacity: 0.7;
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Edge feather"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0; maximum: 1;
+                        value <=> root.feather;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-feather(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.feather * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: "Feather softens how abruptly the cutout ends, without moving where it ends. Raise it if the edge looks cut out with scissors.";
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    opacity: 0.7;
+                }
+
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Fade in"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0.01; maximum: 1;
+                        value <=> root.fade-rise;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-fade-rise(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.fade-rise * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Fade out"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0.01; maximum: 1;
+                        value <=> root.fade-fall;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-fade-fall(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.fade-fall * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Motion release"; width: 96px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0.01; maximum: 1;
+                        value <=> root.motion-release;
+                        enabled: root.background-mode != 0;
+                        released(v) => { root.set-motion-release(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.motion-release * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: "Fade smooths the matte over time: lower is calmer, higher follows you more closely. Motion release is how big a change counts as real movement rather than noise.";
                     wrap: word-wrap;
                     font-size: 11px;
                     opacity: 0.7;

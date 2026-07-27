@@ -496,34 +496,36 @@ fn run_once(
         let gpu_ms = match gpu.as_mut() {
             Some(pipe) => {
                 let t1 = Instant::now();
-                pipe.process(
-                    &frame.data,
-                    &mut processed,
-                    cleanroom_gpu::Look {
-                        mode: effective_background,
-                        blur_strength: now_cfg.video.blur_strength,
-                        mirror: now_cfg.video.mirror,
-                        desaturate: now_cfg.video.background_desaturate,
-                        dim: now_cfg.video.background_dim,
-                        // Resolved against the mode actually being rendered, not the one
-                        // configured: a missing background image degrades Replace to Blur,
-                        // and carrying Replace's tighter edge into that would erode the
-                        // silhouette for no reason.
-                        tighten: now_cfg.video.tighten_for(effective_background),
-                    },
-                );
-                // Matting runs *after* the composite, so its matte applies to the next
-                // frame rather than this one. One frame of latency is invisible, and it
-                // avoids a pipeline stall: the alternative is to downscale, read back, run
-                // the network and only then composite, serialising the GPU behind the CPU
-                // on every single frame.
+
+                // Upload and unpack the frame, and take the downscaled copy the network
+                // wants — all *before* compositing anything.
+                //
+                // The order here is the whole point, and it used to be the other way round:
+                // composite first, then infer, so the matte produced from this frame landed
+                // on the *next* one. That is 33 ms of misalignment between an image and its
+                // own alpha at 30 fps, which reads as a fringe dragging behind anything that
+                // moves — and it is amplified rather than softened by the guided filter,
+                // whose `alpha = a*I + b` extrapolates when `a` was fitted on a frame the
+                // subject has already left.
+                //
+                // It was justified as avoiding a pipeline stall. It did not avoid one: the
+                // composite already blocked on a readback and the downscale blocked on a
+                // second, for three queue submissions a frame against two now.
                 if let Some(m) = matter.as_mut().filter(|_| matting_active) {
-                    let t2 = Instant::now();
                     // Read before inferring: `alpha` borrows `m`, so the geometry has to be
                     // out before the match arm needs it.
                     let (matte_w, matte_h) = (m.infer_w(), m.infer_h());
-                    if pipe.read_matte_input(&mut matte_rgba) {
-                        match m.infer(&matte_rgba) {
+                    if pipe.begin_frame(&frame.data, Some(&mut matte_rgba)) {
+                        let t2 = Instant::now();
+                        // Read live, like blur strength: these are pure arithmetic on the
+                        // alpha, so they must never reach `needs_restart` — a restart drops
+                        // the loopback fd and blanks the camera for every app in the call.
+                        let smoothing = cleanroom_matting::Smoothing {
+                            rise: now_cfg.video.matte_fade_rise,
+                            fall: now_cfg.video.matte_fade_fall,
+                            motion_release: now_cfg.video.matte_motion_release,
+                        };
+                        match m.infer(&matte_rgba, smoothing) {
                             Ok(alpha) => {
                                 pipe.set_matte(alpha, matte_w, matte_h);
                                 infer_errors = 0;
@@ -550,10 +552,31 @@ fn run_once(
                                 }
                             }
                         }
+                        matting_ms = t2.elapsed().as_secs_f64() * 1000.0;
                     }
                     matte_rejected = m.rejected;
-                    matting_ms = t2.elapsed().as_secs_f64() * 1000.0;
+                } else {
+                    // No matte wanted. `begin_frame` still uploads and unpacks, and skips
+                    // the readback stall entirely.
+                    pipe.begin_frame(&frame.data, None);
                 }
+
+                pipe.finish_frame(
+                    &mut processed,
+                    cleanroom_gpu::Look {
+                        mode: effective_background,
+                        blur_strength: now_cfg.video.blur_strength,
+                        mirror: now_cfg.video.mirror,
+                        desaturate: now_cfg.video.background_desaturate,
+                        dim: now_cfg.video.background_dim,
+                        // Resolved against the mode actually being rendered, not the one
+                        // configured: a missing background image degrades Replace to Blur,
+                        // and carrying Replace's tighter edge into that would erode the
+                        // silhouette for no reason.
+                        tighten: now_cfg.video.tighten_for(effective_background),
+                        feather: now_cfg.video.matte_feather,
+                    },
+                );
 
                 sink.write(&processed)?;
                 // Same buffer to both transports. Advertising YUY2 on the PipeWire node is
@@ -879,6 +902,29 @@ mod tests {
         power.video.power_save = !base.video.power_save;
         assert!(!needs_restart(&base, &power, CAM), "power save is live");
 
+        // The edge and fade knobs are pure arithmetic on the alpha — no buffer is sized
+        // from them and no session depends on them. Restarting for one would drop the
+        // loopback fd and blank the camera for every app in the call, which is a
+        // spectacular price for nudging a slider.
+        for (name, mutate) in [
+            (
+                "feather",
+                (|c: &mut Config| c.video.matte_feather = 0.5) as fn(&mut Config),
+            ),
+            ("fade rise", |c: &mut Config| c.video.matte_fade_rise = 0.8),
+            ("fade fall", |c: &mut Config| c.video.matte_fade_fall = 0.4),
+            ("motion release", |c: &mut Config| {
+                c.video.matte_motion_release = 0.1
+            }),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(
+                !needs_restart(&base, &changed, CAM),
+                "{name} must be adjustable without reopening the devices"
+            );
+        }
+
         // Blur -> Replace -> Remove all need the same matting model, so switching between
         // them is a uniform change, not a pipeline change.
         for mode in [BackgroundMode::Replace, BackgroundMode::Remove] {
@@ -917,6 +963,27 @@ mod tests {
                 "changing {name} must reopen the devices"
             );
         }
+    }
+
+    /// The config's fade defaults must be the filter's own defaults.
+    ///
+    /// They are declared twice — as serde defaults in `cleanroom-core`, which cannot depend
+    /// on the matting crate, and in `Smoothing::default`. Two sources of truth for the same
+    /// three numbers drift silently, and the symptom would be a fresh install behaving
+    /// unlike the documented default with nothing to point at.
+    #[test]
+    fn the_config_defaults_match_the_filters_own() {
+        let cfg = Config::default().video;
+        let s = cleanroom_matting::Smoothing::default();
+        assert_eq!(
+            (
+                cfg.matte_fade_rise,
+                cfg.matte_fade_fall,
+                cfg.matte_motion_release
+            ),
+            (s.rise, s.fall, s.motion_release),
+            "cleanroom-core's serde defaults have drifted from Smoothing::default"
+        );
     }
 
     /// `video.device = None` means "first usable camera". That is the camera already open,

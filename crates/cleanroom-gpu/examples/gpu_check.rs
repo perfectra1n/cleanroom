@@ -226,14 +226,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // also confirms the wiring: without enable_matte_input the composite must fall back to
     // sampling the matte directly rather than reading an uninitialised coefficient field.
     pipe.enable_matte_input(128, 72);
-    let mut guided_out = vec![0u8; frame_bytes];
-    pipe.process(
-        &input,
-        &mut guided_out,
-        look(BackgroundMode::Blur, 1.0, false),
-    );
-    let mut small = vec![0u8; 128 * 72 * 4];
-    let got_guidance = pipe.read_matte_input(&mut small);
     // A half-and-half matte at guidance resolution: the guided filter should keep the
     // boundary where it is rather than smearing it across the frame.
     let mut half = vec![0u8; 128 * 72];
@@ -242,9 +234,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             half[y * 128 + x] = if x < 64 { 0 } else { 255 };
         }
     }
-    pipe.set_matte(&half, 128, 72);
+
+    // One begin/set/finish cycle, which is the contract the daemon runs on: the guidance
+    // image comes out, a matte derived from it goes back in, and the composite consumes
+    // both without a frame boundary in between. This used to need a throwaway `process`
+    // first, purely to leave something for the readback to downscale.
+    let mut small = vec![0u8; 128 * 72 * 4];
     let mut split = vec![0u8; frame_bytes];
-    pipe.process(&input, &mut split, look(BackgroundMode::Blur, 1.0, false));
+    let got_guidance = pipe.begin_frame(&input, Some(&mut small));
+    pipe.set_matte(&half, 128, 72);
+    pipe.finish_frame(&mut split, look(BackgroundMode::Blur, 1.0, false));
 
     // Compare halves statistically rather than probing single pixels. Two lone texels can
     // agree by coincidence on a checkerboard, which is exactly what an earlier version of

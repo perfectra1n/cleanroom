@@ -142,21 +142,57 @@ const DOWNSAMPLE_RATIO: f32 = if INFER_W > 512 {
     1.0
 };
 
-/// Weight given to a *rising* alpha sample when the matte is otherwise stable.
+/// How hard the matte is damped frame to frame, and in which direction.
 ///
-/// Higher than `ALPHA_FALL` because gaining subject early is invisible, where losing it
-/// early punches a hole in a moving limb.
-const ALPHA_RISE: f32 = 0.55;
-
-/// Weight given to a *falling* alpha sample when the matte is otherwise stable.
-const ALPHA_FALL: f32 = 0.22;
-
-/// The per-pixel alpha change at which temporal damping is fully released.
+/// Runtime rather than constants because these are a *look* preference: how much shimmer to
+/// trade for how much responsiveness is not something one set of numbers settles for
+/// everybody. `video.matte_fade_*` sets them live, per frame.
 ///
-/// Below this, a change is treated as noise and averaged; at or above it, the new sample is
-/// taken essentially whole, because a jump that large is the network reporting real motion
-/// and averaging it is what produces ghost trails.
-const MOTION_FULL: f32 = 0.25;
+/// What they are emphatically *not* is a fix for a lagging matte. Measured against a moving
+/// soft edge, the defaults below displace it by at most 0.38 matte pixels at any speed —
+/// against a full `speed` pixels for a matte computed one frame late. See
+/// `temporal_smoothing_costs_well_under_a_pixel`, which is the guard on anyone retuning
+/// these into a smear.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Smoothing {
+    /// Weight given to a *rising* alpha sample when the matte is otherwise stable.
+    ///
+    /// Higher than `fall` by default because gaining subject early is invisible, where
+    /// losing it early punches a hole in a moving limb.
+    pub rise: f32,
+    /// Weight given to a *falling* alpha sample when the matte is otherwise stable.
+    pub fall: f32,
+    /// The per-pixel alpha change at which temporal damping is fully released.
+    ///
+    /// Below this, a change is treated as noise and averaged; at or above it, the new
+    /// sample is taken essentially whole, because a jump that large is the network
+    /// reporting real motion and averaging it is what produces ghost trails.
+    pub motion_release: f32,
+}
+
+impl Default for Smoothing {
+    fn default() -> Self {
+        Self {
+            rise: 0.55,
+            fall: 0.22,
+            motion_release: 0.25,
+        }
+    }
+}
+
+impl Smoothing {
+    /// Clamp to the ranges the filter is meaningful over.
+    ///
+    /// A weight of 0 would freeze the matte at its first frame and a `motion_release` of 0
+    /// would divide by zero, so neither is left to a config file to get right.
+    pub fn sanitised(self) -> Self {
+        Self {
+            rise: self.rise.clamp(0.01, 1.0),
+            fall: self.fall.clamp(0.01, 1.0),
+            motion_release: self.motion_release.clamp(0.01, 1.0),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MattingError {
@@ -542,7 +578,10 @@ impl Matter {
     /// `rgba` is tightly packed RGBA8 at [`Matter::infer_w`]x[`Matter::infer_h`] — what the
     /// GPU downscale pass produces. Returns the alpha matte as R8 at the same size, ready to
     /// upload.
-    pub fn infer(&mut self, rgba: &[u8]) -> Result<&[u8], MattingError> {
+    ///
+    /// `smoothing` is passed per call rather than stored, so the daemon's "read the live
+    /// config each frame" pattern applies to it with no hidden state to keep in step.
+    pub fn infer(&mut self, rgba: &[u8], smoothing: Smoothing) -> Result<&[u8], MattingError> {
         let px = (self.width * self.height) as usize;
         debug_assert_eq!(rgba.len(), px * 4);
 
@@ -591,7 +630,7 @@ impl Matter {
             self.cross_check(coverage);
         }
 
-        Self::smooth_into(&mut self.smoothed, self.frames, &pha);
+        Self::smooth_into(&mut self.smoothed, self.frames, &pha, smoothing.sanitised());
         for (dst, &v) in self.alpha.iter_mut().zip(self.smoothed.iter()) {
             *dst = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
         }
@@ -712,7 +751,7 @@ impl Matter {
     /// confident, and the hole punched there shows the *blurred* room through the middle of
     /// their sleeve. Rising alpha has no equivalent failure; the worst case is a few
     /// milliseconds of extra subject, which nobody sees.
-    fn smooth_into(smoothed: &mut Vec<f32>, frames: u64, pha: &[f32]) {
+    fn smooth_into(smoothed: &mut Vec<f32>, frames: u64, pha: &[f32], s: Smoothing) {
         // First real frame: nothing to blend against, so take it as-is. Blending against
         // the seeded matte would fade the subject in over the first few frames.
         if frames == 0 || smoothed.len() != pha.len() {
@@ -726,12 +765,12 @@ impl Matter {
             let delta = now - *prev;
 
             // Base weight on the new sample, by direction.
-            let base = if delta < 0.0 { ALPHA_FALL } else { ALPHA_RISE };
+            let base = if delta < 0.0 { s.fall } else { s.rise };
 
             // Release the damping in proportion to how big the change is, so a genuine
             // movement is followed immediately while noise around zero is averaged away.
-            // At |delta| >= MOTION_FULL the new sample is taken essentially whole.
-            let motion = (delta.abs() / MOTION_FULL).min(1.0);
+            // At |delta| >= motion_release the new sample is taken essentially whole.
+            let motion = (delta.abs() / s.motion_release).min(1.0);
             let w = base + (1.0 - base) * motion;
 
             *prev += delta * w;
@@ -911,7 +950,116 @@ mod tests {
     #[allow(non_snake_case)]
     fn Self_smooth(state: &mut Vec<f32>, next: &[f32]) {
         // frames > 0 so the first-frame passthrough does not apply.
-        Matter::smooth_into(state, 1, next);
+        Matter::smooth_into(state, 1, next, Smoothing::default());
+    }
+
+    // --- temporal lag -----------------------------------------------------------------
+    //
+    // The filter's cost, as one number. Everything below exists because "it looks smeary
+    // when I move" is not something you can tune against, and the constants above were
+    // picked by eye.
+
+    /// Where the edge starts, and how many frames it slides for.
+    ///
+    /// The strip is sized from the travel rather than fixed: at 4 px/frame the edge covers
+    /// 236 px, and a strip that runs out mid-slide has no 0.5 crossing left to find.
+    const LAG_START: f32 = 64.0;
+    const LAG_FRAMES: usize = 60;
+
+    /// Sub-pixel position where `v` crosses 0.5, searched in whichever direction it runs.
+    fn crossing(v: &[f32]) -> Option<f32> {
+        for i in 1..v.len() {
+            let (a, b) = (v[i - 1], v[i]);
+            if (a >= 0.5) != (b >= 0.5) {
+                // Linear interpolation between the two straddling samples.
+                return Some(i as f32 - 1.0 + (a - 0.5) / (a - b));
+            }
+        }
+        None
+    }
+
+    /// Frames of lag the temporal filter adds to a soft edge moving at `speed` px/frame.
+    ///
+    /// A *hard* step costs nothing here — a full-swing delta releases the damping
+    /// completely, which is what `a_large_change_is_followed_almost_immediately` already
+    /// covers. So this measures the case a real matte actually presents: a ramp several
+    /// pixels wide sliding across the frame. That is where the filter lags, and the ramp
+    /// *is* the edge region, which is exactly where a lagging alpha shows as fringing.
+    ///
+    /// `falling` picks which side of the subject is under test. Both directions matter and
+    /// they do not cost the same: `ALPHA_FALL` damps harder than `ALPHA_RISE`, so the
+    /// trailing edge of a moving limb lags more than its leading edge — and a difference
+    /// between the two sides is what reads as an edge smearing rather than merely trailing.
+    fn edge_lag_frames(ramp_px: f32, speed: f32, falling: bool) -> f32 {
+        // A ramp centred on `c`, which slides *right* by `speed` each frame.
+        //
+        // `falling` puts the foreground on the right, so the foreground region retreats
+        // rightward and a pixel's alpha decreases as the edge passes it. Getting this
+        // round the wrong way makes the test measure `ALPHA_RISE` while reporting it as
+        // fall, and the two differ by more than 2x — so the sign is the whole measurement.
+        let travel = speed * (LAG_FRAMES - 1) as f32;
+        let width = (LAG_START + travel + 4.0 * ramp_px).ceil() as usize;
+        let edge_at = |c: f32| -> Vec<f32> {
+            (0..width)
+                .map(|i| {
+                    let d = if falling { i as f32 - c } else { c - i as f32 };
+                    (d / ramp_px + 0.5).clamp(0.0, 1.0)
+                })
+                .collect()
+        };
+
+        let mut smoothed = Vec::new();
+        for f in 0..LAG_FRAMES {
+            let pha = edge_at(LAG_START + speed * f as f32);
+            Matter::smooth_into(&mut smoothed, f as u64, &pha, Smoothing::default());
+        }
+
+        let truth = LAG_START + speed * (LAG_FRAMES - 1) as f32;
+        let seen = crossing(&smoothed).expect("the edge must cross 0.5 somewhere");
+        // Positive means the filter's edge is behind where the subject actually is.
+        (truth - seen).abs() / speed
+    }
+
+    /// The temporal filter's cost, in the unit that is actually visible.
+    ///
+    /// Lag in *frames* is a misleading number on its own, because what anyone sees is the
+    /// alpha edge in the wrong *place*, and `px = frames * speed` — the two terms move in
+    /// opposite directions here. Slow motion lags the most frames and the fewest pixels.
+    /// Measured in pixels the filter costs well under half a matte pixel at every speed,
+    /// which is why it is *not* a meaningful source of fringing.
+    ///
+    /// It is worth measuring anyway, because these constants are now user-settable: this
+    /// is the guard that stops somebody turning `matte_fade_*` into a smear.
+    ///
+    /// For scale, the thing that *does* matter: a matte computed one frame late is
+    /// misaligned by a full `speed` pixels — 4 px at 4 px/frame, against the 0.4 px here.
+    #[test]
+    fn temporal_smoothing_costs_well_under_a_pixel() {
+        let ramp = 8.0;
+        let mut worst_px: f32 = 0.0;
+
+        eprintln!("  speed   fall(frames)  rise(frames)   fall(px)  rise(px)  1-frame lag(px)");
+        for speed in [0.25f32, 0.5, 1.0, 2.0, 4.0] {
+            let (fall, rise) = (
+                edge_lag_frames(ramp, speed, true),
+                edge_lag_frames(ramp, speed, false),
+            );
+            eprintln!(
+                "{speed:>7}   {fall:>11.2}  {rise:>12.2}   {:>8.2}  {:>8.2}  {speed:>14.2}",
+                fall * speed,
+                rise * speed,
+            );
+            worst_px = worst_px.max(fall * speed).max(rise * speed);
+        }
+
+        // Half a matte pixel is ~1.9 px at 1080p once the guided filter has upsampled it —
+        // below what anyone can see, and an order of magnitude under the misalignment a
+        // one-frame-late matte produces at any realistic speed.
+        assert!(
+            worst_px <= 0.5,
+            "temporal smoothing displaces the edge by {worst_px:.2} matte px; \
+             the filter is smearing the edge it exists to stabilise"
+        );
     }
 
     /// Guards a bug that produced a *plausible* matte rather than an error.
@@ -978,7 +1126,10 @@ mod tests {
         // more than one is the only way to exercise the state hand-off at all.
         let mut last_len = 0;
         for _ in 0..8 {
-            last_len = m.infer(&frame).expect("inference must succeed").len();
+            last_len = m
+                .infer(&frame, Smoothing::default())
+                .expect("inference must succeed")
+                .len();
         }
         assert_eq!(
             last_len, px,

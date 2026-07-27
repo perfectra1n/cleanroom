@@ -169,6 +169,114 @@ and convert with the same matrix — then the error is **0**.
 
 ## ONNX Runtime / matting
 
+### The matte was a frame behind the image, and every throughput metric said "fine"
+
+Reported as "the model doesn't seem to be working that quickly — weird fringing and lagging
+when I move around". The obvious reading is that inference is missing its budget. It was
+not: the daemon reported **29.9 fps, 0 dropped, decode 7.47 ms + gpu 1.46 ms + matting
+10.40 ms = 19.3 ms** inside a 33.3 ms frame. Fourteen milliseconds of headroom.
+
+The defect was not speed but **alignment**. `run_once` composited the frame *first* and
+inferred *afterwards*, so the alpha produced from frame N was uploaded for frame N+1. At
+30 fps that is 33.3 ms of misalignment between an image and its own alpha:
+
+- **Leading edge of motion** — the subject has moved into pixels the matte does not cover,
+  so they get blurred along with the room.
+- **Trailing edge** — the matte still claims foreground where the subject has left, so a
+  sharp band of stale background is keyed in and drags behind the movement.
+
+It was justified in a comment as invisible, and as avoiding a pipeline stall. Neither held.
+It was not invisible — it is the whole reported symptom. And it avoided no stall: `process`
+already blocked on a readback and `read_matte_input` blocked on a second, for **three**
+queue submissions per frame.
+
+**The guided filter amplifies it rather than hiding it.** `run_guided` fits its
+coefficients on the correct pair — the guidance image and the matte from the *same* frame —
+but the composite *consumed* them a frame later, evaluating `alpha = a*I + b` against the
+next frame's luma. `a` is large at an edge by construction, because that is what makes the
+alpha track luminance. A stale high-gain local linear model does not decay into soft
+ghosting; it extrapolates, and a moving edge picks up a luminance-keyed fringe. That is why
+the artifact reads as *weird* rather than merely delayed.
+
+**The fix is pure reordering** — `unpack -> downscale -> infer -> composite`, as
+`begin_frame` / `set_matte` / `finish_frame`. Same passes, same readback bytes, same two
+stalls, one *fewer* submission, and no added end-to-end latency because `sink.write`
+already ran after inference. Measured before and after on the reference machine:
+
+| | fps | decode | gpu | matting | total | dropped |
+|---|-----|--------|-----|---------|-------|---------|
+| before | 29.9 | 7.47 | 1.46 | 10.40 | 19.33 | 0 |
+| after | 29.9–30.1 | 7.43 | 1.65 | 9.91 | 18.99 | 0 |
+
+`gpu` rises and `matting` falls by about the same amount: the guided pass moved out of the
+matting span and into the composite's command buffer, where it belongs.
+
+`finish_frame` deliberately takes **no frame argument**. The bug was never in
+`FramePipeline`, which faithfully applied whatever matte was set — it was in the caller's
+ordering. Removing the frame parameter is what stops that ordering being something a caller
+can get wrong, and `read_matte_input` is gone so "composite now, infer later" no longer has
+a way to spell itself.
+
+**The lesson worth keeping:** fps and dropped-frame counters cannot see a frame-offset bug.
+Both were perfect throughout. A pipeline can be exactly on time and still be wrong.
+
+### Temporal smoothing was not the culprit, and measuring in frames says otherwise
+
+The obvious second suspect was the alpha EMA (`ALPHA_FALL = 0.22`, `MOTION_FULL = 0.25`),
+which does lag: 1.27 frames on a slow trailing edge. That number is misleading on its own.
+What anyone *sees* is the edge in the wrong place, and `pixels = frames * speed` — the two
+terms move in opposite directions, so the slowest motion lags the most frames and the
+fewest pixels:
+
+| speed (matte px/frame) | fall lag | displacement | 1-frame-late matte |
+|---|---|---|---|
+| 0.25 | 1.27 fr | **0.32 px** | 0.25 px |
+| 1.0 | 0.34 fr | **0.34 px** | 1.00 px |
+| 4.0 | 0.00 fr | **0.00 px** | 4.00 px |
+
+Worst case the filter displaces the edge by 0.38 matte pixels — about 1.4 px at 1080p —
+against a full `speed` pixels for the misalignment above. Two orders of magnitude apart at
+any realistic speed. The constants were left alone and exposed as `video.matte_fade_*` for
+taste; `temporal_smoothing_costs_well_under_a_pixel` is the guard against retuning them
+into a smear. **Pick the unit the user actually perceives before concluding anything.**
+
+### `tighten` sharpens the edge while eroding it, which is the opposite of softening
+
+`alpha = (alpha - t) / (1 - t)` is a shift *and* a rescale, so its gain is `1/(1 - t)`. A
+hand-tuned `matte_tighten = 0.34` — reached for to fight the fringing above — was also
+making the ramp 51% steeper. Anyone chasing a softer edge with this knob is turning the
+wrong one, and turning it the wrong way.
+
+`video.matte_feather` is the width control: it widens the ramp about whatever crossing
+`tighten` chose, leaving the crossing alone. It lives in the composite shader rather than
+in the matting crate on purpose — anything softened at 512x288 is re-sharpened by
+`a*I + b` on the way up to full resolution.
+
+### Adding a config field is not a safe *downgrade*
+
+`Config` is `deny_unknown_fields`, and the daemon refuses to start on a config it cannot
+parse rather than overwrite it with defaults. Both are right. Together they mean a **newer
+daemon writing a new key takes the older binary down**, hard:
+
+```
+config is corrupt; attempting to recover from backup
+backup is also unparseable
+Error: unknown field `matte_fade_fall`, expected one of `enabled`, `device`, ...
+```
+
+Hit for real while A/B-testing this change: the dev build wrote `matte_fade_*` into
+`~/.config/cleanroom/config.toml`, and handing the devices back to the packaged daemon left
+no camera at all. The backup does not help, because it gets rewritten too.
+
+Adding fields is still forward-compatible — `#[serde(default)]` on every new one means an
+*older* config loads fine in a newer daemon, which is the direction that matters for
+upgrades. Just know that rolling back needs the new keys removed first:
+
+```
+sed -i '/^matte_feather = /d; /^matte_fade_/d; /^matte_motion_release = /d' \
+    ~/.config/cleanroom/config.toml
+```
+
 ### A Conv with C_in divisible by 3 but not by 4 is computed wrong on the WebGPU EP
 
 **This is the root cause of the entry below, found after every whole-model hypothesis had
