@@ -127,11 +127,21 @@ described.sort_by_key(|(a, _)| match a.get_info().device_type {
 A pin that cannot be honoured is an **error**, never a fallback — someone who pinned a GPU
 would otherwise never learn they were ignored.
 
-### One WGSL entry point per file
+### One *declaration* per binding slot, not one entry point per file
 
-Bindings cannot be shared across entry points in a single module, so `@group(0) @binding(0)`
-declared twice fails to compile. The colour matrix lives in `shaders/colour.wgsl` and is
-concatenated by the host, because naga has no `include`.
+A binding slot can only be declared once in a module, so `@group(0) @binding(0)` written
+twice fails to compile. That is the actual constraint, and it is easy to over-read as "one
+entry point per file" — `blur.wgsl` has three, sharing the same declarations.
+
+What matters when entry points in one module need *different* bindings: with `layout: None`,
+wgpu derives each pipeline's bind group layout from the resources that entry point actually
+uses, not from everything declared in the module. So `blur.wgsl` can declare a matte at
+binding 4 that only `down_weighted` reads, and the `down` and `up` pipelines validate without
+it rather than demanding a binding they never touch. Verified on this stack; do not assume it
+without checking, because the failure would be a validation error at pipeline creation.
+
+Genuinely shared *code* still has to be concatenated by the host — the colour matrix lives in
+`shaders/colour.wgsl` and is prepended, because naga has no `include`.
 
 ### Readback rows must be 256-byte aligned
 
@@ -164,6 +174,65 @@ A round-trip test built in YUV directly produced max luma error 15 and looked li
 matrix. It wasn't: arbitrary Y/Cb/Cr combinations fall outside the RGB gamut, the shader
 clamps them correctly, and the round-trip cannot recover them. Build test frames from **RGB**
 and convert with the same matrix — then the error is **0**.
+
+### Blurring the whole frame puts the subject inside its own background
+
+Reported as "a smeared copy of me slides around behind me when I move quickly".
+
+The obvious way to build a background blur is: blur the frame, then composite the sharp
+subject over it with the matte. That is wrong, and it is wrong in a way that only shows up
+under motion. The blurred plane contains a low-frequency copy of the *subject*, so when they
+move, their own smear slides around behind them. It also haloes: the subject's colours bleed
+outward across the silhouette, which is the bright ring people notice against a dark wall.
+
+Quantified here by mutation — a white subject against a mid-grey backdrop, sampling the
+background just outside the silhouette:
+
+|  | background luma | true backdrop |
+|---|---|---|
+| blur the whole frame | **173** | 125 |
+| weighted | **125** | 125 |
+
+Forty-eight levels of subject were being mixed into its own background.
+
+**The fix is normalized convolution, and on a pyramid it is nearly free.** Accumulate each
+tap as `(rgb * (1 - alpha), 1 - alpha)` and divide the weight back out at the end. Two things
+make it cheap: the pyramid textures are already RGBA with an unused alpha channel, and every
+pass after the first sums `vec4` linearly, so the weight propagates through the rest of the
+pyramid with no code at all. Only level 0 — the one pass that reads the full-resolution
+frame — needs a weighted variant.
+
+Two things that are easy to get wrong:
+
+**The pyramid has to be `Rgba16Float`, not `Rgba8Unorm`.** The weight is divided back out, so
+quantisation error is amplified by `1/w`. An isolated background pixel in a narrow gap — say
+between an arm and the torso — sits near `w = 0.05`, where 8-bit recovers with about ten
+levels of error and bands visibly across a region that is supposed to be smooth.
+
+**Guard the zero-weight case.** With no matting model loaded the matte is a single opaque
+texel, so every tap has zero background weight and the divide falls on its `max()` floor.
+That is harmless *only* because alpha is 1 there and the composite takes the foreground
+whole — the meaningless background is never sampled. Worth an assertion rather than a
+comment: a regression would black the entire frame the moment the model failed to load.
+
+The exclusion mask can come from the raw matte rather than the guided filter's refined
+alpha. It is about to be blurred by the whole pyramid, so its edge precision is irrelevant,
+and a bilinearly-stretched matte gives a *softer* exclusion than a hard silhouette would.
+
+### Adapter selection means throughput checks measure the wrong GPU
+
+`gpu_check` called `Gpu::new(None)`, which uses the same "prefer discrete" selection the
+daemon does. On the reference machine that always picks the RTX 5090, so the slow-hardware
+conformance target — the Radeon iGPU, 3-4x the frame time — was never exercised and
+"fits 30fps" was being answered for the wrong device. It takes an optional render node now:
+
+```sh
+nix develop -c cargo run --release -p cleanroom-gpu --example gpu_check -- /dev/dri/renderD129
+```
+
+The difference is the whole point of measuring. Adding the weighted blur above cost nothing
+measurable on the 5090 (0.86 → 0.85 ms at max blur, inside noise) and 0.29 ms on the iGPU
+(2.77 → 3.06). Both fit; only one of them tells you anything.
 
 ---
 
@@ -251,6 +320,103 @@ wrong one, and turning it the wrong way.
 `tighten` chose, leaving the crossing alone. It lives in the composite shader rather than
 in the matting crate on purpose — anything softened at 512x288 is re-sharpened by
 `a*I + b` on the way up to full resolution.
+
+### You cannot feather an edge by remapping alpha values
+
+The correction to the claim above, which was true in intent and false as shipped. The first
+implementation of `matte_feather` widened the ramp in *alpha space*:
+
+```wgsl
+let c = (1.0 + comp.tighten) * 0.5;
+let w = clamp((1.0 - comp.tighten) * 0.5 * (1.0 + 3.0 * comp.feather), 0.01, 0.5);
+alpha = smoothstep(c - w, c + w, alpha);
+```
+
+Evaluated across the slider's actual range, `w` never moves:
+
+| feather | tighten=0.0 | tighten=0.12 | tighten=0.34 |
+|---|---|---|---|
+| 0.05 | w=0.5 | w=0.5 | w=0.3795 |
+| 0.1 | w=0.5 | w=0.5 | w=0.429 |
+| 1.0 | w=0.5 | w=0.5 | w=0.5 |
+
+At `tighten = 0` — the default for blur — `(1 - 0) * 0.5` already sits on the clamp ceiling,
+so **every non-zero feather produces the identical curve**. The control had two states, off
+and one fixed shape. For replace it saturated by about 0.05, so 95% of the travel was inert.
+
+And the shape it reached was the wrong one. `smoothstep(0, 1, a)` has gradient 1.5 at the
+midpoint, so the knob labelled "feather" made the edge **harder** through the transition and
+softened only the tails.
+
+**The clamp was not the bug; it is the boundary of the technique.** Remapping alpha *values*
+can move where the edge sits and reshape its profile, but the transition still lands on
+exactly the same pixels. `w = 0.5` centred at `0.5` already spans the whole `[0,1]` alpha
+range — there is nothing left to widen. Feathering is inherently a *spatial* operation: a
+pixel's alpha has to be influenced by its neighbours' or the edge cannot get wider.
+
+So it is now an average of the resolved alpha over a disc, in the composite, at full
+resolution — full resolution for the reason in the entry above, that anything softened at
+512x288 is re-sharpened on the way up.
+
+The sample pattern took two attempts, and the failure is the interesting part. A hexagonal
+ring of six taps plus the centre *looks* like a disc, but projected onto an edge normal it
+collapses to three distinct offsets — `0`, `±r/2`, `±r` — with a hole between them. Measured
+on a hard test edge that gave alpha 0.14 / 0.43 / 0.57 / 0.86 and nothing in between: a wide
+edge made of four coarse steps, which reads as banding, not softness. A twelve-tap Vogel
+disc (radius `sqrt((i + 0.5)/N)`, golden-angle rotation) spreads taps evenly, so every normal
+direction sees twelve distinct offsets:
+
+```
+feather 0     width 0   235 235 235 235 145 145 145 145
+feather 0.25  width 2   235 235 235 217 160 145 145 145
+feather 0.5   width 4   235 230 203 170 151 145 145 145
+feather 1     width 6   234 226 214 193 178 162 154 147
+```
+
+**Measure the profile, not just the width.** A ramp that is wide but takes three values is
+not a soft edge, and a width figure alone cannot tell the two apart.
+
+One trap in testing it: the split white/black frame the other GPU tests use puts a *colour*
+edge in the same place as the alpha edge, and `Remove` then mixes flat green against black,
+so composited luma dips **below** the background plateau — 97 in the middle of a 145..235
+ramp. Any threshold-based band detector silently loses half the transition. Use a uniform
+frame and let luma be a direct readout of alpha.
+
+### A knob that writes, persists and reads back, and still does nothing
+
+`video.guided_filter`, `video.guided_radius` and `video.guided_eps` were write-only for
+their whole existence. `pipe.set_guided(...)` was called exactly once, before the frame loop,
+from the config snapshot `run_once` opened with, and never again.
+
+This is worse than a control that plainly does nothing, because every check a user can run
+says it worked: the value validates, persists to `config.toml`, and `cleanroom-ctl get` and
+the GUI slider both read it back correctly. It starts taking effect only when something
+*unrelated* restarts the pipeline — so toggling blur off and on makes it appear to work.
+
+The gap is structural, and worth understanding before adding a knob. `needs_restart` is a
+**deny-list**: a setting it does not name is *assumed* live. For almost everything that
+assumption holds for free, because `Look` and `Smoothing` are rebuilt from the live config
+every frame and cost nothing to pass again. Anything that instead *reconfigures* the
+pipeline needs its previous value remembered so a change can be detected — which
+`audio_pipeline` has always done correctly for `attenuation_db`:
+
+```rust
+if c.audio.denoise.attenuation_db != applied_atten {
+    applied_atten = c.audio.denoise.attenuation_db;
+    d.set_attenuation(applied_atten);
+}
+```
+
+`LiveSettings` in `video_pipeline.rs` is that, for the guided fields. Note what the fix is
+*not*: adding them to `needs_restart`. A restart drops the loopback fd, and with
+`exclusive_caps=1` the node reverts to output-only, so every app in the call loses the
+camera — see the entry on that below. Reopening the devices to change a filter radius would
+be a spectacular price.
+
+The guard is `every_video_setting_is_classified_as_live_restart_or_inert`: it walks
+`settings::keys()` and fails unless every `video.*` key is named in exactly one of three
+lists. Adding a knob now fails the build until somebody classifies it. Its limit is worth
+stating — it proves a key was *classified*, not that the frame loop reads it.
 
 ### Adding a config field is not a safe *downgrade*
 

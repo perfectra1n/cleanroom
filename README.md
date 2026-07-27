@@ -13,7 +13,7 @@ Maxine), and does not lie to you about whether the GPU is being used.
 |---|---|
 | Virtual camera | `/dev/video0` → `/dev/video10`, MJPG 1080p30, power-save on real consumer events |
 | PipeWire camera | `cleanroom_cam` published as `Video/Source` + `media.role=Camera` for Flatpak and portal apps |
-| Background | Blur, replace (cover-fitted image), green key; guided-filter matte upsample |
+| Background | Blur, replace (cover-fitted image), green key; guided-filter matte upsample; the blur excludes the subject, so it carries no ghost of you |
 | Virtual microphone | `cleanroom_mic` with DeepFilterNet, ~40 dB measured suppression, released when nothing is listening |
 | GPU | RVM matting at 9.6 ms/frame on an RTX 5090, 30 fps sustained end to end |
 | Desktop | GUI with tray, preview, device pickers; autostart; suspend/resume; `cleanroom-ctl` parity |
