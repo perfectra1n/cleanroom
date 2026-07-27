@@ -75,6 +75,42 @@ docs/
   shortcuts.md      Binding compositor keys to cleanroom-ctl
 ```
 
+## Installing
+
+**Nix / NixOS**
+
+```sh
+nix profile install github:perfectra1n/cleanroom      # or .#cleanroom from a clone
+```
+
+As a NixOS module, which also provisions v4l2loopback, the WirePlumber rules and rtkit:
+
+```nix
+{
+  inputs.cleanroom.url = "github:perfectra1n/cleanroom";
+  # ...
+  imports = [ inputs.cleanroom.nixosModules.default ];
+  services.cleanroom.enable = true;
+}
+```
+
+**Arch** — `packaging/aur/PKGBUILD`. **Debian / Fedora** — `nfpm pkg -f packaging/nfpm.yaml`.
+Both are written but have never been built; the reference machine is NixOS.
+
+### Do not run the binaries out of `target/`
+
+`cargo build` produces binaries that work *only* inside `nix develop`, and the way they
+fail outside it is unhelpful: `wgpu` dlopens `libvulkan.so.1` and Slint dlopens
+`libwayland-client.so`, so neither appears in `DT_NEEDED` and `ldd` reports the binary as
+fully resolved right up until it exits with `Could not initialize backend`. Launched from a
+desktop entry, where there is no terminal, that is invisible — the window simply never
+appears.
+
+The packaged builds wrap every binary with the right `LD_LIBRARY_PATH`, which is what makes
+them launchable from a dock, a `.desktop` file or D-Bus activation. For running a working
+copy from a checkout, use `mise run gui` / `mise run daemon`, which go through the dev
+shell.
+
 ## Using it
 
 ```sh
@@ -84,6 +120,10 @@ cleanroomd                        # or let D-Bus activation start it
 cleanroom-ctl set video.background blur
 cleanroom-gui                     # optional; the daemon does not need it
 ```
+
+`cleanroom-ctl autostart` reports which of the three start mechanisms your session actually
+supports and sets it up; on a compositor that supports none of them it prints the line to
+paste. D-Bus activation works regardless, so any `cleanroom-ctl` call starts the daemon.
 
 ## Building
 

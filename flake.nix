@@ -91,10 +91,16 @@
             runHook postUnpack
           '';
 
+          # Name the two artefacts rather than copying the build directory wholesale.
+          # `cp -r . $out/` also captured dist.tar — the 109 MiB intermediate this phase
+          # had just extracted, i.e. half the closure was a second copy of its own input —
+          # plus the builder's env-vars dump. Listing them explicitly also means a change
+          # in the upstream archive layout fails the build instead of silently producing
+          # an output with no libraries in it.
           installPhase = ''
             runHook preInstall
-            mkdir -p $out
-            cp -r ./*/ $out/ 2>/dev/null || cp -r . $out/
+            install -Dm755 -t "$out" libwebgpu_dawn.so
+            install -Dm644 -t "$out" libonnxruntime.a
             runHook postInstall
           '';
         };
@@ -177,12 +183,40 @@
                 --prefix LD_LIBRARY_PATH : "${ortPrebuilt}:${pkgs.lib.makeLibraryPath runtimeLibs}"
             done
 
+            # share/systemd/user, not lib/systemd/user. systemd's *user* manager searches
+            # $XDG_DATA_DIRS/systemd/user, and a nix profile contributes
+            # ~/.nix-profile/share — it never looks under lib/, which is a system-manager
+            # path. Installed to lib/ the unit is simply invisible, and because the D-Bus
+            # service file below delegates activation with SystemdService=, that also
+            # silently breaks starting the daemon on demand. The NixOS module declares its
+            # own unit and is unaffected either way.
             install -Dm644 packaging/systemd/cleanroomd.service \
-              "$out/lib/systemd/user/cleanroomd.service"
+              "$out/share/systemd/user/cleanroomd.service"
             install -Dm644 packaging/systemd/io.github.perfectra1n.Cleanroom.service \
               "$out/share/dbus-1/services/io.github.perfectra1n.Cleanroom.service"
             install -Dm644 packaging/desktop/io.github.perfectra1n.Cleanroom.desktop \
               "$out/share/applications/io.github.perfectra1n.Cleanroom.desktop"
+
+            # The three unit/entry files are written for FHS distros, where /usr/bin is
+            # both correct and stable — deb, rpm and the AUR package all install there.
+            # Nothing is ever at /usr/bin on NixOS, so installing them verbatim gives a
+            # systemd unit and a D-Bus service that fail with "No such file or directory"
+            # and a launcher entry that silently does nothing. Rewrite the paths to this
+            # derivation's own wrappers, which is also what makes LD_LIBRARY_PATH reach
+            # the daemon: the bare ELF next to the wrapper would start and then fail to
+            # dlopen libvulkan.
+            substituteInPlace \
+              "$out/share/systemd/user/cleanroomd.service" \
+              "$out/share/dbus-1/services/io.github.perfectra1n.Cleanroom.service" \
+              --replace-fail /usr/bin/cleanroomd "$out/bin/cleanroomd"
+
+            # Exec=cleanroom-gui relies on PATH, which a .desktop launched by the
+            # compositor does not reliably inherit — `nix profile` puts the binary in
+            # ~/.nix-profile/bin, which is on an interactive shell's PATH but not
+            # necessarily on the session bus activation environment's.
+            substituteInPlace \
+              "$out/share/applications/io.github.perfectra1n.Cleanroom.desktop" \
+              --replace-fail "Exec=cleanroom-gui" "Exec=$out/bin/cleanroom-gui"
 
             for size in 16 24 32 48 64 128 256; do
               install -Dm644 \

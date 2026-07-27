@@ -87,10 +87,34 @@ fn desktop_honours_xdg_autostart() -> bool {
 /// Absolute is not a nicety. systemd's xdg-autostart generator emits **nothing at all** for
 /// a relative `Exec=`, silently, so a desktop entry saying `Exec=cleanroomd` produces no
 /// unit and no error and no autostart.
+///
+/// The wrapper unwrapping is the same kind of trap. Nix's `makeWrapper` installs the real
+/// ELF as `.<name>-wrapped` next to a shell script that sets `LD_LIBRARY_PATH`, and
+/// `/proc/self/exe` names the ELF, never the script. Handing that path back would produce
+/// an autostart line that runs the daemon with no library path at all, so it would die on
+/// its first `dlopen` of libvulkan — which is precisely the silent non-start this module
+/// exists to prevent, reintroduced one layer down.
 fn own_exe() -> Option<String> {
-    std::fs::read_link("/proc/self/exe")
-        .ok()
-        .map(|p| p.display().to_string())
+    let path = std::fs::read_link("/proc/self/exe").ok()?;
+    Some(unwrap_nix_wrapper(path).display().to_string())
+}
+
+/// Map `…/bin/.cleanroomd-wrapped` back to `…/bin/cleanroomd`.
+///
+/// Only when the wrapper is actually there: a binary legitimately named `.foo-wrapped`
+/// with no sibling should be reported as itself rather than as a path that does not exist.
+fn unwrap_nix_wrapper(path: PathBuf) -> PathBuf {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return path;
+    };
+    let Some(inner) = name
+        .strip_prefix('.')
+        .and_then(|n| n.strip_suffix("-wrapped"))
+    else {
+        return path;
+    };
+    let wrapper = path.with_file_name(inner);
+    if wrapper.exists() { wrapper } else { path }
 }
 
 /// The line to paste into a compositor config when nothing else works.
@@ -341,6 +365,32 @@ mod tests {
     fn the_desktop_entry_uses_an_absolute_exec() {
         let e = desktop_entry("/usr/bin/cleanroomd");
         assert!(e.contains("Exec=/usr/bin/cleanroomd"));
+    }
+
+    /// Under Nix, /proc/self/exe is the inner ELF, which has no LD_LIBRARY_PATH and so
+    /// cannot dlopen libvulkan. Autostart must name the wrapper that does.
+    #[test]
+    fn a_nix_wrapped_binary_reports_its_wrapper() {
+        let dir = std::env::temp_dir().join("cleanroom-unwrap-test/bin");
+        std::fs::create_dir_all(&dir).expect("temp bin dir");
+        let wrapper = dir.join("cleanroomd");
+        let inner = dir.join(".cleanroomd-wrapped");
+        std::fs::write(&wrapper, b"#!/bin/sh\n").expect("wrapper");
+        std::fs::write(&inner, b"\x7fELF").expect("inner");
+
+        assert_eq!(unwrap_nix_wrapper(inner.clone()), wrapper);
+        // An ordinary binary is left exactly as found.
+        assert_eq!(unwrap_nix_wrapper(wrapper.clone()), wrapper);
+
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// Without the sibling wrapper there is nothing better to report, so report the ELF
+    /// rather than a path that does not exist.
+    #[test]
+    fn a_lone_wrapped_name_is_left_alone() {
+        let orphan = std::env::temp_dir().join("cleanroom-no-such-dir/.cleanroomd-wrapped");
+        assert_eq!(unwrap_nix_wrapper(orphan.clone()), orphan);
     }
 
     /// The basename, Icon, StartupWMClass and the GUI's app_id must all be the same string,

@@ -833,6 +833,70 @@ at boot with no session.
   it makes systemd's xdg-autostart generator emit no unit at all.
 - Absolute `Exec=` — the generator silently emits nothing for a relative path.
 
+### A `.desktop` pointing into `target/` launches nothing, silently
+
+**Symptom.** Clicking Cleanroom in the launcher does nothing at all — no window, no error,
+no process. Running the same binary from a terminal inside `nix develop` works perfectly.
+
+**Cause.** `wgpu` dlopens `libvulkan.so.1` and Slint/winit dlopen `libwayland-client.so`.
+Because they are dlopened, they are not in `DT_NEEDED`, so `ldd` reports the binary as
+**fully resolved** and the `RUNPATH` cargo baked in lists only the real link-time deps
+(pipewire, libjpeg-turbo, fontconfig). The libraries are found only via the
+`LD_LIBRARY_PATH` the dev shell exports. A desktop entry inherits none of it, so the
+process dies immediately:
+
+```
+Error: Could not initialize backend.
+Error from Winit backend: ... The wayland library could not be loaded
+```
+
+and with `Terminal=false` nobody ever sees that line.
+
+**Fix.** Desktop entries must point at a *packaged* binary. `nix profile install .#cleanroom`
+wraps all three with the right `LD_LIBRARY_PATH`; deb/rpm/AUR install to `/usr/bin`. From a
+checkout, use `mise run gui`, which goes through the dev shell. Never point `Exec=` at
+`target/debug` or `target/release`.
+
+### `$XDG_DATA_HOME` outranks the package's own entry
+
+A leftover `~/.local/share/applications/io.github.perfectra1n.Cleanroom.desktop` **shadows**
+the packaged one, because `XDG_DATA_HOME` is searched before every entry in
+`XDG_DATA_DIRS`. Installing the package correctly is not enough if a stale hand-written
+entry is still sitting there — remove it, or it keeps winning.
+
+### Nix: user units go in `share/systemd/user`, not `lib/systemd/user`
+
+systemd's **user** manager searches `$XDG_DATA_DIRS/systemd/user`, to which a nix profile
+contributes `~/.nix-profile/share`. It never looks under `lib/`, which is a *system*-manager
+path. A unit installed to `$out/lib/systemd/user` is simply invisible — and because the
+D-Bus service file delegates with `SystemdService=cleanroomd.service`, that silently breaks
+on-demand activation too, which is the only start mechanism that works when
+`graphical-session.target` never activates.
+
+Check with `systemctl --user cat cleanroomd.service`: it must resolve to a real path.
+
+### The shipped unit files are FHS, and Nix has no `/usr/bin`
+
+`packaging/systemd/*.service` and `packaging/desktop/*.desktop` hardcode
+`/usr/bin/cleanroomd` and `Exec=cleanroom-gui`, which is right for deb, rpm and the AUR
+package and wrong for Nix. `flake.nix`'s `postInstall` rewrites them with
+`substituteInPlace --replace-fail`. Use `--replace-fail`, never `--replace`: if the source
+files are edited later the build then fails loudly instead of shipping a unit that points at
+a binary that does not exist.
+
+### `/proc/self/exe` under Nix is `.name-wrapped`, which must not be handed to the user
+
+`makeWrapper` installs the real ELF as `.cleanroomd-wrapped` beside a shell script that sets
+`LD_LIBRARY_PATH`, and `/proc/self/exe` names the ELF, never the script. `cleanroom-ctl
+autostart` printed that path as its `exec-once =` line, so pasting it would have started the
+daemon *bypassing the wrapper* — dying at the first `dlopen` of libvulkan, which is exactly
+the silent non-start `autostart.rs` exists to prevent, one layer down. `own_exe()` now maps
+`.<name>-wrapped` back to the sibling wrapper when one exists.
+
+Note the printed path is a `/nix/store` path, which changes on every rebuild: an `exec-once`
+line pasted into a compositor config will keep running the *old* build after
+`nix profile upgrade`. Prefer `~/.nix-profile/bin/cleanroomd` there.
+
 ### A worker thread that reports its own health cannot report its own death
 
 `run_once` returned `Ok(())` both for "the stop flag is set" and for "config changed, reopen
