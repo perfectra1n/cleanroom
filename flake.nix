@@ -325,6 +325,27 @@
             # and there is no Dawn in the store. The WebGPU EP comes from ort's prebuilt.
             export ORT_SYS_NIXPKGS_DYLIB="${pkgs.onnxruntime}/lib/libonnxruntime.so"
 
+            # Lavapipe, mesa's software Vulkan implementation. Point VK_DRIVER_FILES at
+            # this to get an adapter on a machine that has no GPU — which is what CI does,
+            # and how you reproduce a CI-only GPU failure locally:
+            #
+            #   VK_DRIVER_FILES=$CLEANROOM_LAVAPIPE_ICD mise run spike:rvm
+            #
+            # It is exported rather than discovered because discovery is what broke: CI
+            # used to run `find /nix/store -name lvp_icd.x86_64.json | head -1`, which
+            # matched nothing (mesa was not in this shell's closure at all), and `dirname`
+            # of that empty string yields "." — so VK_DRIVER_FILES became the relative
+            # path "./lvp_icd.x86_64.json", every adapter enumeration came back empty, and
+            # the job failed as `NoAdapter` rather than as the path bug it was. Naming the
+            # store path here cannot fail that way, and keeps one definition of the
+            # environment rather than a second, divergent one in the workflow.
+            #
+            # NB: mesa is deliberately NOT added to buildInputs or runtimeLibs. Referring
+            # to it here already pulls it into the shell's closure, and putting its libGL
+            # ahead of /run/opengl-driver on the library path would make a real GPU harder
+            # to reach locally, not easier.
+            export CLEANROOM_LAVAPIPE_ICD="${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json"
+
             echo "cleanroom devshell"
             echo "  rustc            $(rustc --version | cut -d' ' -f2)"
             echo "  vulkan devices   $(vulkaninfo --summary 2>/dev/null | grep -c deviceName || echo '?')"
