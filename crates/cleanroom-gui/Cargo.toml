@@ -13,8 +13,9 @@ path = "src/main.rs"
 [dependencies]
 cleanroom-core = { path = "../cleanroom-core" }
 cleanroom-ipc = { path = "../cleanroom-ipc" }
-# The preview consumes the virtual camera exactly as a meeting app would, so it reuses the
-# same V4L2 capture the daemon uses rather than a second implementation.
+# The preview reads the daemon's own PipeWire node rather than the v4l2loopback device,
+# which admits only one streaming capture consumer and must be left to the meeting apps. So
+# this is the shared PipeWire capture plus the YUY2 conversion, not a second implementation.
 cleanroom-video = { path = "../cleanroom-video" }
 
 anyhow.workspace = true

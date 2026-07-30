@@ -1,18 +1,22 @@
-//! Live preview, by consuming the virtual camera like any other app.
+//! Live preview, by consuming the daemon's `cleanroom_cam` PipeWire node.
 //!
-//! The GUI opens `/dev/video10` exactly the way Zoom or Chrome would, which makes the
-//! preview WYSIWYG-correct by construction rather than by careful reimplementation: what
-//! is on screen is literally what a meeting app receives, including the composite, the
-//! matte and the mirror. A separate preview path fed from inside the daemon would be
-//! lower-latency and would also be a second renderer that could disagree with the real one.
+//! The bytes on this node are the *same composited frames* the virtual camera carries — one
+//! pipeline, one composite, one matte, one mirror — so the preview stays WYSIWYG by
+//! construction rather than by carefully reimplementing the renderer. What changed is only
+//! the transport it arrives over.
+//!
+//! That choice is not cosmetic. v4l2loopback admits exactly **one** streaming capture
+//! consumer, so a preview reading the loopback device was a preview that made Chrome, Zoom
+//! or anything else find the camera busy. PipeWire imposes no such limit: any number of
+//! consumers can link to the same node. The loopback device and its single capture slot are
+//! now left entirely to real apps, and this window is not competing for them.
 //!
 //! Two consequences worth being explicit about, because both are visible to the user:
 //!
-//! * An open preview is a **real consumer**, so it wakes the camera out of power save. That
-//!   is arguably correct — you are looking at the picture — but it does mean the LED comes
-//!   on when the window opens.
-//! * The daemon's consumer count includes us, so it will read one higher than the number of
-//!   meeting apps.
+//! * The preview follows the window. A hidden or closed window is not a consumer of
+//!   anything; there is no background stream left running behind it.
+//! * Opening the window does wake the camera, through the PipeWire consumer path rather
+//!   than through the loopback device.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,9 +33,10 @@ pub struct Preview {
 }
 
 impl Preview {
-    /// Start reading `path`, delivering frames through `on_frame` on the Slint event loop.
+    /// Start reading the PipeWire node `node`, delivering frames through `on_frame` on the
+    /// Slint event loop.
     pub fn start(
-        path: String,
+        node: String,
         on_frame: impl Fn(Vec<u8>, u32, u32) + Send + Sync + 'static,
     ) -> Self {
         // Arc rather than a borrow: each frame hands the callback to the Slint event loop,
@@ -42,7 +47,7 @@ impl Preview {
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()
             .name("cleanroom-preview".into())
-            .spawn(move || run(path, stop_thread, on_frame))
+            .spawn(move || run(node, stop_thread, on_frame))
             .expect("spawning the preview thread");
         Self {
             stop,
@@ -53,6 +58,9 @@ impl Preview {
 
 impl Drop for Preview {
     fn drop(&mut self) {
+        // Signal, then join, so the PipeWire stream is disconnected before this returns and
+        // the caller can honestly say the preview has stopped. Bounded at roughly 50 ms:
+        // that is how often `PwCapture::run` polls the stop flag from inside its main loop.
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -67,13 +75,13 @@ impl Drop for Preview {
 /// the event-loop closure where it belongs.
 type FrameSink = Arc<dyn Fn(Vec<u8>, u32, u32) + Send + Sync>;
 
-fn run(path: String, stop: Arc<AtomicBool>, on_frame: FrameSink) {
-    // Reconnect rather than give up. The device disappears whenever the daemon restarts
-    // its pipeline — a resolution change, a resume from suspend — and a preview that goes
-    // permanently black after an unrelated setting change would look like a bug in the
-    // setting.
+fn run(node: String, stop: Arc<AtomicBool>, on_frame: FrameSink) {
+    // Reconnect rather than give up. The node disappears whenever the daemon restarts its
+    // pipeline — a resolution change, a resume from suspend — and it may not exist at all
+    // yet when the window opens first. A preview that went permanently black after an
+    // unrelated setting change would look like a bug in the setting.
     while !stop.load(Ordering::Relaxed) {
-        match stream_once(&path, &stop, &on_frame) {
+        match capture_once(&node, &stop, &on_frame) {
             Ok(()) => return,
             Err(e) => {
                 tracing::debug!(error = %e, "preview stream ended; retrying");
@@ -88,45 +96,35 @@ fn run(path: String, stop: Arc<AtomicBool>, on_frame: FrameSink) {
     }
 }
 
-fn stream_once(
-    path: &str,
-    stop: &AtomicBool,
+/// One capture session, from link-up to the node going away or the stop flag being set.
+///
+/// `PwCapture::run` blocks on its own PipeWire main loop and owns the thread until then, so
+/// everything this function does happens inside the frame callback. The geometry is not
+/// requested: it is whatever the daemon negotiated, handed in with every frame, and it can
+/// change under us when the daemon is reconfigured — which is exactly why the scaler is
+/// given `w` and `h` per frame rather than a size read once at startup.
+fn capture_once(
+    node: &str,
+    stop: &Arc<AtomicBool>,
     on_frame: &FrameSink,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Ask for the preview size and take whatever the driver grants. v4l2loopback serves
-    // the producer's geometry regardless of what a consumer requests, and `Camera::open`
-    // already reads back what it actually got rather than trusting the request.
-    let mut cam = cleanroom_video::Camera::open(path, PREVIEW_W, PREVIEW_H, 30)?;
-    let mode = cam.mode();
-    cam.start()?;
-
+) -> Result<(), cleanroom_video::PwCaptureError> {
+    let should_stop = stop.clone();
+    let sink = on_frame.clone();
     let mut rgb = vec![0u8; (PREVIEW_W * PREVIEW_H * 3) as usize];
 
-    while !stop.load(Ordering::Relaxed) {
-        let frame = cam.next_frame()?;
-        if frame.format != cleanroom_video::PixelFormat::Yuyv {
-            // The daemon publishes YUY2 and nothing else does. Anything here means we are
-            // reading a device we did not expect, and guessing at the layout would draw
-            // garbage rather than fail.
-            return Err(format!("preview expected YUY2, got {:?}", frame.format).into());
-        }
+    cleanroom_video::PwCapture::run(
+        node,
+        move || should_stop.load(Ordering::Relaxed),
+        move |yuy2, w, h| {
+            yuy2_to_rgb_scaled(yuy2, w, h, &mut rgb, PREVIEW_W, PREVIEW_H);
 
-        yuy2_to_rgb_scaled(
-            frame.data,
-            mode.width,
-            mode.height,
-            &mut rgb,
-            PREVIEW_W,
-            PREVIEW_H,
-        );
-
-        // The only safe way to reach UI state from here. If the event loop has already
-        // gone, this returns an error and the frame is simply dropped.
-        let cb = on_frame.clone();
-        let pixels = rgb.clone();
-        let _ = slint::invoke_from_event_loop(move || cb(pixels, PREVIEW_W, PREVIEW_H));
-    }
-    Ok(())
+            // The only safe way to reach UI state from here. If the event loop has already
+            // gone, this returns an error and the frame is simply dropped.
+            let cb = sink.clone();
+            let pixels = rgb.clone();
+            let _ = slint::invoke_from_event_loop(move || cb(pixels, PREVIEW_W, PREVIEW_H));
+        },
+    )
 }
 
 /// YUY2 to RGB with nearest-neighbour downscale, in one pass.
