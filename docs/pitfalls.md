@@ -1056,6 +1056,16 @@ none either, since the host is whichever bar the user runs. So:
 - closing the window **quits the GUI** rather than hiding into a tray that may not exist;
 - everything the tray menu does is reachable from `cleanroom-ctl`.
 
+**Correction: the first bullet was never true, on any desktop with a tray.** It was a design
+statement that never reached code. Slint's default close behaviour is `HideWindow`, and
+quit-on-last-window-closed cannot fire while a tray icon is alive, because the tray is
+itself an event-loop keepalive — "A visible `SystemTrayIcon` keeps the event loop alive the
+same way a visible window does" is documented, intended behaviour. So on quickshell, KDE, or
+anywhere else an SNI host exists, closing the window left a *headless* process running with
+the camera still open — which is the entry immediately below. The second bullet stands, and so does the
+reasoning behind both: the fix was to make the sentence true in both directions — hide to
+tray when there is one, quit when there is not — not to pick one and hope.
+
 Verified working on quickshell: item `Active`, 256×256 ARGB pixmap, `/MenuBar` exported with
 four live items. Slint hardcodes `Id = "slint-tray"` and leaves `Title` empty; `ToolTip` is
 correct and is what hosts show.
@@ -1068,6 +1078,132 @@ for display, so the visible result is right, but a host that matches on `Id` see
 Living with it is deliberate. The alternative is driving `ksni` directly, which means
 re-implementing the menu by hand and giving up the live property binding that keeps the tray
 labels agreeing with the window — a real regression in exchange for a cosmetic fix.
+
+### Chrome cannot open the virtual camera while no Cleanroom window is open
+
+**Symptom.** A meeting app — Chrome, but Zoom and Discord behave the same — fails on
+`/dev/video10` with `NotReadableError` / "camera busy". There is no Cleanroom window on any
+workspace. `cleanroom-ctl status` reports the daemon healthy and producing frames at 30 fps.
+Nothing in `ps` looks wrong.
+
+The obvious readings are all wrong, and each is wrong for a specific reason:
+
+| Suspected | Why it isn't |
+|---|---|
+| `exclusive_caps=1` left the node output-only | The placeholder write on open flips it and it stays flipped for as long as the daemon streams — see the `exclusive_caps` entry above. That failure mode also fails at `open()` with *Not a video capture device*, not at `S_FMT` with `EBUSY`. |
+| Permissions on the node | `crw-rw----+ root video`, unchanged, and the same browser opened the same device an hour earlier. |
+| PipeWire is holding the v4l2 node | The `fuser` below names the holder outright, so this never needed a theory. WirePlumber's rule hides the *physical* camera, not the loopback one; and a monitor's probe-open does not claim the slot anyway — the slot is taken on the streaming path, which is the same reason probe-opens correctly do not count as consumers. |
+
+The one-liner that cracked it took ten seconds and should have been the first thing tried:
+
+```
+$ fuser -v /dev/video10
+                     USER        PID  ACCESS COMMAND
+/dev/video10:        jon       14231  F....  cleanroomd
+                     jon       14892  F....  cleanroom-gui
+```
+
+`cleanroom-gui`, with no window. And `strace` on the browser shows where it dies:
+
+```
+openat(AT_FDCWD, "/dev/video10", O_RDWR|O_NONBLOCK) = 23
+ioctl(23, VIDIOC_S_FMT, {type=VIDEO_CAPTURE, fmt.pix={width=1920, height=1080,
+      pixelformat=YUYV, field=NONE}}) = -1 EBUSY (Device or resource busy)
+```
+
+**The `open()` succeeds. The requested format is byte-for-byte the format already in force.
+`S_FMT` returns `EBUSY` anyway.** That is the counterintuitive core, and it is why the
+symptom reads as a permissions or driver-state problem rather than as contention: every
+mental model of "busy" says asking for what is already set should be free.
+
+**Layer 1: v4l2loopback ≥ 0.13 has one capture slot, not many readers.** The old multi-reader
+model was replaced by *format tokens*. `vidioc_s_fmt_vid` (read against v4l2loopback 0.15.3)
+gates on `dev->format_tokens & token` and returns `-EBUSY` when the caller does not hold the
+token — before, and instead of, comparing the requested format to the current one. Asking for
+the identical format is not a special case, because the check is not about the format at all.
+So: one streaming capture consumer per device, and the second one gets a message about
+formats for a problem that is about ownership.
+
+**Layer 2: the holder was the GUI preview, and it had outlived its window.** The preview
+opened the loopback device exactly like a meeting app, which made the two features mutually
+exclusive by construction — preview open meant Chrome saw a busy camera, Chrome open meant
+the preview showed nothing. It survived the close button because of the tray: closing hid
+the window (Slint's default is `HideWindow`), the tray icon kept the event loop alive, and
+nothing stopped the preview because its slot was write-once — started when the daemon first
+reported a vcam path, never cleared. The design comment asserting "closing the window quits
+the GUI" made this look impossible while the code did the opposite; see the correction to
+the entry above.
+
+**Fix, in three parts, because each one alone leaves a hole.**
+
+1. The preview no longer opens `/dev/video10` at all. It captures the daemon's `cleanroom_cam`
+   PipeWire node (`crates/cleanroom-video/src/pw_capture.rs`) — the same composited YUY2 the
+   loopback carries, so the preview stays WYSIWYG by construction rather than by
+   reimplementation — and a PipeWire node accepts any number of consumers. Two properties are
+   the whole safety story:
+
+   ```rust
+   props.insert(*pipewire::keys::TARGET_OBJECT, node_name);
+   props.insert(*pipewire::keys::NODE_DONT_RECONNECT, "true");
+   ```
+
+   Without both, an absent daemon node makes PipeWire autoconnect the capture stream to the
+   default *physical* webcam: the preview would silently show, and seize, the real camera.
+   With them, an absent target is an error to report and retry.
+
+2. `on_close_requested` stops the preview *first*, then hides to tray when one exists and
+   quits when none does. Both halves are load-bearing: hiding without stopping is the
+   original bug, and quitting while a tray icon sits there is a tray that lies. Slint 1.17
+   offers no "close and quit" response — the handler returns `HideWindow` either way and
+   calls `quit_event_loop()` in the no-tray case. The steady-state rule is separate and
+   single: the 500 ms status poll runs the preview only while the window is visible *and*
+   the daemon publishes a node, so a hidden window stays stopped rather than being stopped
+   once; the close handler exists purely so the stream is released at once instead of up to
+   half a second later.
+
+3. Power save counts PipeWire consumers as well as v4l2 `STREAMON`s (`capture_wanted`). The
+   old predicate consulted only `ConsumerWatch`, which counts loopback readers — so a browser
+   using the *PipeWire* camera got a camera that was asleep, a second bug this fix falls out
+   of rather than one it was aiming at.
+
+**Diagnosability, because the next occurrence will have a different holder.** `doctor` grew a
+`virtual camera readers` check that puts a name to it:
+
+```
+[WARN] virtual camera readers       /dev/video10 is open by chrome (41234) —
+       v4l2loopback ≥0.13 gives the first streaming reader the device's only
+       capture slot, so while it streams every other app sees "camera busy"
+              -> close whichever of those apps should not have the camera — it may be
+                 a hidden or background process: a browser tab with camera permission,
+                 a stalled recorder, or OBS. Apps that speak PipeWire can use the
+                 'Cleanroom Camera' node instead, which any number of readers can share.
+```
+
+The check **never opens the device**. A capture-side open followed by `S_FMT` is precisely
+what claims the token, so a diagnostic that probed the node would *become* the process making
+every other app see "camera busy". It is a read-only `/proc` scan and nothing else.
+`cleanroom-ctl status` prints the same names under the consumer count:
+
+```
+         1 consumer(s) reading the v4l2 virtual camera
+         held by chrome (41234)
+```
+
+and the GUI shows the same thing as a banner — `chrome (41234) is using the virtual camera`.
+Note what that banner can now afford to say: the preview is never one of the apps in it,
+because the preview is on the PipeWire node.
+
+The caveat is the one this file states everywhere the `/proc` scan appears: **holders are
+labels, never a count.** A Flatpak'd or bubblewrap'd reader is invisible to the scan, so
+"no other readers" can be confidently wrong. `stats.vcam_consumers` is the authoritative
+number; the names are an annotation on it.
+
+Guards: `closing_with_a_tray_hides_and_closing_without_one_quits` and
+`the_preview_runs_only_while_the_window_is_visible_and_a_node_is_published` for the lifetime,
+`capture_props_target_the_named_node_and_forbid_reconnecting_elsewhere` for the two stream
+properties above, `a_held_virtual_camera_warns_and_names_the_holder` for the doctor wording
+(it asserts on the literal `0.13`, because the version is the fact a user searches for), and
+`a_pipewire_consumer_keeps_the_camera_awake_under_power_save` for the third prong.
 
 ### Reading the tray menu to check it
 
