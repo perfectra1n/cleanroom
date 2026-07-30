@@ -30,8 +30,9 @@
 use libspa::param::video::VideoFormat;
 use libspa::pod::Pod;
 use pipewire::properties::properties;
-use pipewire::stream::StreamFlags;
+use pipewire::stream::{StreamFlags, StreamState};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, thiserror::Error)]
@@ -180,10 +181,16 @@ impl PwSource {
     ///
     /// Owns a dedicated thread: the PipeWire main loop drives itself, and the video thread
     /// is already blocked in V4L2 `DQBUF` and cannot host it.
+    ///
+    /// `active` is this node's answer to "is anybody watching?", and it is what lets power
+    /// save see a PipeWire consumer at all — `ConsumerWatch` counts v4l2loopback STREAMONs
+    /// and is blind to this transport entirely. It is cleared before returning, so a
+    /// caller that keeps the flag after the loop ends reads "nobody", never a stale yes.
     pub fn run(
         slot: Arc<FrameSlot>,
         node_description: &str,
         should_stop: impl Fn() -> bool + 'static,
+        active: Arc<AtomicBool>,
     ) -> Result<(), PwSourceError> {
         pipewire::init();
 
@@ -208,8 +215,18 @@ impl PwSource {
         let frame_bytes = slot.frame_bytes();
 
         let slot_cb = slot.clone();
+        let active_cb = active.clone();
         let _listener = stream
             .add_local_listener_with_user_data(())
+            // Streaming means at least one consumer, and it means it exactly. This node is
+            // a DRIVER, and WirePlumber only runs a DRIVER source node while something is
+            // linked to it — so the graph reaches Streaming when the first consumer links
+            // and leaves it when the last one goes. Paused, Connecting, Unconnected and
+            // Error all mean nobody is watching, which is why this is a `matches!` on the
+            // one state rather than a list of the ones to exclude.
+            .state_changed(move |_stream, _ud, _old, new| {
+                active_cb.store(matches!(new, StreamState::Streaming), Ordering::Relaxed);
+            })
             .param_changed(move |stream, _, id, param| {
                 if param.is_none() || id != libspa::param::ParamType::Format.as_raw() {
                     return;
@@ -280,39 +297,67 @@ impl PwSource {
             fps
         );
 
-        // Drive the cadence ourselves. `is_driving()` is false while the stream is paused,
-        // so the tick becomes a cheap no-op rather than something to guard separately.
-        let loop_ref = mainloop.loop_();
-        let stream_timer = stream.clone();
-        let interval = std::time::Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
-        let frame_timer = loop_ref.add_timer(move |_| {
-            if stream_timer.is_driving() {
-                let _ = stream_timer.trigger_process();
-            }
-        });
-        frame_timer
-            .update_timer(Some(interval), Some(interval))
-            .into_result()
-            .ok();
-
-        let quit = mainloop.clone();
-        let stop_timer = loop_ref.add_timer(move |_| {
-            if should_stop() {
-                quit.quit();
-            }
-        });
-        stop_timer
-            .update_timer(
-                Some(std::time::Duration::from_millis(200)),
-                Some(std::time::Duration::from_millis(200)),
-            )
-            .into_result()
-            .ok();
+        // Bound to locals, not dropped: a `TimerSource` removes its source from the loop
+        // when it falls, so `let _ = install_timers(..)` would arm both timers and disarm
+        // them again on the same line — no cadence, and nothing to notice the stop flag.
+        let (_frame_timer, _stop_timer) = install_timers(
+            mainloop.loop_(),
+            mainloop.clone(),
+            stream.clone(),
+            fps,
+            should_stop,
+        );
 
         mainloop.run();
+        // The loop is over, so no consumer can be attached to it any more. Say so before
+        // returning: the daemon keeps reading this flag, and a stale `true` left behind by
+        // a dead thread would hold the camera awake forever.
+        active.store(false, Ordering::Relaxed);
         tracing::info!("PipeWire Video/Source stopped");
         Ok(())
     }
+}
+
+/// Arm the frame tick and the stop poll on `loop_`, returning both guards.
+///
+/// Split out of [`PwSource::run`] purely to keep that function inside its length budget;
+/// the two timers have nothing else to do with each other. The guards are returned rather
+/// than kept here because they **must outlive `mainloop.run()`** — see the call site.
+fn install_timers<'l>(
+    loop_: &'l pipewire::loop_::Loop,
+    mainloop: pipewire::main_loop::MainLoopRc,
+    stream: pipewire::stream::StreamRc,
+    fps: u32,
+    should_stop: impl Fn() -> bool + 'static,
+) -> (
+    pipewire::loop_::TimerSource<'l>,
+    pipewire::loop_::TimerSource<'l>,
+) {
+    // Drive the cadence ourselves. `is_driving()` is false while the stream is paused, so
+    // the tick becomes a cheap no-op rather than something to guard separately.
+    let interval = std::time::Duration::from_nanos(1_000_000_000 / fps.max(1) as u64);
+    let frame_timer = loop_.add_timer(move |_| {
+        if stream.is_driving() {
+            let _ = stream.trigger_process();
+        }
+    });
+    frame_timer
+        .update_timer(Some(interval), Some(interval))
+        .into_result()
+        .ok();
+
+    let poll = std::time::Duration::from_millis(200);
+    let stop_timer = loop_.add_timer(move |_| {
+        if should_stop() {
+            mainloop.quit();
+        }
+    });
+    stop_timer
+        .update_timer(Some(poll), Some(poll))
+        .into_result()
+        .ok();
+
+    (frame_timer, stop_timer)
 }
 
 /// `SPA_PARAM_Buffers`: how many buffers, how big, and how they are laid out.

@@ -14,6 +14,7 @@ use cleanroom_gpu::{FramePipeline, Gpu};
 use cleanroom_ipc::PipelineStats;
 use cleanroom_matting::Matter;
 use cleanroom_video::{Camera, ConsumerWatch, FrameDecoder, LoopbackSink, Yuy2Frame};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -319,6 +320,9 @@ fn run_once(
     )));
 
     let mut stats = StatsAccumulator::new();
+    // Who is reading the loopback device, by name. Kept across the whole run so the /proc
+    // scan happens on transitions only.
+    let mut holders = HolderTracker::default();
     let mut capturing = true;
     // Last driver sequence number, for detecting frames the camera produced that we never
     // collected. `None` until the first frame, and reset across a power-save gap, where a
@@ -392,28 +396,7 @@ fn run_once(
         // Suspend takes priority over everything else in this loop: there is a bounded
         // window before the machine goes down regardless of what we are doing.
         if shared.suspend_requested() {
-            tracing::info!("releasing devices for suspend");
-            cam.stop();
-            // `take()` rather than `= None` so the drop is the statement, not a side
-            // effect of an assignment nothing reads. This releases the wgpu device *and*
-            // its instance; the instance matters, because it retains loader and ICD state,
-            // and carrying one across a suspend is the same hazard as carrying one across
-            // a driver swap.
-            drop(gpu.take());
-            shared.set_video_health(HealthState::idle("devices released for system suspend"));
-            shared.acknowledge_suspend();
-
-            while shared.suspend_requested() && !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(IDLE_POLL);
-            }
-            if stop.load(Ordering::Relaxed) {
-                return Ok(Outcome::Stopped);
-            }
-            // Rebuild from scratch rather than resuming in place. A resumed GPU is a new
-            // GPU as far as the driver is concerned, and re-entering run_once is already
-            // the code path that knows how to build one.
-            tracing::info!("resumed; rebuilding the pipeline");
-            return Ok(Outcome::Restart);
+            return Ok(suspend_and_wait(shared, stop, &mut cam, &mut gpu));
         }
 
         // Once a minute, not per frame: this is a sysfs read against an event that
@@ -441,7 +424,23 @@ fn run_once(
         }
 
         let consumers = watch.poll(Duration::from_millis(0));
-        let wanted = !now_cfg.video.power_save || watch.in_use();
+
+        // Names for the count, rescanned *only* on a transition — never on a fixed cadence
+        // and never on the 500 ms status poll, which is a reader and has no business
+        // paying for a walk of every process's fd directory.
+        if let Some(names) = holders.update(consumers, || {
+            cleanroom_video::holders_of(Path::new(&sink.path), Some(std::process::id()))
+                .iter()
+                .map(|h| h.to_string())
+                .collect()
+        }) {
+            shared.set_vcam_holders(names);
+        }
+
+        let pw_in_use = pw_source
+            .as_ref()
+            .is_some_and(|p| p.active.load(Ordering::Relaxed));
+        let wanted = capture_wanted(now_cfg.video.power_save, watch.in_use(), pw_in_use);
 
         if wanted && !capturing {
             // Someone opened the camera. Resume before they notice.
@@ -473,6 +472,12 @@ fn run_once(
         }
 
         if !capturing {
+            // The wait is bounded and the loop re-evaluates `wanted` at the top of every
+            // iteration, which is what lets a PipeWire consumer wake the camera at all:
+            // `watch.poll` only ever fires on a v4l2loopback event, so a client linking to
+            // the pw node produces nothing for it to return early on. The camera therefore
+            // comes back within IDLE_POLL rather than instantly — a quarter of a second,
+            // and the price of not polling the PipeWire flag on a timer of its own.
             watch.poll(IDLE_POLL);
             stats.publish_if_due(shared, consumers, true);
             continue;
@@ -620,6 +625,83 @@ fn run_once(
     Ok(Outcome::Stopped)
 }
 
+/// Release the devices, wait out the suspend, and say what to do on the other side.
+///
+/// Lifted out of the frame loop because it is one self-contained episode — everything
+/// between "logind says we are going down" and "we are back" — and because the loop it came
+/// from is the worst function in the workspace by cognitive complexity. The return value is
+/// load-bearing: a suspend that ends in a stop must not read as one that ends in a restart.
+fn suspend_and_wait(
+    shared: &Arc<Shared>,
+    stop: &AtomicBool,
+    cam: &mut Camera,
+    gpu: &mut Option<FramePipeline>,
+) -> Outcome {
+    tracing::info!("releasing devices for suspend");
+    cam.stop();
+    // `take()` rather than `= None` so the drop is the statement, not a side effect of an
+    // assignment nothing reads. This releases the wgpu device *and* its instance; the
+    // instance matters, because it retains loader and ICD state, and carrying one across a
+    // suspend is the same hazard as carrying one across a driver swap.
+    drop(gpu.take());
+    shared.set_video_health(HealthState::idle("devices released for system suspend"));
+    shared.acknowledge_suspend();
+
+    while shared.suspend_requested() && !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(IDLE_POLL);
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Outcome::Stopped;
+    }
+    // Rebuild from scratch rather than resuming in place. A resumed GPU is a new GPU as far
+    // as the driver is concerned, and re-entering run_once is already the code path that
+    // knows how to build one.
+    tracing::info!("resumed; rebuilding the pipeline");
+    Outcome::Restart
+}
+
+/// Whether capture should run. Power save may only stop the camera when BOTH
+/// transports are idle: v4l2loopback STREAMON consumers and the PipeWire node's
+/// consumers are independent populations, and either one deserves frames.
+fn capture_wanted(power_save: bool, v4l2_in_use: bool, pw_in_use: bool) -> bool {
+    !power_save || v4l2_in_use || pw_in_use
+}
+
+/// Remembers the consumer count so `/proc` is scanned only when it actually moves.
+///
+/// Naming holders means walking every process's fd directory. That is far too expensive to
+/// run on a cadence, and pointless besides: the names can only change when the count does.
+///
+/// `last` is the count as of the previous transition. `None` means "unknown" — both the
+/// starting state and what [`ConsumerWatch`] reports when the driver will not say — and it
+/// is treated as a state like any other, so arriving at it rescans once and staying in it
+/// does not.
+#[derive(Default)]
+struct HolderTracker {
+    last: Option<u32>,
+}
+
+impl HolderTracker {
+    /// Some(list) when the count changed and holders should be republished.
+    /// A count of zero clears without scanning. `scan` is injected for tests.
+    fn update(
+        &mut self,
+        count: Option<u32>,
+        scan: impl FnOnce() -> Vec<String>,
+    ) -> Option<Vec<String>> {
+        if count == self.last {
+            return None;
+        }
+        self.last = count;
+        // Zero consumers is the one answer arithmetic already knows: nobody holds the
+        // device, so the walk of /proc could not find anyone even if it ran.
+        Some(match count {
+            Some(0) => Vec::new(),
+            _ => scan(),
+        })
+    }
+}
+
 /// The PipeWire `Video/Source` publisher, on its own thread.
 ///
 /// Owns its stop flag and join handle so `Drop` tears the thread down on every exit path
@@ -628,6 +710,10 @@ fn run_once(
 /// two cameras with the same name.
 struct PwSourceThread {
     slot: Arc<cleanroom_video::FrameSlot>,
+    /// Whether this node currently has a consumer linked to it. Read by the frame loop's
+    /// power-save decision, which would otherwise see only v4l2loopback and put the camera
+    /// to sleep underneath a PipeWire client — the GUI preview included.
+    active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -636,25 +722,36 @@ impl PwSourceThread {
     fn start(width: u32, height: u32, fps: u32) -> Self {
         let slot = cleanroom_video::FrameSlot::new(width, height, fps);
         let stop = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let slot_thread = slot.clone();
+        let active_thread = active.clone();
         let handle = std::thread::Builder::new()
             .name("cleanroom-pwcam".into())
             .spawn(move || {
                 // Degraded, never fatal: the loopback device is what most apps use, so
                 // losing the portal transport reduces coverage but is not a reason to have
                 // no camera at all.
-                if let Err(e) =
-                    cleanroom_video::PwSource::run(slot_thread, "Cleanroom Camera", move || {
-                        stop_thread.load(Ordering::Relaxed)
-                    })
-                {
+                let run = cleanroom_video::PwSource::run(
+                    slot_thread,
+                    "Cleanroom Camera",
+                    move || stop_thread.load(Ordering::Relaxed),
+                    active_thread.clone(),
+                );
+                if let Err(e) = run {
                     tracing::warn!(error = %e, "PipeWire Video/Source failed");
                 }
+                // Cleared here as well as inside `run`, because the paths that never reach
+                // `run`'s own clear are exactly the ones that matter: a connect that failed
+                // because PipeWire is not there, or a panic-free early `?`. A thread that
+                // is no longer publishing must read as "nobody watching", or power save
+                // would hold the camera awake for a transport that does not exist.
+                active_thread.store(false, Ordering::Relaxed);
             })
             .expect("spawning the PipeWire camera thread");
         Self {
             slot,
+            active,
             stop,
             handle: Some(handle),
         }
@@ -1186,6 +1283,95 @@ mod tests {
         let base = Config::default();
         assert_eq!(base.video.device, None, "precondition");
         assert!(!needs_restart(&base, &base, CAM));
+    }
+
+    /// The GUI preview reads the PipeWire node, not the loopback device. Before this, power
+    /// save consulted `ConsumerWatch` alone — which counts v4l2loopback STREAMONs and is
+    /// structurally blind to the pw transport — so opening the preview on an otherwise idle
+    /// machine got a stopped camera and a black picture, with the daemon reporting "no
+    /// consumers" and being, from its own point of view, correct.
+    #[test]
+    fn a_pipewire_consumer_keeps_the_camera_awake_under_power_save() {
+        assert!(
+            capture_wanted(true, false, true),
+            "a PipeWire consumer is a consumer; power save must not sleep the camera on it"
+        );
+    }
+
+    /// The two transports are independent populations, so the camera may only stop when
+    /// *both* are empty. Any other rule takes frames away from someone who asked for them.
+    #[test]
+    fn power_save_only_sleeps_the_camera_when_both_transports_are_idle() {
+        for (v4l2, pw) in [(true, true), (true, false), (false, true)] {
+            assert!(
+                capture_wanted(true, v4l2, pw),
+                "v4l2={v4l2} pw={pw}: somebody is watching"
+            );
+        }
+        assert!(
+            !capture_wanted(true, false, false),
+            "nobody on either transport is the only case that releases the camera"
+        );
+    }
+
+    /// With power save off the camera runs regardless, which is the whole meaning of the
+    /// setting: a user who turned it off is asking for the LED and the latency, not for a
+    /// cleverer version of the same policy.
+    #[test]
+    fn power_save_off_never_sleeps_the_camera() {
+        for (v4l2, pw) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(capture_wanted(false, v4l2, pw), "v4l2={v4l2} pw={pw}");
+        }
+    }
+
+    /// The scan walks every process's fd directory. Running it on a cadence — per frame, or
+    /// worse, on the 500 ms status poll a GUI drives — would spend real CPU re-deriving a
+    /// list that cannot have changed, so it must fire on transitions and nothing else.
+    #[test]
+    fn holders_are_rescanned_only_when_the_consumer_count_moves() {
+        let mut tracker = HolderTracker::default();
+        let mut scans = 0;
+
+        let sequence = [Some(1), Some(1), Some(2), Some(2), Some(1)];
+        let published: Vec<bool> = sequence
+            .iter()
+            .map(|&count| {
+                tracker
+                    .update(count, || {
+                        scans += 1;
+                        vec!["chromium (1234)".to_string()]
+                    })
+                    .is_some()
+            })
+            .collect();
+
+        assert_eq!(
+            published,
+            vec![true, false, true, false, true],
+            "a repeat of the same count is not a transition"
+        );
+        assert_eq!(scans, 3, "one /proc walk per move, and not one more");
+    }
+
+    /// Zero consumers is the one answer arithmetic already has: nobody holds the device, so
+    /// the walk cannot find anyone. It still has to *publish* the empty list, or the last
+    /// meeting's readers stay on screen after everybody has hung up.
+    #[test]
+    fn a_consumer_count_of_zero_clears_holders_without_scanning() {
+        let mut tracker = HolderTracker::default();
+        let mut scanned = false;
+
+        let cleared = tracker.update(Some(0), || {
+            scanned = true;
+            vec!["should not have been scanned".to_string()]
+        });
+
+        assert!(!scanned, "a count of zero must not walk /proc");
+        assert_eq!(
+            cleared,
+            Some(Vec::new()),
+            "the empty list must still be published, or stale names linger"
+        );
     }
 
     /// The bug this whole `Outcome` type exists to prevent: `run_once` returned `Ok(())`
