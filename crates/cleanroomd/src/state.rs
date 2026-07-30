@@ -69,6 +69,10 @@ pub struct Shared {
     stats: RwLock<PipelineStats>,
     gpu_adapter: RwLock<String>,
     vcam_path: RwLock<String>,
+    /// Names of the processes reading the virtual camera. Labels for the count in
+    /// `stats.vcam_consumers`, never a substitute for it — the scan that fills this
+    /// cannot see sandboxed readers.
+    vcam_holders: RwLock<Vec<String>>,
     pw_node: RwLock<String>,
     /// Which matting provider is live, and why if it was not the requested one.
     matting_engine: RwLock<String>,
@@ -106,6 +110,7 @@ impl Shared {
             stats: RwLock::new(PipelineStats::default()),
             gpu_adapter: RwLock::new("not initialised".into()),
             vcam_path: RwLock::new(String::new()),
+            vcam_holders: RwLock::new(Vec::new()),
             pw_node: RwLock::new(String::new()),
             matting_engine: RwLock::new(String::new()),
             suspend: AtomicBool::new(false),
@@ -228,6 +233,21 @@ impl Shared {
 
     pub fn set_vcam_path(&self, s: impl Into<String>) {
         *self.vcam_path.write().expect("vcam lock poisoned") = s.into();
+        // A new node means a new set of readers, and the old names describe processes that
+        // are, by definition, not reading this one. Clearing here is what stops a pipeline
+        // restart from serving a stale list until the next consumer-count change refreshes
+        // it — which, if nothing ever connects, is never.
+        self.set_vcam_holders(Vec::new());
+    }
+
+    /// Replace the holder names. Called when the consumer count changes; the empty list is
+    /// a legitimate answer both for "nobody is reading" and for "everybody reading is
+    /// sandboxed", which is why the count is published separately.
+    pub fn set_vcam_holders(&self, holders: Vec<String>) {
+        *self
+            .vcam_holders
+            .write()
+            .expect("vcam holders lock poisoned") = holders;
     }
 
     pub fn status(&self) -> Status {
@@ -240,6 +260,11 @@ impl Shared {
             audio_detail: a.detail,
             gpu_adapter: self.gpu_adapter.read().expect("gpu lock poisoned").clone(),
             vcam_path: self.vcam_path.read().expect("vcam lock poisoned").clone(),
+            vcam_holders: self
+                .vcam_holders
+                .read()
+                .expect("vcam holders lock poisoned")
+                .clone(),
             pw_node: self.pw_node.read().expect("pw lock poisoned").clone(),
             matting_engine: self
                 .matting_engine
@@ -324,6 +349,29 @@ mod tests {
         let s = shared();
         assert_eq!(s.status().video_health, Health::Idle);
         assert_eq!(s.status().audio_health, Health::Idle);
+    }
+
+    /// The names are cached until the consumer count next changes, so nothing refreshes
+    /// them across a pipeline restart. If they survived the new node's path, `status`
+    /// would name processes that are demonstrably not reading it.
+    #[test]
+    fn vcam_holders_round_trip_through_status_and_clear_on_a_new_vcam_path() {
+        let s = shared();
+        assert!(s.status().vcam_holders.is_empty(), "nothing has read yet");
+
+        s.set_vcam_path("/dev/video42");
+        s.set_vcam_holders(vec!["chromium (1234)".into(), "obs (5678)".into()]);
+        assert_eq!(
+            s.status().vcam_holders,
+            vec!["chromium (1234)".to_string(), "obs (5678)".to_string()],
+            "the labels must reach the wire in the order they were collected"
+        );
+
+        s.set_vcam_path("/dev/video43");
+        assert!(
+            s.status().vcam_holders.is_empty(),
+            "a restart allocates a new node, and the old readers are not on it"
+        );
     }
 
     #[test]
