@@ -87,6 +87,7 @@ pub fn run(config: &Config, rt: &crate::realtime::RtStatus) -> Vec<Check> {
     out.extend(check_v4l2loopback());
     out.extend(check_secure_boot());
     out.extend(check_cameras());
+    out.extend(check_vcam_busy());
     out.extend(check_pipewire());
     out.extend(check_realtime(rt));
     out.extend(check_browsers());
@@ -385,6 +386,82 @@ fn check_cameras() -> Vec<Check> {
     out
 }
 
+// --- virtual camera readers ----------------------------------------------------------
+
+/// Who is holding the virtual camera?
+///
+/// v4l2loopback 0.13 and later hand the *first* streaming capture reader the device's only
+/// format token; every other app then fails `VIDIOC_S_FMT` with EBUSY and reports nothing
+/// more useful than "camera busy". The holder is routinely something the user cannot see —
+/// a background browser tab, a stalled recorder, or (historically) a zombie Cleanroom GUI.
+/// Naming it is the whole point of this check.
+fn check_vcam_busy() -> Vec<Check> {
+    // This deliberately never opens the device. A capture-side open followed by S_FMT is
+    // exactly what claims the format token, so a diagnostic that probed the node would
+    // *become* the process making every other app see "camera busy". Everything below is
+    // a read-only /proc scan.
+    let me = std::process::id();
+    let checks: Vec<Check> = cleanroom_video::enumerate()
+        .iter()
+        .filter(|d| d.is_virtual)
+        .map(|d| {
+            let path = d.path.display().to_string();
+            let holders = cleanroom_video::holders_of(Path::new(&d.path), Some(me));
+            vcam_readers_check(&path, &holders)
+        })
+        .collect();
+
+    if checks.is_empty() {
+        return vec![Check::info(
+            "virtual camera readers",
+            "no virtual camera device present to inspect",
+        )];
+    }
+    checks
+}
+
+/// Render one virtual camera's holder list as a check.
+///
+/// Pure, so the wording is testable without a v4l2loopback device present.
+///
+/// The holder list comes from a `/proc/*/fd` scan, which cannot see a reader living in
+/// another user namespace: a Flatpak'd or bubblewrap'd browser holding the camera is
+/// indistinguishable from nobody holding it. So the "no other readers" branch here can be
+/// plain wrong, and it is only ever a hint — the consumer count reported by
+/// `cleanroom-ctl status` is the authoritative answer to "is anything reading?". This
+/// check's job is putting a name to a holder it *can* see.
+fn vcam_readers_check(path: &str, holders: &[cleanroom_video::Holder]) -> Check {
+    if holders.is_empty() {
+        return Check::info(
+            "virtual camera readers",
+            format!(
+                "{path} has no other readers — the single capture slot v4l2loopback ≥0.13 \
+                 allows is free"
+            ),
+        );
+    }
+
+    let names = holders
+        .iter()
+        .map(|h| h.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Check::warn(
+        "virtual camera readers",
+        format!(
+            "{path} is open by {names} — v4l2loopback ≥0.13 gives the first streaming reader \
+             the device's only capture slot, so while it streams every other app sees \
+             \"camera busy\""
+        ),
+    )
+    .with_fix(
+        "close whichever of those apps should not have the camera — it may be a hidden or \
+         background process: a browser tab with camera permission, a stalled recorder, or \
+         OBS. Apps that speak PipeWire can use the 'Cleanroom Camera' node instead, which \
+         any number of readers can share.",
+    )
+}
+
 // --- pipewire -----------------------------------------------------------------------
 
 fn check_pipewire() -> Vec<Check> {
@@ -597,6 +674,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_held_virtual_camera_warns_and_names_the_holder() {
+        // The user's whole problem is that they cannot tell *which* app has the camera,
+        // so the holder's name and pid have to survive into the text they read.
+        let holders = vec![cleanroom_video::Holder {
+            pid: 41234,
+            comm: "chrome".to_string(),
+        }];
+        let c = vcam_readers_check("/dev/video42", &holders);
+
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("chrome"), "detail was: {}", c.detail);
+        assert!(c.detail.contains("41234"), "detail was: {}", c.detail);
+        // The version is the load-bearing fact: it is why one reader locks everyone else
+        // out, and it is what a user searches for.
+        assert!(c.detail.contains("0.13"), "detail was: {}", c.detail);
+        assert!(
+            c.fix.as_deref().is_some_and(|f| !f.is_empty()),
+            "a held camera must say what to close, got {:?}",
+            c.fix
+        );
+    }
+
+    #[test]
+    fn a_free_virtual_camera_is_informational() {
+        let c = vcam_readers_check("/dev/video42", &[]);
+        assert_eq!(c.level, Level::Info);
+        assert!(
+            c.detail.contains("/dev/video42"),
+            "detail was: {}",
+            c.detail
+        );
+        assert!(!c.detail.is_empty());
     }
 
     #[test]
