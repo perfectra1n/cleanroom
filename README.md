@@ -41,9 +41,12 @@ most determined not to reproduce.
 **GPU required, vendor-neutral.** Inference runs on a portable GPU path. There is no CPU
 inference fallback, because a CPU fallback nobody notices is worse than an error.
 
-**The daemon owns the devices.** Exactly one process opens the camera. Effects survive
-closing the window. The GUI, the CLI and `busctl` are equal citizens on the same D-Bus
-interface — anything the UI can do is scriptable.
+**The daemon owns the devices.** Exactly one process opens the camera, and the GUI preview
+rides the daemon's PipeWire node rather than the loopback device, so it never competes with
+a meeting app for `/dev/video10`. Effects survive closing the window — which hides to the
+tray where there is one, and quits the GUI where there is not. The GUI, the CLI and
+`busctl` are equal citizens on the same D-Bus interface — anything the UI can do is
+scriptable.
 
 **Both virtual-camera transports.** `v4l2loopback` reaches Chrome, Electron, Zoom,
 Discord and OBS. A PipeWire `Video/Source` node reaches Flatpak and portal-aware apps, and

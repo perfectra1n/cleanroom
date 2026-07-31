@@ -2,6 +2,10 @@
 //!
 //! Run the passthrough example in one terminal, this in another, then start and stop
 //! `ffplay /dev/video10` and watch the count move.
+//!
+//! Each transition also prints who is holding the device, scanned out of `/proc`. That
+//! list is decoration, not data: a sandboxed reader (Flatpak, bubblewrap) is invisible to
+//! the scan, so `held by:` can be missing while the count says 1. The count is the truth.
 
 use std::time::Duration;
 
@@ -36,6 +40,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "idle (capture can stop, LED off)"
                 }
             );
+            let held = cleanroom_video::holders_of(&dev.path, None);
+            if !held.is_empty() {
+                let names: Vec<String> = held.iter().map(|h| h.to_string()).collect();
+                println!("  held by: {}", names.join(", "));
+            }
             last = now;
         }
     }

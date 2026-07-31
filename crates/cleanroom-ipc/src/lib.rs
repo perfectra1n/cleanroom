@@ -29,7 +29,10 @@ pub const INTERFACE: &str = "io.github.perfectra1n.Cleanroom1";
 ///
 /// 2: `PipelineStats` gained `matte_rejected` and `Status` gained `pw_node`, both of
 ///    which change D-Bus signatures.
-pub const INTERFACE_VERSION: u32 = 3;
+/// 4: `Status` gained `vcam_holders`, inserted after `vcam_path`, which changes the
+///    D-Bus signature — struct fields are positional, so an older GUI cannot decode a
+///    newer `Status` at all and needs to be told to update rather than left guessing.
+pub const INTERFACE_VERSION: u32 = 4;
 
 /// How healthy the pipeline is.
 ///
@@ -111,6 +114,10 @@ pub struct PipelineStats {
     /// How many processes are currently reading the virtual camera. Drives power save.
     /// Note this counts *streaming* consumers, not opens: browsers probe-open cameras
     /// without streaming and must not be counted.
+    ///
+    /// This counts the v4l2 transport only. Consumers of the PipeWire node — including
+    /// the GUI's own preview — are not included, so a zero here does not mean nothing is
+    /// watching, only that nothing is watching *through v4l2loopback*.
     pub vcam_consumers: u32,
     /// Microphone level pre-denoise, dBFS.
     pub mic_level_db: f32,
@@ -132,6 +139,17 @@ pub struct Status {
     /// Path of the v4l2loopback node we are producing into. Allocated at runtime via the
     /// control device rather than hardcoded, so we never fight OBS over /dev/video10.
     pub vcam_path: String,
+    /// Best-effort names — `"comm (pid)"` — of the processes currently reading the
+    /// virtual camera, refreshed when the consumer count changes, with the daemon itself
+    /// excluded. Answers "which app has my camera", which is the question a bare count
+    /// leaves you asking.
+    ///
+    /// Best-effort is the operative word: a sandboxed reader (Flatpak, and anything else
+    /// in its own PID namespace) is invisible to the /proc scan behind this, so the list
+    /// can be shorter than the count or empty while a consumer is plainly streaming.
+    /// `stats.vcam_consumers` is the authoritative count; these are labels only and must
+    /// never be counted or used to decide whether anyone is watching.
+    pub vcam_holders: Vec<String>,
     /// The PipeWire node name we publish as, or empty when that transport is off or has
     /// failed. Reported separately from `vcam_path` because the two transports succeed and
     /// fail independently, and "the camera works" is a different claim for each.

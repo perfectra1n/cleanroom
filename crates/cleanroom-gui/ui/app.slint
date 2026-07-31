@@ -71,6 +71,12 @@ export component AppWindow inherits Window {
 
     in property <image> preview-frame;
     in property <bool> preview-running: false;
+    // What to say in the preview area while there is no picture. Two different situations —
+    // waiting for frames, and a PipeWire source that is off or failed — so the wording is
+    // decided in Rust rather than guessed at here.
+    in property <string> preview-hint: "waiting for the virtual camera…";
+    // Non-empty when something outside Cleanroom is reading the virtual camera.
+    in property <string> vcam-holder-banner: "";
     in-out property <string> background-image: "";
     in property <string> autostart-mechanism: "";
     in property <string> autostart-instruction: "";
@@ -152,6 +158,24 @@ export component AppWindow inherits Window {
             }
         }
 
+        // Informational, not a warning: another app holding the camera is the system
+        // working. Blue rather than amber so it never reads as something to fix — it is
+        // here to answer "which app has my camera", which is otherwise unanswerable.
+        if root.vcam-holder-banner != "" : Rectangle {
+            background: #58a6ff20;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: #58a6ff;
+            height: holders.preferred-height + 16px;
+            holders := VerticalBox {
+                padding: 8px;
+                Text {
+                    text: root.vcam-holder-banner;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
         GroupBox {
             title: "Status";
             VerticalBox {
@@ -187,7 +211,8 @@ export component AppWindow inherits Window {
                     }
                     Text {
                         visible: !root.preview-running;
-                        text: "waiting for the virtual camera…";
+                        text: root.preview-hint;
+                        wrap: word-wrap;
                         color: #888;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -195,10 +220,11 @@ export component AppWindow inherits Window {
                         height: parent.height;
                     }
                 }
-                // Said plainly rather than left to be discovered: the preview is a real
-                // consumer of the virtual camera, so it keeps the capture awake.
+                // Said plainly rather than left to be discovered: the preview reads the
+                // daemon's PipeWire node — the same composited frames the virtual camera
+                // carries — and it lives and dies with this window.
                 Text {
-                    text: "This is what other apps see. Keeping it open holds the camera awake.";
+                    text: "This is what other apps see. The preview follows the window — closing or hiding it releases the camera.";
                     color: #888;
                     font-size: 11px;
                     wrap: word-wrap;
@@ -568,10 +594,13 @@ export component AppWindow inherits Window {
                     Text { text: "matting " + Math.round(root.matting-ms * 100) / 100 + " ms"; }
                     Rectangle { horizontal-stretch: 1; }
                 }
+                // Readers of the v4l2 device only, and the preview is not one of them: it
+                // consumes the PipeWire node instead, so this counts other apps and nothing
+                // else.
                 Text {
                     text: root.consumers == 0
                         ? "idle — camera released"
-                        : root.consumers + " app(s) using the camera";
+                        : root.consumers + " app(s) reading the virtual camera";
                 }
                 // Both hidden until non-zero. A counter permanently reading 0 is noise, and
                 // noise is what stops anyone noticing the moment it stops reading 0.
@@ -599,9 +628,10 @@ export component AppWindow inherits Window {
 // only UI it presents is its menu.
 //
 // Whether it appears at all depends entirely on the desktop. GNOME ships no SNI host, and
-// a bare wlroots session often has none either. So the tray is treated as decoration —
-// closing the window quits the GUI rather than hiding it into a tray that may not exist,
-// and every action here is also reachable from `cleanroom-ctl`.
+// a bare wlroots session often has none either — so what closing the window does depends on
+// whether one was actually registered: with a tray it hides and stops the preview, so no
+// invisible process is left holding the camera; with no SNI host it quits, because nothing
+// would be left to reopen it from. Every action here is also reachable from `cleanroom-ctl`.
 export component Tray inherits SystemTrayIcon {
     icon: @image-url("../icons/cleanroom.png");
     tooltip: "Cleanroom";
@@ -613,6 +643,10 @@ export component Tray inherits SystemTrayIcon {
 
     in property <bool> blur-on: true;
     in property <bool> denoise-on: true;
+
+    // Clicking the icon is what most people try first, and once the window is hidden the
+    // menu is otherwise the only way back to it.
+    clicked => { root.show-window(); }
 
     Menu {
         MenuItem {

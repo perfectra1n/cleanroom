@@ -147,9 +147,15 @@ async fn status(proxy: &CleanroomProxy<'_>) -> Result<()> {
         st.fps, st.decode_ms, st.gpu_ms, st.matting_ms, st.dropped
     );
     println!(
-        "         {} consumer(s) reading the virtual camera",
+        "         {} consumer(s) reading the v4l2 virtual camera",
         st.vcam_consumers
     );
+    // Names, when we could get them. Sandboxed readers are invisible to the scan, so this
+    // can be shorter than the count above — printed only when it has something to say,
+    // rather than as an empty line that reads like "nobody".
+    if !s.vcam_holders.is_empty() {
+        println!("         held by {}", s.vcam_holders.join(", "));
+    }
     // Only shown once it has happened. A permanent "0 rejected" trains people to skip the
     // line, which is the opposite of what a counter that only matters when non-zero needs.
     if st.matte_rejected > 0 {

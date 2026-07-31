@@ -31,9 +31,16 @@
 //! wlroots session often has no host either, since the host is whichever bar the user runs
 //! and a minimal setup runs none.
 //!
-//! So the tray is decoration, never the only entry point: closing the window quits the GUI
-//! rather than hiding into a tray that may not exist, and everything in the tray menu is
-//! also reachable from `cleanroom-ctl`.
+//! So what closing the window does depends on whether a tray was actually registered:
+//!
+//! * With a tray, the window hides and the preview is stopped on the spot. A registered
+//!   tray keeps Slint's event loop alive after the last window closes, so without that
+//!   explicit stop the process would linger invisibly with a live capture stream — which is
+//!   precisely the "something still has my camera" bug this is written to avoid.
+//! * With no tray, there is nothing left to reopen the window from, so closing quits.
+//!
+//! Every action in the tray menu is also reachable from `cleanroom-ctl`, because a tray that
+//! never appears must not be the only way to do anything.
 
 mod filechooser;
 mod preview;
@@ -167,20 +174,10 @@ fn main() -> Result<()> {
 
     wire_controls(&ui, set_tx.clone());
 
-    // The preview consumes the virtual camera the same way a meeting app does, so it is
-    // WYSIWYG by construction.
-    //
-    // Started from the status snapshot rather than from a repeating UI timer: the vcam path
-    // is not known until the daemon has been polled at least once, and the snapshot is
-    // already the thing that learns it. One fewer mechanism, and it cannot start before
-    // there is a path to start on.
-    let preview_slot: std::rc::Rc<std::cell::RefCell<Option<preview::Preview>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    PREVIEW_SLOT.with(|s| *s.borrow_mut() = Some(preview_slot));
-
     if let Some(t) = &tray {
         wire_tray(t, &ui, set_tx);
     }
+    wire_close(&ui, tray.is_some());
 
     ui.show()?;
     slint::run_event_loop()?;
@@ -372,38 +369,150 @@ fn current_camera_id(status: &Status) -> String {
 }
 
 thread_local! {
-    /// Owns the preview thread. Thread-local because it can only be touched from the UI
-    /// thread, which is also the only place `apply_snapshot` runs.
-    static PREVIEW_SLOT: std::cell::RefCell<
-        Option<std::rc::Rc<std::cell::RefCell<Option<preview::Preview>>>>,
-    > = const { std::cell::RefCell::new(None) };
+    /// Owns the preview thread, alongside the PipeWire node name it was started on.
+    ///
+    /// The name is kept because the node can change under us — the daemon can be
+    /// reconfigured, or the source can come back under a different name — and a preview
+    /// still linked to the previous one would sit there showing nothing with no way to
+    /// notice. Comparing names is how a restart is detected.
+    ///
+    /// Thread-local because it can only be touched from the UI thread, which is the only
+    /// place `apply_snapshot` and the close handler run.
+    static PREVIEW_SLOT: std::cell::RefCell<Option<(String, preview::Preview)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Start the preview once the daemon has told us which device to read.
-fn ensure_preview(ui: &AppWindow, vcam_path: &str) {
-    if vcam_path.is_empty() || vcam_path == "—" {
-        return;
+/// The preview runs only while there is both a window to show it in and a node to read.
+///
+/// Visibility is half the rule because the preview is a real PipeWire consumer: a hidden
+/// window that kept streaming would hold the camera awake with nobody looking at it, which
+/// is indistinguishable from the daemon having gone rogue.
+fn preview_should_run(window_visible: bool, pw_node: &str) -> bool {
+    window_visible && !pw_node.is_empty()
+}
+
+/// What to say in the empty preview area, which is two quite different situations.
+///
+/// An empty `pw_node` is the daemon telling us the PipeWire source is off or has failed;
+/// no amount of waiting will produce a frame, and saying "waiting…" forever would be a
+/// lie. There is deliberately no fallback to the v4l2 device: that would take the single
+/// capture slot the meeting apps need.
+fn preview_hint(pw_node: &str) -> &'static str {
+    if pw_node.is_empty() {
+        "preview unavailable — the PipeWire camera source is off or failed; \
+         check `cleanroom-ctl status`"
+    } else {
+        "waiting for the virtual camera…"
     }
+}
+
+/// What closing the window should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseAction {
+    /// A tray icon exists, so the window can be brought back; hide it.
+    HideToTray,
+    /// Nothing would be left to reopen it from, so end the process.
+    Quit,
+}
+
+/// Hiding is only honest when there is a tray to hide *into*.
+fn close_action(have_tray: bool) -> CloseAction {
+    if have_tray {
+        CloseAction::HideToTray
+    } else {
+        CloseAction::Quit
+    }
+}
+
+/// The banner shown when something outside Cleanroom is reading the virtual camera.
+///
+/// `consumers` is the authoritative count — it comes from the v4l2 device itself — while
+/// `holders` is a best-effort naming that a sandboxed reader is simply invisible to. So the
+/// count always decides the wording and the names only decorate it: "2 apps" with one name
+/// listed is honest, "1 app" because only one could be named would not be.
+///
+/// The preview is not in this count. It consumes the PipeWire node, so everything reported
+/// here is somebody else.
+fn holder_banner_text(consumers: u32, holders: &[String]) -> String {
+    match (consumers, holders) {
+        (0, _) => String::new(),
+        (1, [only]) => format!("{only} is using the virtual camera"),
+        (1, _) => "1 app is using the virtual camera".to_string(),
+        (n, []) => format!("{n} apps are using the virtual camera"),
+        (n, named) => format!(
+            "{n} apps are using the virtual camera: {}",
+            named.join(", ")
+        ),
+    }
+}
+
+/// Start or stop the preview so it matches the window and the node the daemon publishes.
+///
+/// The 500 ms status poll is the single lifecycle mechanism here, deliberately: there is no
+/// second timer and no visibility callback to disagree with it. Hiding the window therefore
+/// stops the preview on the next tick and — because the same rule is re-evaluated every
+/// tick — keeps it stopped. Closing is handled separately by `stop_preview_now`, so the
+/// stream is released at once rather than up to half a second later.
+fn sync_preview(ui: &AppWindow, pw_node: &str) {
+    ui.set_preview_hint(preview_hint(pw_node).into());
+    let run = preview_should_run(ui.window().is_visible(), pw_node);
+
     PREVIEW_SLOT.with(|slot| {
-        let slot = slot.borrow();
-        let Some(slot) = slot.as_ref() else { return };
-        if slot.borrow().is_some() {
+        let mut slot = slot.borrow_mut();
+        if !run {
+            if slot.take().is_some() {
+                ui.set_preview_running(false);
+            }
             return;
         }
-        tracing::info!(path = vcam_path, "starting preview");
-        let weak = ui.as_weak();
-        *slot.borrow_mut() = Some(preview::Preview::start(
-            vcam_path.to_string(),
-            move |rgb, pw, ph| {
-                if let Some(ui) = weak.upgrade() {
-                    let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(
-                        &rgb, pw, ph,
-                    );
-                    ui.set_preview_frame(slint::Image::from_rgb8(buf));
-                    ui.set_preview_running(true);
-                }
-            },
-        ));
+        if slot.as_ref().is_some_and(|(node, _)| node == pw_node) {
+            return;
+        }
+        // Assigning None first joins any thread still on the previous node, so two capture
+        // streams never overlap.
+        *slot = None;
+        tracing::info!(node = pw_node, "starting preview");
+        *slot = Some((pw_node.to_string(), start_preview(ui, pw_node)));
+    });
+}
+
+/// Stop the preview immediately and say so in the UI.
+///
+/// Called from the close handler: a tray keeps the event loop alive after the window goes,
+/// and a headless process holding a camera stream is the exact failure this whole path
+/// exists to prevent.
+fn stop_preview_now(ui: &AppWindow) {
+    PREVIEW_SLOT.with(|slot| *slot.borrow_mut() = None);
+    ui.set_preview_running(false);
+}
+
+/// The frame sink: pixels in on a worker thread, a `slint::Image` out on the UI thread.
+fn start_preview(ui: &AppWindow, pw_node: &str) -> preview::Preview {
+    let weak = ui.as_weak();
+    preview::Preview::start(pw_node.to_string(), move |rgb, pw, ph| {
+        if let Some(ui) = weak.upgrade() {
+            let buf = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::clone_from_slice(&rgb, pw, ph);
+            ui.set_preview_frame(slint::Image::from_rgb8(buf));
+            ui.set_preview_running(true);
+        }
+    })
+}
+
+/// Closing the window must not leave a capture stream running behind it.
+///
+/// Slint 1.17 offers no "close and quit" response — the only choices are hiding the window
+/// or refusing to close it — so quitting is done by calling `quit_event_loop` from inside
+/// the handler and hiding anyway.
+fn wire_close(ui: &AppWindow, have_tray: bool) {
+    let weak = ui.as_weak();
+    ui.window().on_close_requested(move || {
+        if let Some(ui) = weak.upgrade() {
+            stop_preview_now(&ui);
+        }
+        if close_action(have_tray) == CloseAction::Quit {
+            let _ = slint::quit_event_loop();
+        }
+        slint::CloseRequestResponse::HideWindow
     });
 }
 
@@ -411,7 +520,7 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_connected(true);
     // Both taken before the status fields are moved into the UI below.
     let active_camera = current_camera_id(&s.status);
-    let vcam_path = s.status.vcam_path.clone();
+    let pw_node = s.status.pw_node.clone();
 
     ui.set_video_health(health_code(&s.status.video_health));
     ui.set_video_detail(s.status.video_detail.into());
@@ -435,9 +544,10 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_consumers(st.vcam_consumers as i32);
     ui.set_mic_in_db(st.mic_level_db);
     ui.set_mic_out_db(st.mic_level_out_db);
+    ui.set_vcam_holder_banner(holder_banner_text(st.vcam_consumers, &s.status.vcam_holders).into());
 
     ui.set_background_image(s.background_image.clone().into());
-    ensure_preview(ui, &vcam_path);
+    sync_preview(ui, &pw_node);
 
     // Only when this poll actually fetched them. Writing empty lists on the intervening
     // polls would make the pickers flicker empty nineteen times out of twenty.
@@ -708,4 +818,74 @@ fn wire_tray(tray: &Tray, ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>)
             tray.set_denoise_on(ui.get_denoise());
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hiding into a tray that does not exist is how a GUI becomes unreachable: the window
+    /// is gone, nothing in the panel brings it back, and the process is still running.
+    #[test]
+    fn closing_with_a_tray_hides_and_closing_without_one_quits() {
+        assert_eq!(close_action(true), CloseAction::HideToTray);
+        assert_eq!(close_action(false), CloseAction::Quit);
+    }
+
+    /// The preview is a real PipeWire consumer, so both halves of the rule matter: no node
+    /// means nothing to read, and no visible window means nobody is looking.
+    #[test]
+    fn the_preview_runs_only_while_the_window_is_visible_and_a_node_is_published() {
+        assert!(preview_should_run(true, "cleanroom_cam"));
+        assert!(!preview_should_run(false, "cleanroom_cam"));
+        assert!(!preview_should_run(true, ""));
+        assert!(!preview_should_run(false, ""));
+    }
+
+    /// "Waiting…" against a source that will never publish is a lie the user cannot see
+    /// through — it looks like a slow start rather than a disabled transport.
+    #[test]
+    fn an_empty_pw_node_shows_the_disabled_hint_rather_than_the_waiting_one() {
+        assert!(preview_hint("cleanroom_cam").starts_with("waiting"));
+        let off = preview_hint("");
+        assert!(off.starts_with("preview unavailable"), "got {off}");
+        assert!(
+            off.contains("cleanroom-ctl status"),
+            "the hint must say where to look next, got {off}"
+        );
+    }
+
+    /// The count is authoritative and the names are best-effort, so the banner has to read
+    /// correctly when there are fewer names than readers — including none at all.
+    #[test]
+    fn no_holders_means_no_banner_and_holders_are_named_in_it() {
+        assert_eq!(holder_banner_text(0, &[]), "");
+        assert_eq!(
+            holder_banner_text(0, &["chrome (41234)".to_string()]),
+            "",
+            "nothing is streaming, whatever a stale name list says"
+        );
+
+        assert_eq!(
+            holder_banner_text(1, &["chrome (41234)".to_string()]),
+            "chrome (41234) is using the virtual camera"
+        );
+
+        let two = ["chrome (41234)".to_string(), "zoom (555)".to_string()];
+        assert_eq!(
+            holder_banner_text(2, &two),
+            "2 apps are using the virtual camera: chrome (41234), zoom (555)"
+        );
+
+        // A Flatpak reader is invisible to the /proc scan, so this is a real case and not a
+        // defensive one: the count still has to be reported.
+        assert_eq!(
+            holder_banner_text(2, &[]),
+            "2 apps are using the virtual camera"
+        );
+        assert_eq!(
+            holder_banner_text(1, &[]),
+            "1 app is using the virtual camera"
+        );
+    }
 }
