@@ -145,14 +145,10 @@ pub fn demote_current_thread() {
     // rtkit-promoted thread it exists for. Observed: the warning below fired and the
     // process was still RTTIME-killed a moment later.
     let keep_flag = current_policy() & SCHED_RESET_ON_FORK;
-    let param = libc::sched_param { sched_priority: 0 };
-    // SAFETY: pid 0 means the calling thread; `param` is valid for the call. Dropping to
-    // SCHED_OTHER requires no privilege, unlike acquiring a real-time policy.
-    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER | keep_flag, &param) };
-    if rc != 0 {
+    if let Err(e) = set_policy(libc::SCHED_OTHER | keep_flag, 0) {
         // Worst case the model load runs against the RT budget, which is where we were.
         tracing::warn!(
-            error = %std::io::Error::last_os_error(),
+            error = %std::io::Error::from_raw_os_error(e),
             "could not return the audio thread to normal scheduling before reload"
         );
     }
@@ -174,11 +170,18 @@ fn set_rttime_limit() -> std::io::Result<()> {
 
 /// Returns the raw errno on failure, since `EPERM` is a normal outcome we branch on.
 fn set_scheduler_directly() -> Result<(), i32> {
+    set_policy(libc::SCHED_RR, RT_PRIORITY)
+}
+
+/// The one `sched_setscheduler` call site — promotion and demotion both go through it,
+/// so the workspace carries a single unsafe block for the syscall. Returns the raw errno
+/// on failure.
+fn set_policy(policy: i32, priority: i32) -> Result<(), i32> {
     let param = libc::sched_param {
-        sched_priority: RT_PRIORITY,
+        sched_priority: priority,
     };
     // SAFETY: pid 0 means the calling thread; `param` is valid for the call.
-    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &param) };
+    let rc = unsafe { libc::sched_setscheduler(0, policy, &param) };
     if rc == 0 {
         Ok(())
     } else {

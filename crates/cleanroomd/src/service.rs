@@ -216,7 +216,10 @@ mod tests {
     /// it would destroy a setting that becomes valid again the moment it is plugged in.
     #[test]
     fn an_unknown_value_is_stored_as_given() {
-        assert_eq!(resolve_microphone("alsa_input.not-plugged-in", &sources()), None);
+        assert_eq!(
+            resolve_microphone("alsa_input.not-plugged-in", &sources()),
+            None
+        );
         assert_eq!(resolve_microphone("", &[]), None);
     }
 

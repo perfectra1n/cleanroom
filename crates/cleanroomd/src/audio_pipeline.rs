@@ -10,7 +10,7 @@
 
 use crate::state::{HealthState, Shared};
 use cleanroom_audio::{Denoiser, SharedAudio, VirtualMic, to_dbfs};
-use cleanroom_core::VIRTUAL_MIC_NODE;
+use cleanroom_core::{Config, VIRTUAL_MIC_NODE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -108,6 +108,48 @@ fn run(shared: Arc<Shared>, audio: Arc<SharedAudio>, stop: Arc<AtomicBool>) {
     }
 }
 
+/// Park while audio is disabled in config, reporting Idle, until it is re-enabled or the
+/// daemon stops.
+fn wait_while_disabled(shared: &Arc<Shared>, stop: &Arc<AtomicBool>) -> Outcome {
+    shared.set_audio_health(HealthState::idle("audio disabled in config"));
+    while !stop.load(Ordering::Relaxed) && !shared.config().audio.enabled {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Two ways out of that wait, and they must not read the same: leaving because the
+    // user re-enabled audio has to restart the pipeline, not end the thread.
+    if stop.load(Ordering::Relaxed) {
+        Outcome::Stopped
+    } else {
+        Outcome::Restart
+    }
+}
+
+/// Load the denoiser up front so a missing model is reported as a clear health state
+/// rather than as a mic that mysteriously does nothing. Running without it is a
+/// legitimate mode — a passthrough virtual mic is still useful — but it is *reported*
+/// (Degraded) rather than silently substituted. `None` with denoise disabled in config
+/// is the passthrough the user asked for.
+fn load_denoiser(shared: &Arc<Shared>, cfg: &Config) -> Option<Denoiser> {
+    if !cfg.audio.denoise.enabled {
+        return None;
+    }
+    match cleanroom_audio::find_model().and_then(|m| {
+        Denoiser::new(
+            &m,
+            cfg.audio.denoise.attenuation_db,
+            cfg.audio.denoise.post_filter_beta,
+        )
+    }) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            shared.set_audio_health(HealthState::degraded(format!(
+                "running as passthrough — denoiser unavailable: {e}"
+            )));
+            None
+        }
+    }
+}
+
 fn run_once(
     shared: &Arc<Shared>,
     audio: &Arc<SharedAudio>,
@@ -122,43 +164,13 @@ fn run_once(
     let cfg = shared.config();
 
     if !cfg.audio.enabled {
-        shared.set_audio_health(HealthState::idle("audio disabled in config"));
-        while !stop.load(Ordering::Relaxed) && !shared.config().audio.enabled {
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        // Two ways out of that wait, and they must not read the same: leaving because the
-        // user re-enabled audio has to restart the pipeline, not end the thread.
-        return Ok(if stop.load(Ordering::Relaxed) {
-            Outcome::Stopped
-        } else {
-            Outcome::Restart
-        });
+        return Ok(wait_while_disabled(shared, stop));
     }
 
-    // Load the denoiser up front so a missing model is reported as a clear health state
-    // rather than as a mic that mysteriously does nothing. Running without it is a
-    // legitimate mode — a passthrough virtual mic is still useful — but it is *reported*
-    // rather than silently substituted.
-    let denoiser = if cfg.audio.denoise.enabled {
-        match cleanroom_audio::find_model().and_then(|m| {
-            Denoiser::new(
-                &m,
-                cfg.audio.denoise.attenuation_db,
-                cfg.audio.denoise.post_filter_beta,
-            )
-        }) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                shared.set_audio_health(HealthState::degraded(format!(
-                    "running as passthrough — denoiser unavailable: {e}"
-                )));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
+    // `DfTract`'s thread-safety is not documented, and upstream's own LADSPA plugin
+    // deliberately never moves one across a thread boundary — so it is constructed here
+    // and used only inside the process closure on the PipeWire thread that owns it.
+    let mut denoiser = load_denoiser(shared, &cfg);
     let denoise_active = denoiser.is_some();
     let target = cfg.audio.device.clone();
 
@@ -187,11 +199,6 @@ fn run_once(
             },
         )));
     }
-
-    // Moved into the process closure. `DfTract`'s thread-safety is not documented, and
-    // upstream's own LADSPA plugin deliberately never moves one across a thread boundary
-    // — so it is constructed here and used only on the PipeWire thread that owns it.
-    let mut denoiser = denoiser;
 
     // Restart when a setting changes that we cannot apply in place.
     //

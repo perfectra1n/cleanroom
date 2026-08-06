@@ -684,17 +684,12 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
         let tx = tx.clone();
         let ui_weak = ui.as_weak();
         ui.on_set_microphone(move |index| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            use slint::Model;
-            let Some(id) = usize::try_from(index)
-                .ok()
-                .and_then(|i| ui.get_microphone_ids().row_data(i))
-            else {
+            let Some(id) = ui_weak.upgrade().and_then(|ui| mic_id_at(&ui, index)) else {
                 return;
             };
             let _ = tx.send(SetRequest {
                 key: "audio.device",
-                value: id.to_string(),
+                value: id,
             });
         });
     }
@@ -820,6 +815,16 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     ui.on_set_guided_radius(move |v| s("video.guided_radius", format!("{}", v.round() as u32)));
     let s = send.clone();
     ui.on_set_matting_backend(move |i| s("video.matting_backend", backend_name(i).to_string()));
+}
+
+/// The device id behind a microphone picker row, or `None` when the index is out of
+/// range — Slint hands back -1 on an empty model.
+fn mic_id_at(ui: &AppWindow, index: i32) -> Option<String> {
+    use slint::Model;
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| ui.get_microphone_ids().row_data(i))
+        .map(|id| id.to_string())
 }
 
 /// Which row of the microphone picker the configured device id occupies, or -1 for none.
@@ -948,10 +953,17 @@ mod tests {
             .into_iter()
         };
         assert_eq!(
-            mic_index(ids(), "alsa_input.usb-Focusrite_Scarlett-00.HiFi__Mic1__source"),
+            mic_index(
+                ids(),
+                "alsa_input.usb-Focusrite_Scarlett-00.HiFi__Mic1__source"
+            ),
             1
         );
-        assert_eq!(mic_index(ids(), "(unset)"), -1, "no device means no highlight");
+        assert_eq!(
+            mic_index(ids(), "(unset)"),
+            -1,
+            "no device means no highlight"
+        );
         assert_eq!(
             mic_index(ids(), "alsa_input.unplugged"),
             -1,
