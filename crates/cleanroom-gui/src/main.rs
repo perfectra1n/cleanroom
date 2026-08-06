@@ -61,6 +61,10 @@ slint::include_modules!();
 /// in every taskbar, dock and alt-tab.
 const APP_ID: &str = "io.github.perfectra1n.Cleanroom";
 
+/// The one disconnect message that actually means "start the daemon". The version
+/// mismatch case gets its own text from `cleanroom_ipc::version_mismatch_message`.
+const NOT_RUNNING_MSG: &str = "Not connected to the Cleanroom daemon. Start it with: cleanroomd";
+
 /// A setting change requested by the UI.
 struct SetRequest {
     key: &'static str,
@@ -203,15 +207,22 @@ async fn dbus_loop(ui: slint::Weak<AppWindow>, mut set_rx: mpsc::UnboundedReceiv
                 // first poll includes them so the pickers are populated immediately.
                 let with_devices = ticks.is_multiple_of(DEVICE_POLL_EVERY);
                 ticks = ticks.wrapping_add(1);
-                let snap = poll(with_devices).await;
+                let outcome = poll_outcome(with_devices).await;
                 let ui = ui.clone();
                 // Touching the UI from another thread is not allowed; this hands the
                 // update to the Slint event loop.
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui.upgrade() {
-                        match snap {
-                            Some(s) => apply_snapshot(&ui, s),
-                            None => ui.set_connected(false),
+                        match outcome {
+                            PollOutcome::Snapshot(s) => apply_snapshot(&ui, *s),
+                            PollOutcome::Mismatch(msg) => {
+                                ui.set_connected(false);
+                                ui.set_connect_error(msg.into());
+                            }
+                            PollOutcome::Unreachable => {
+                                ui.set_connected(false);
+                                ui.set_connect_error(NOT_RUNNING_MSG.into());
+                            }
                         }
                     }
                 });
@@ -230,9 +241,40 @@ async fn proxy() -> zbus::Result<CleanroomProxy<'static>> {
     CleanroomProxy::new(&conn).await
 }
 
-async fn poll(with_devices: bool) -> Option<Snapshot> {
-    let p = proxy().await.ok()?;
+/// What one poll learned, with the two failure shapes kept apart.
+///
+/// Collapsing them into one was the original sin here: a `Status` whose D-Bus signature
+/// this build can't decode used to read as "daemon not running", and the banner told the
+/// user to start a daemon that was already up. `InterfaceVersion` is a bare `u32`, so it
+/// decodes across every client generation and cleanly separates the two cases.
+enum PollOutcome {
+    Snapshot(Box<Snapshot>),
+    /// Daemon reachable but incompatible; carries the shared "update me" message.
+    Mismatch(String),
+    Unreachable,
+}
 
+async fn poll_outcome(with_devices: bool) -> PollOutcome {
+    let Ok(p) = proxy().await else {
+        return PollOutcome::Unreachable;
+    };
+    // The property read doubles as the liveness probe: it is the first call on the
+    // fresh connection, so a missing daemon fails here, before the version check.
+    let Ok(daemon_version) = p.interface_version().await else {
+        return PollOutcome::Unreachable;
+    };
+    if let Some(msg) = cleanroom_ipc::version_mismatch_message(daemon_version) {
+        return PollOutcome::Mismatch(msg);
+    }
+    match poll(p, with_devices).await {
+        Some(s) => PollOutcome::Snapshot(Box::new(s)),
+        // Versions agree, so a decode failure can only mean the daemon went away
+        // between the probe and the poll.
+        None => PollOutcome::Unreachable,
+    }
+}
+
+async fn poll(p: CleanroomProxy<'static>, with_devices: bool) -> Option<Snapshot> {
     let devices = if with_devices {
         let cameras = p
             .list_cameras()

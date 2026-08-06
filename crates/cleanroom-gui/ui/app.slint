@@ -62,6 +62,10 @@ export component AppWindow inherits Window {
     in property <float> mic-out-db: -100;
 
     in property <bool> connected: false;
+    // Why we are disconnected, set from Rust. Two very different situations share the
+    // banner: no daemon at all, and a daemon whose D-Bus interface version this GUI
+    // doesn't speak — the second must never masquerade as the first.
+    in property <string> connect-error: "Not connected to the Cleanroom daemon. Start it with: cleanroomd";
 
     // Device pickers. Populated from ListCameras / ListMicrophones.
     in property <[string]> camera-names: [];
@@ -151,7 +155,7 @@ export component AppWindow inherits Window {
                 padding: 8px;
                 Text {
                     text: !root.connected
-                        ? "Not connected to the Cleanroom daemon. Start it with: cleanroomd"
+                        ? root.connect-error
                         : "Running degraded — see the detail below.";
                     wrap: word-wrap;
                 }

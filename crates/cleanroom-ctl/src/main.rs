@@ -81,6 +81,17 @@ async fn main() -> Result<()> {
          service, start it with `cleanroomd`",
     )?;
 
+    // Gate on the interface version before the first real call. The version property is
+    // a bare u32 and decodes across every generation, so a mismatch surfaces as "update
+    // the daemon / update this program" instead of a raw signature-mismatch error at
+    // whatever call happened to run first. A failed probe is ignored on purpose: the
+    // command below will produce the usual, more specific error.
+    if let Ok(v) = proxy.interface_version().await
+        && let Some(msg) = cleanroom_ipc::version_mismatch_message(v)
+    {
+        anyhow::bail!("{msg}");
+    }
+
     match cli.command {
         Command::Status => status(&proxy).await?,
         Command::Get { key } => println!("{}", proxy.get(&key).await?),

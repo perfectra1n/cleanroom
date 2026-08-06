@@ -34,6 +34,28 @@ pub const INTERFACE: &str = "io.github.perfectra1n.Cleanroom1";
 ///    newer `Status` at all and needs to be told to update rather than left guessing.
 pub const INTERFACE_VERSION: u32 = 4;
 
+/// The "update me" message the version property exists to enable.
+///
+/// Shared between the GUI and the CLI so a mismatch reads the same everywhere, and so
+/// neither client is tempted to map it onto "daemon not running" — the failure this
+/// message replaces was exactly that: an old GUI hit the changed `Status` signature,
+/// couldn't decode it, and told the user to start a daemon that was already running.
+/// `daemon` is the value read from the `InterfaceVersion` property, which is a bare
+/// `u32` and therefore decodable by every client generation.
+pub fn version_mismatch_message(daemon: u32) -> Option<String> {
+    match daemon.cmp(&INTERFACE_VERSION) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some(format!(
+            "The Cleanroom daemon is running but speaks interface v{daemon}; this client \
+             expects v{INTERFACE_VERSION} — update the daemon."
+        )),
+        std::cmp::Ordering::Greater => Some(format!(
+            "The Cleanroom daemon is running but speaks interface v{daemon}; this client \
+             expects v{INTERFACE_VERSION} — update this program."
+        )),
+    }
+}
+
 /// How healthy the pipeline is.
 ///
 /// This type is the enforcement mechanism for the project's central rule: **no silent
@@ -227,4 +249,28 @@ pub trait Cleanroom {
     /// Roughly once a second while running.
     #[zbus(signal)]
     fn stats(&self, stats: PipelineStats) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn matching_versions_are_not_a_mismatch() {
+        assert_eq!(version_mismatch_message(INTERFACE_VERSION), None);
+    }
+
+    #[test]
+    fn older_daemon_tells_the_user_to_update_the_daemon() {
+        let msg = version_mismatch_message(INTERFACE_VERSION - 1).unwrap();
+        assert!(msg.contains("update the daemon"), "got: {msg}");
+        assert!(msg.contains("running"), "got: {msg}");
+    }
+
+    #[test]
+    fn newer_daemon_tells_the_user_to_update_this_client() {
+        let msg = version_mismatch_message(INTERFACE_VERSION + 1).unwrap();
+        assert!(msg.contains("update this"), "got: {msg}");
+        assert!(msg.contains("running"), "got: {msg}");
+    }
 }
