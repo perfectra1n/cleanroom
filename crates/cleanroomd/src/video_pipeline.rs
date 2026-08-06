@@ -31,6 +31,14 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 /// so there is little reason to persevere with one that is producing errors.
 const MATTE_ERROR_RESET: u32 = 30;
 
+/// Consecutive undecodable frames before the camera is reopened.
+///
+/// About one second at 30 fps. Below this the failures are weather — a truncated MJPG
+/// payload is a routine USB event, bandwidth contention on a hub is enough — and the
+/// response is to skip the frame. At this many in a row the *stream* is broken, not
+/// unlucky, and renegotiating the device is the medicine rather than the poison.
+const DECODE_ERROR_LIMIT: u32 = 30;
+
 pub struct VideoPipeline {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -331,6 +339,7 @@ fn run_once(
     // Consecutive `infer` failures. A single one is a frame not worth crashing over; a run
     // of them means the recurrent state is wedged and needs clearing.
     let mut infer_errors: u32 = 0;
+    let mut decode_errors: u32 = 0;
     // The decoded replacement plate, and whether its current failure has been reported.
     // The flag stops a broken path re-logging thirty times a second.
     let mut plate: Option<crate::background::Plate> = None;
@@ -456,6 +465,7 @@ fn run_once(
             }
             last_sequence = None;
             infer_errors = 0;
+            decode_errors = 0;
             shared.set_video_health(HealthState::nominal(format!(
                 "{} -> {} ({})",
                 cam_path, sink.path, mode
@@ -502,9 +512,13 @@ fn run_once(
         });
         last_sequence = Some(raw.sequence);
 
-        let t0 = Instant::now();
-        decoder.to_yuy2(raw.data, raw.format, raw.width, raw.height, &mut frame)?;
-        let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let Some(decode_ms) = decode_or_skip(&mut decoder, &raw, &mut frame, &mut decode_errors)?
+        else {
+            // No output frame this iteration. The skip counts as a drop — from a
+            // consumer's seat that is exactly what it is — on top of any driver gap.
+            stats.dropped += dropped_now + 1;
+            continue;
+        };
 
         // Effects. Read the live config each frame so a blur-strength change takes effect
         // on the very next frame rather than at the next restart.
@@ -529,9 +543,6 @@ fn run_once(
                 // composite already blocked on a readback and the downscale blocked on a
                 // second, for three queue submissions a frame against two now.
                 if let Some(m) = matter.as_mut().filter(|_| matting_active) {
-                    // Read before inferring: `alpha` borrows `m`, so the geometry has to be
-                    // out before the match arm needs it.
-                    let (matte_w, matte_h) = (m.infer_w(), m.infer_h());
                     if pipe.begin_frame(&frame.data, Some(&mut matte_rgba)) {
                         let t2 = Instant::now();
                         // Read live, like blur strength: these are pure arithmetic on the
@@ -542,33 +553,7 @@ fn run_once(
                             fall: now_cfg.video.matte_fade_fall,
                             motion_release: now_cfg.video.matte_motion_release,
                         };
-                        match m.infer(&matte_rgba, smoothing) {
-                            Ok(alpha) => {
-                                pipe.set_matte(alpha, matte_w, matte_h);
-                                infer_errors = 0;
-                            }
-                            Err(e) => {
-                                // One failure is a frame, not an outage — the previous
-                                // matte stays up and nobody notices. A *run* of them is
-                                // different: the most likely cause is recurrent state the
-                                // session will keep choking on, and re-feeding it every
-                                // frame forever is how a transient becomes permanent.
-                                infer_errors += 1;
-                                tracing::warn!(
-                                    error = %e,
-                                    consecutive = infer_errors,
-                                    "matting failed for one frame"
-                                );
-                                if infer_errors >= MATTE_ERROR_RESET {
-                                    tracing::warn!(
-                                        "resetting matting state after {infer_errors} \
-                                         consecutive failures"
-                                    );
-                                    m.reset();
-                                    infer_errors = 0;
-                                }
-                            }
-                        }
+                        infer_and_apply_matte(m, pipe, &matte_rgba, smoothing, &mut infer_errors);
                         matting_ms = t2.elapsed().as_secs_f64() * 1000.0;
                     }
                     matte_rejected = m.rejected;
@@ -623,6 +608,95 @@ fn run_once(
 
     // The only way out of that loop is the stop flag.
     Ok(Outcome::Stopped)
+}
+
+/// One matte inference, with the error-run policy.
+///
+/// One failure is a frame, not an outage — the previous matte stays up and nobody
+/// notices. A *run* of them is different: the most likely cause is recurrent state the
+/// session will keep choking on, and re-feeding it every frame forever is how a
+/// transient becomes permanent, so after [`MATTE_ERROR_RESET`] in a row the state is
+/// cleared.
+fn infer_and_apply_matte(
+    m: &mut Matter,
+    pipe: &mut FramePipeline,
+    matte_rgba: &[u8],
+    smoothing: cleanroom_matting::Smoothing,
+    infer_errors: &mut u32,
+) {
+    // Read before inferring: `alpha` borrows `m`, so the geometry has to be out first.
+    let (matte_w, matte_h) = (m.infer_w(), m.infer_h());
+    match m.infer(matte_rgba, smoothing) {
+        Ok(alpha) => {
+            pipe.set_matte(alpha, matte_w, matte_h);
+            *infer_errors = 0;
+        }
+        Err(e) => {
+            *infer_errors += 1;
+            tracing::warn!(
+                error = %e,
+                consecutive = *infer_errors,
+                "matting failed for one frame"
+            );
+            if *infer_errors >= MATTE_ERROR_RESET {
+                tracing::warn!("resetting matting state after {infer_errors} consecutive failures");
+                m.reset();
+                *infer_errors = 0;
+            }
+        }
+    }
+}
+
+/// Convert one camera frame, tolerating isolated corruption.
+///
+/// A truncated MJPG payload is a routine USB event — bandwidth contention on a hub is
+/// enough — and it used to end in `?`: one bad frame published a Failed health state,
+/// sat out the five-second backoff, and then tore the camera down and reopened it,
+/// renegotiating the very USB link that was already struggling. On a machine where
+/// truncation recurs, that is a pipeline that flaps forever with a red banner while 29
+/// of every 30 frames were fine.
+///
+/// So a bad frame is now the same non-event a failed matte is: skip it, keep the last
+/// good picture on the virtual camera, and count. Corruption arrives two ways — the
+/// driver may confess with `V4L2_BUF_FLAG_ERROR` (checked before wasting a decode on
+/// it), or the decoder finds out the hard way — and both feed one counter. Returns
+/// `Some(decode_ms)` for a delivered frame, `None` for a skipped one, and an error only
+/// after [`DECODE_ERROR_LIMIT`] consecutive failures, where reopening the device is
+/// genuinely the next thing to try.
+fn decode_or_skip(
+    decoder: &mut FrameDecoder,
+    raw: &cleanroom_video::RawFrame,
+    frame: &mut Yuy2Frame,
+    errors: &mut u32,
+) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let t0 = Instant::now();
+    let outcome = if raw.corrupt {
+        Err("the driver flagged the frame as corrupt (V4L2_BUF_FLAG_ERROR)".to_string())
+    } else {
+        decoder
+            .to_yuy2(raw.data, raw.format, raw.width, raw.height, frame)
+            .map_err(|e| e.to_string())
+    };
+    match outcome {
+        Ok(()) => {
+            *errors = 0;
+            Ok(Some(t0.elapsed().as_secs_f64() * 1000.0))
+        }
+        Err(e) if *errors + 1 >= DECODE_ERROR_LIMIT => Err(format!(
+            "{e} — {DECODE_ERROR_LIMIT} consecutive frames were undecodable; \
+             reopening the camera"
+        )
+        .into()),
+        Err(e) => {
+            *errors += 1;
+            tracing::warn!(
+                error = %e,
+                consecutive = *errors,
+                "skipping an undecodable camera frame"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Release the devices, wait out the suspend, and say what to do on the other side.
@@ -1386,6 +1460,107 @@ mod tests {
         assert!(
             !matches!(Outcome::Restart, Outcome::Stopped),
             "a restart must never be readable as a stop"
+        );
+    }
+
+    use cleanroom_video::{PixelFormat, RawFrame};
+
+    fn garbage_mjpeg(corrupt: bool) -> RawFrame<'static> {
+        RawFrame {
+            // Not a JPEG: the decoder must reject it, which stands in for a payload the
+            // USB link truncated.
+            data: &[0xDE, 0xAD, 0xBE, 0xEF],
+            format: PixelFormat::Mjpeg,
+            width: 64,
+            height: 32,
+            sequence: 0,
+            corrupt,
+        }
+    }
+
+    /// A truncated MJPG frame used to end the whole pipeline: `?` out of the frame loop,
+    /// Failed health, five seconds of backoff, then a device reopen that renegotiates
+    /// the very USB link that was struggling. Observed live as "JPEG decode failed:
+    /// Corrupt JPEG data: premature end of data segment" flapping forever on a
+    /// bandwidth-starved C920. One bad frame is weather, not an outage.
+    #[test]
+    fn an_undecodable_frame_is_skipped_not_fatal() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = 0u32;
+
+        let got = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+            .expect("one bad frame must not be an error");
+        assert!(got.is_none(), "the frame must be skipped, not delivered");
+        assert_eq!(errors, 1);
+    }
+
+    /// The driver's own verdict must be believed without paying for a decode — and for
+    /// raw formats it is the only warning there is, since a truncated YUYV payload
+    /// "decodes" into a torn picture.
+    #[test]
+    fn a_driver_flagged_frame_is_skipped_before_decoding() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = 0u32;
+
+        // Valid-length YUYV payload, but the driver says it is damaged.
+        let data = vec![0x80u8; 64 * 32 * 2];
+        let raw = RawFrame {
+            data: &data,
+            format: PixelFormat::Yuyv,
+            width: 64,
+            height: 32,
+            sequence: 0,
+            corrupt: true,
+        };
+        let got = decode_or_skip(&mut decoder, &raw, &mut frame, &mut errors).unwrap();
+        assert!(got.is_none(), "a corrupt-flagged frame must not be trusted");
+        assert_eq!(errors, 1);
+    }
+
+    /// A good frame ends the error run — 29 failures, one success, 29 more failures must
+    /// never add up to a restart.
+    #[test]
+    fn a_good_frame_resets_the_error_run() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = DECODE_ERROR_LIMIT - 1;
+
+        let data = vec![0x80u8; 64 * 32 * 2];
+        let raw = RawFrame {
+            data: &data,
+            format: PixelFormat::Yuyv,
+            width: 64,
+            height: 32,
+            sequence: 0,
+            corrupt: false,
+        };
+        let got = decode_or_skip(&mut decoder, &raw, &mut frame, &mut errors).unwrap();
+        assert!(got.is_some(), "a clean YUYV frame must be delivered");
+        assert_eq!(errors, 0, "success must clear the run");
+    }
+
+    /// A *run* of undecodable frames is a different animal: the stream itself is broken
+    /// (wrong negotiated mode, half-dead cable) and reopening the device is the right
+    /// medicine — but only then.
+    #[test]
+    fn a_run_of_bad_frames_escalates_to_a_restart() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = 0u32;
+
+        for _ in 0..DECODE_ERROR_LIMIT - 1 {
+            let got =
+                decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+                    .expect("below the limit every failure is a skip");
+            assert!(got.is_none());
+        }
+        let err = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+            .expect_err("the frame at the limit must escalate");
+        assert!(
+            err.to_string().contains("consecutive"),
+            "the error must say it was a run, not one frame: {err}"
         );
     }
 }

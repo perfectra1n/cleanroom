@@ -47,6 +47,13 @@ pub struct RawFrame<'a> {
     /// Driver sequence number. Gaps mean the driver dropped frames, which is worth
     /// distinguishing from us dropping them.
     pub sequence: u32,
+    /// The driver set `V4L2_BUF_FLAG_ERROR` on this buffer: it knows the payload is
+    /// damaged (for UVC, typically an MJPG frame truncated by USB bandwidth pressure).
+    /// The data is still handed over — V4L2's contract is "may be corrupt", not "is
+    /// garbage" — but it must not be trusted as a picture. For MJPEG the decoder would
+    /// catch it anyway; for raw formats a truncated payload is full-length and decodes
+    /// "successfully" into a torn frame, so this flag is the only warning there is.
+    pub corrupt: bool,
 }
 
 pub struct Camera {
@@ -201,6 +208,7 @@ impl Camera {
             width: mode.width,
             height: mode.height,
             sequence: meta.sequence,
+            corrupt: meta.flags.contains(v4l::buffer::Flags::ERROR),
         })
     }
 }
