@@ -125,6 +125,39 @@ pub fn request_for_current_thread() -> RtStatus {
     }
 }
 
+/// Return the calling thread to ordinary scheduling.
+///
+/// Called at the top of every pipeline (re)start, and load-bearing: the thread keeps its
+/// SCHED_RR policy from the previous run, and the DeepFilterNet model load that follows
+/// is a long continuous CPU burst. Under the `RLIMIT_RTTIME` budget rtkit made us set,
+/// that burst is indistinguishable from a wedged real-time thread, and the kernel's
+/// answer to one of those is SIGKILL to the whole process — no signal handler, no log
+/// line, exit code 137. Observed on every microphone switch in a debug build, where the
+/// unoptimised model load comfortably exceeds the 200 ms budget.
+///
+/// First start is a no-op (the thread is not real-time yet), which is exactly the
+/// symmetry wanted: every pass through `run_once` does its heavy lifting at normal
+/// priority and is promoted afterwards.
+pub fn demote_current_thread() {
+    // The SCHED_RESET_ON_FORK flag rtkit set must be passed back, not dropped: the
+    // kernel reads a policy without it as a request to *clear* the flag, which needs
+    // CAP_SYS_NICE — so a plain SCHED_OTHER demotion fails with EPERM precisely on the
+    // rtkit-promoted thread it exists for. Observed: the warning below fired and the
+    // process was still RTTIME-killed a moment later.
+    let keep_flag = current_policy() & SCHED_RESET_ON_FORK;
+    let param = libc::sched_param { sched_priority: 0 };
+    // SAFETY: pid 0 means the calling thread; `param` is valid for the call. Dropping to
+    // SCHED_OTHER requires no privilege, unlike acquiring a real-time policy.
+    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER | keep_flag, &param) };
+    if rc != 0 {
+        // Worst case the model load runs against the RT budget, which is where we were.
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "could not return the audio thread to normal scheduling before reload"
+        );
+    }
+}
+
 fn set_rttime_limit() -> std::io::Result<()> {
     let lim = libc::rlimit {
         rlim_cur: RT_TIME_LIMIT_US,
