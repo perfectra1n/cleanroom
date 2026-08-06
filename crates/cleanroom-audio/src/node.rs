@@ -23,7 +23,7 @@
 //! what makes it a link target other apps can select, lets it become the default input,
 //! and is why `AUTOCONNECT` is inert here — it *is* the target.
 
-use crate::ringbuf::{HOP, HopBridge};
+use crate::ringbuf::{HOP, RING_HOPS};
 use cleanroom_core::CaptureTarget;
 use libspa::param::audio::{AudioFormat, AudioInfoRaw};
 use libspa::pod::Pod;
@@ -32,7 +32,8 @@ use pipewire::stream::StreamFlags;
 use std::cell::RefCell;
 use std::io::Cursor;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// DeepFilterNet operates at exactly this rate. The reference machine's graph already
 /// runs at 48 kHz, so no resampling is needed — but the format is advertised as fixed
@@ -53,36 +54,48 @@ pub enum AudioError {
 
     #[error("no hardware microphone available to capture from")]
     NoInput,
+
+    #[error("could not spawn the denoise worker thread: {0}")]
+    Worker(std::io::Error),
 }
 
-/// Everything the two streams share.
+/// A peak level the RT callbacks can publish without taking a lock.
+///
+/// This used to be `Mutex<f32>`, locked from both realtime callbacks *and* the daemon's
+/// metering poll — a textbook priority-inversion pair: the RT thread parks on a mutex
+/// held by a normal-priority thread that just got preempted. The critical section was
+/// nanoseconds, so it rarely bit, but "rarely" is not a property a realtime path gets to
+/// have. An f32 round-trips through its bit pattern losslessly, so an `AtomicU32` is the
+/// whole fix.
+#[derive(Default)]
+pub struct AtomicLevel(AtomicU32);
+
+impl AtomicLevel {
+    pub fn set(&self, v: f32) {
+        self.0.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// Everything the streams, the worker and the daemon share. Atomics only — this struct
+/// is touched from the realtime callbacks, and nothing on that path may wait.
+#[derive(Default)]
 pub struct SharedAudio {
-    pub bridge: Mutex<HopBridge>,
     /// Peak level seen on the way in, linear 0..1. Read by the daemon for metering.
-    pub level_in: Mutex<f32>,
-    pub level_out: Mutex<f32>,
+    pub level_in: AtomicLevel,
+    pub level_out: AtomicLevel,
+    /// Total samples lost to a full ring. Non-zero means the denoise worker could not
+    /// keep up. Not yet surfaced by the daemon's status — read it in a debugger or a
+    /// future health line, but do not mistake this comment for reporting.
+    pub overruns: AtomicU64,
 }
 
 impl SharedAudio {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            // 32 hops = 320 ms of slack. Enough to ride out a scheduling hiccup without
-            // letting latency run away if something goes badly wrong.
-            bridge: Mutex::new(HopBridge::new(32)),
-            level_in: Mutex::new(0.0),
-            level_out: Mutex::new(0.0),
-        })
-    }
-}
-
-impl Default for SharedAudio {
-    fn default() -> Self {
-        // Only here to satisfy clippy; the Arc constructor is the real entry point.
-        Self {
-            bridge: Mutex::new(HopBridge::new(32)),
-            level_in: Mutex::new(0.0),
-            level_out: Mutex::new(0.0),
-        }
+        Arc::new(Self::default())
     }
 }
 
@@ -134,6 +147,87 @@ pub fn to_dbfs(linear: f32) -> f32 {
 /// scale of link churn and well under anyone's patience.
 const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The denoise worker thread with its rings, split into the ends each party keeps: the
+/// capture callback takes `cap_tx` and `waker`, the playback callback takes `out_rx`,
+/// and shutdown takes `handle` and `stop`.
+struct DenoiseWorker {
+    handle: std::thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    cap_tx: rtrb::Producer<f32>,
+    out_rx: crate::ringbuf::CycleReader,
+    waker: std::thread::Thread,
+}
+
+/// Spawn the worker and wire its rings. See [`crate::ringbuf::run_worker`] for what
+/// runs on it, and [`VirtualMic::run`] for why `make_process` is a factory.
+fn spawn_denoise_worker<F, M>(
+    shared: Arc<SharedAudio>,
+    make_process: M,
+) -> Result<DenoiseWorker, AudioError>
+where
+    F: FnMut(&[f32; HOP], &mut [f32; HOP]) + 'static,
+    M: FnOnce() -> F + Send + 'static,
+{
+    let (cap_tx, cap_rx) = rtrb::RingBuffer::<f32>::new(RING_HOPS * HOP);
+    let (out_tx, out_rx) = rtrb::RingBuffer::<f32>::new(RING_HOPS * HOP);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = std::thread::Builder::new()
+        .name("cleanroom-denoise".into())
+        .spawn({
+            let stop = stop.clone();
+            move || {
+                let process = make_process();
+                crate::ringbuf::run_worker(cap_rx, out_tx, process, stop, shared)
+            }
+        })
+        .map_err(AudioError::Worker)?;
+    let waker = handle.thread().clone();
+    Ok(DenoiseWorker {
+        handle,
+        stop,
+        cap_tx,
+        out_rx: crate::ringbuf::CycleReader::new(out_rx),
+        waker,
+    })
+}
+
+/// Feed every registry event about links and nodes into the tracker, so the timer tick
+/// can answer "who is listening, and what else could we capture". The returned listener
+/// must be kept alive for the life of the loop.
+fn watch_registry(
+    registry: &pipewire::registry::RegistryRc,
+    tracker: &Rc<RefCell<crate::registry::LinkTracker>>,
+) -> pipewire::registry::Listener {
+    let t_add = tracker.clone();
+    let t_del = tracker.clone();
+    registry
+        .add_listener_local()
+        .global(move |g| {
+            let Some(props) = g.props else { return };
+            match g.type_ {
+                pipewire::types::ObjectType::Link => {
+                    let id_of = |k: &str| props.get(k).and_then(|v| v.parse::<u32>().ok());
+                    t_add.borrow_mut().add_link(
+                        g.id,
+                        id_of(*pipewire::keys::LINK_OUTPUT_NODE),
+                        id_of(*pipewire::keys::LINK_INPUT_NODE),
+                    );
+                }
+                pipewire::types::ObjectType::Node => {
+                    let class = props.get(*pipewire::keys::MEDIA_CLASS).unwrap_or("");
+                    let name = props.get(*pipewire::keys::NODE_NAME).unwrap_or("");
+                    let desc = props.get(*pipewire::keys::NODE_DESCRIPTION);
+                    if !name.is_empty() {
+                        t_add.borrow_mut().add_node(g.id, class, name, desc);
+                    }
+                }
+                _ => {}
+            }
+        })
+        .global_remove(move |id| t_del.borrow_mut().remove_global(id))
+        .register()
+}
+
 /// Runs the PipeWire main loop with a capture stream and a source stream.
 ///
 /// Blocks until `stop` is signalled. Intended to own a dedicated thread: the PipeWire
@@ -143,21 +237,44 @@ pub struct VirtualMic;
 impl VirtualMic {
     /// Build and run the node graph.
     ///
-    /// `process` is called with one hop in and one hop out, on the PipeWire thread but
-    /// outside the RT callback path — see [`HopBridge::drain`].
-    pub fn run<F>(
+    /// `make_process` is a factory, not the processor itself, and that is load-bearing:
+    /// it runs ON the dedicated worker thread and returns the per-hop closure, which
+    /// then never crosses a thread boundary in its life. The denoiser it typically
+    /// captures is `!Send` — `DfTract` holds `Rc<Tensor>` — so it *cannot* be built on
+    /// the caller's thread and handed over. An earlier shape of this API took the
+    /// closure directly and executed it on PipeWire's RT data thread anyway, the `!Send`
+    /// move hidden by the C FFI boundary; the factory makes the compiler enforce what a
+    /// doc comment used to plead. It also puts the model load (a long CPU burn) on a
+    /// thread that is never realtime, so `RLIMIT_RTTIME` can no longer kill the process
+    /// over it.
+    ///
+    /// The closure is called with one hop in and one hop out — see
+    /// [`crate::ringbuf::run_worker`].
+    pub fn run<F, M>(
         shared: Arc<SharedAudio>,
         capture_target: Option<CaptureTarget>,
         node_name: &str,
         node_description: &str,
-        mut process: F,
+        make_process: M,
         should_stop: impl Fn() -> bool + 'static,
         view: Arc<crate::registry::RegistryView>,
     ) -> Result<(), AudioError>
     where
         F: FnMut(&[f32; HOP], &mut [f32; HOP]) + 'static,
+        M: FnOnce() -> F + Send + 'static,
     {
         pipewire::init();
+
+        // The worker and its rings exist before either stream does, because the capture
+        // callback needs the producer end and the worker's wake handle at registration
+        // time.
+        let DenoiseWorker {
+            handle: worker,
+            stop: worker_stop,
+            cap_tx,
+            out_rx,
+            waker,
+        } = spawn_denoise_worker(shared.clone(), make_process)?;
 
         // The 0.10 bindings hand out reference-counted handles rather than plain owned
         // ones; the Rc variants are what `Stream::new` expects.
@@ -203,7 +320,11 @@ impl VirtualMic {
         let capture =
             pipewire::stream::StreamRc::new(core.clone(), "cleanroom-capture", capture_props)?;
 
+        // This closure runs on the realtime data thread (RT_PROCESS below): everything
+        // in it is a bounded copy, an atomic, or a futex wake. No locks, no allocation,
+        // no inference — that all happens on the worker this callback wakes.
         let cap_shared = shared.clone();
+        let mut cap_tx = cap_tx;
         let _cap_listener = capture
             .add_local_listener_with_user_data(())
             .process(move |stream, _| {
@@ -226,12 +347,9 @@ impl VirtualMic {
                 let samples =
                     unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const f32, n) };
 
-                if let Ok(mut lvl) = cap_shared.level_in.lock() {
-                    *lvl = peak(samples);
-                }
-                if let Ok(mut b) = cap_shared.bridge.lock() {
-                    b.submit(samples);
-                }
+                cap_shared.level_in.set(peak(samples));
+                crate::ringbuf::push_or_drop(&mut cap_tx, samples, &cap_shared.overruns);
+                waker.unpark();
             })
             .register()?;
 
@@ -254,7 +372,11 @@ impl VirtualMic {
         let playback =
             pipewire::stream::StreamRc::new(core.clone(), "cleanroom-source", playback_props)?;
 
+        // Also on the realtime data thread. It pops what the worker already produced —
+        // whole cycles or silence, never a partial fill — and does nothing else. See
+        // `ringbuf::CycleReader` for why partial fills are forbidden.
         let play_shared = shared.clone();
+        let mut out_rx = out_rx;
         let _play_listener = playback
             .add_local_listener_with_user_data(())
             .process(move |stream, _| {
@@ -283,16 +405,8 @@ impl VirtualMic {
                 let out =
                     unsafe { std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut f32, want) };
 
-                if let Ok(mut b) = play_shared.bridge.lock() {
-                    // Run the denoiser over everything that has arrived, then hand out
-                    // what it produced. Both happen here rather than in the capture
-                    // callback so the work lands on the playback cycle's budget.
-                    b.drain(&mut process);
-                    b.collect(out);
-                }
-                if let Ok(mut lvl) = play_shared.level_out.lock() {
-                    *lvl = peak(out);
-                }
+                out_rx.pop_cycle(out);
+                play_shared.level_out.set(peak(out));
 
                 let chunk = d.chunk_mut();
                 *chunk.offset_mut() = 0;
@@ -332,34 +446,7 @@ impl VirtualMic {
         tracker.borrow_mut().set_node_id(playback.node_id());
 
         let registry = core.get_registry_rc()?;
-        let t_add = tracker.clone();
-        let t_del = tracker.clone();
-        let _reg_listener = registry
-            .add_listener_local()
-            .global(move |g| {
-                let Some(props) = g.props else { return };
-                match g.type_ {
-                    pipewire::types::ObjectType::Link => {
-                        let id_of = |k: &str| props.get(k).and_then(|v| v.parse::<u32>().ok());
-                        t_add.borrow_mut().add_link(
-                            g.id,
-                            id_of(*pipewire::keys::LINK_OUTPUT_NODE),
-                            id_of(*pipewire::keys::LINK_INPUT_NODE),
-                        );
-                    }
-                    pipewire::types::ObjectType::Node => {
-                        let class = props.get(*pipewire::keys::MEDIA_CLASS).unwrap_or("");
-                        let name = props.get(*pipewire::keys::NODE_NAME).unwrap_or("");
-                        let desc = props.get(*pipewire::keys::NODE_DESCRIPTION);
-                        if !name.is_empty() {
-                            t_add.borrow_mut().add_node(g.id, class, name, desc);
-                        }
-                    }
-                    _ => {}
-                }
-            })
-            .global_remove(move |id| t_del.borrow_mut().remove_global(id))
-            .register();
+        let _reg_listener = watch_registry(&registry, &tracker);
 
         // Poll the stop flag from a timer rather than blocking forever, so shutdown does
         // not depend on the main loop noticing a signal.
@@ -440,6 +527,15 @@ impl VirtualMic {
             .ok();
 
         mainloop.run();
+
+        // The worker parks with a timeout, so this join is bounded even if the unpark
+        // races the park. Leaking the thread instead would leak a denoiser (and its
+        // model) per pipeline restart — the exact leak-per-restart bug the video side
+        // had with its Matter.
+        worker_stop.store(true, Ordering::Relaxed);
+        worker.thread().unpark();
+        let _ = worker.join();
+
         tracing::info!("virtual microphone stopped");
         Ok(())
     }

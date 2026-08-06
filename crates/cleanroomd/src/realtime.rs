@@ -127,17 +127,18 @@ pub fn request_for_current_thread() -> RtStatus {
 
 /// Return the calling thread to ordinary scheduling.
 ///
-/// Called at the top of every pipeline (re)start, and load-bearing: the thread keeps its
-/// SCHED_RR policy from the previous run, and the DeepFilterNet model load that follows
-/// is a long continuous CPU burst. Under the `RLIMIT_RTTIME` budget rtkit made us set,
-/// that burst is indistinguishable from a wedged real-time thread, and the kernel's
-/// answer to one of those is SIGKILL to the whole process — no signal handler, no log
-/// line, exit code 137. Observed on every microphone switch in a debug build, where the
-/// unoptimised model load comfortably exceeds the 200 ms budget.
+/// Called at the top of every pipeline (re)start: the thread keeps its SCHED_RR policy
+/// from the previous run, and restart-time work — config reads, D-Bus, PipeWire graph
+/// setup — has no business running under a realtime policy while the `RLIMIT_RTTIME`
+/// budget is armed. The kernel's answer to a thread that burns past that budget without
+/// blocking is SIGKILL to the whole process — no signal handler, no log line, exit code
+/// 137. Observed on every microphone switch in a debug build, back when the
+/// DeepFilterNet model load still ran on this thread; that load has since moved to the
+/// never-realtime denoise worker, which removed the big burst, but the
+/// demote-then-repromote symmetry stays: every pass through `run_once` does its setup
+/// at normal priority and is promoted afterwards.
 ///
-/// First start is a no-op (the thread is not real-time yet), which is exactly the
-/// symmetry wanted: every pass through `run_once` does its heavy lifting at normal
-/// priority and is promoted afterwards.
+/// First start is a no-op (the thread is not real-time yet).
 pub fn demote_current_thread() {
     // The SCHED_RESET_ON_FORK flag rtkit set must be passed back, not dropped: the
     // kernel reads a policy without it as a request to *clear* the flag, which needs

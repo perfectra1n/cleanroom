@@ -31,9 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                let i = *shared.level_in.lock().unwrap();
-                let o = *shared.level_out.lock().unwrap();
-                let over = shared.bridge.lock().unwrap().overruns;
+                let i = shared.level_in.get();
+                let o = shared.level_out.get();
+                let over = shared.overruns.load(Ordering::Relaxed);
                 println!(
                     "in {:6.1} dBFS   out {:6.1} dBFS   overruns {over}",
                     to_dbfs(i),
@@ -49,7 +49,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target,
         cleanroom_core::VIRTUAL_MIC_NODE,
         "Cleanroom Microphone",
-        |inp, outp| outp.copy_from_slice(inp),
+        // A factory rather than the closure itself: the real daemon builds its (!Send)
+        // denoiser inside this, on the worker thread. Passthrough needs no such care,
+        // but the API shape is the same.
+        || {
+            |inp: &[f32; cleanroom_audio::HOP], outp: &mut [f32; cleanroom_audio::HOP]| {
+                outp.copy_from_slice(inp)
+            }
+        },
         move || stop_check.load(Ordering::Relaxed),
         cleanroom_audio::RegistryView::new(),
     )?;
