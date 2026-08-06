@@ -90,6 +90,10 @@ struct Snapshot {
     guided_radius: f32,
     matting_backend: i32,
     background_image: String,
+    /// The configured `audio.device` — a PipeWire `node.name`, or `(unset)`. Fetched on
+    /// every poll, unlike the device *list*, so the picker highlight tracks a change made
+    /// from the CLI within half a second rather than within ten.
+    audio_device: String,
     /// `None` when this poll skipped the expensive parts (see `DEVICE_POLL_EVERY`).
     devices: Option<Devices>,
 }
@@ -308,6 +312,7 @@ async fn poll(p: CleanroomProxy<'static>, with_devices: bool) -> Option<Snapshot
     Some(Snapshot {
         devices,
         background_image: p.get("video.background_image").await.unwrap_or_default(),
+        audio_device: p.get("audio.device").await.unwrap_or_default(),
         status: p.status().await.ok()?,
         background: match p.get("video.background").await.ok()?.as_str() {
             "off" => 0,
@@ -610,11 +615,27 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
 
         let mic_names: Vec<slint::SharedString> =
             d.microphones.iter().map(|(_, desc)| desc.into()).collect();
+        let mic_ids: Vec<slint::SharedString> =
+            d.microphones.iter().map(|(id, _)| id.into()).collect();
         ui.set_microphone_names(slint::ModelRc::new(slint::VecModel::from(mic_names)));
+        ui.set_microphone_ids(slint::ModelRc::new(slint::VecModel::from(mic_ids)));
 
         ui.set_autostart_on(d.autostart_on);
         ui.set_autostart_mechanism(d.autostart_mechanism.clone().into());
         ui.set_autostart_instruction(d.autostart_instruction.clone().into());
+    }
+
+    // Every poll, not only the device-list ones: the ids model persists between list
+    // refreshes, so the highlight can track a config change made from the CLI at the
+    // status cadence. An unmatched value — `(unset)`, or a device currently unplugged —
+    // reads as no selection rather than as a wrong one.
+    {
+        use slint::Model;
+        let ids = ui.get_microphone_ids();
+        ui.set_microphone_index(mic_index(
+            ids.iter().map(|id| id.to_string()),
+            &s.audio_device,
+        ));
     }
 
     // Reflect the daemon's values back, so a change made from the CLI or a second GUI
@@ -655,20 +676,25 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
         });
     }
     {
+        // The picker displays descriptions but the config stores the PipeWire node.name,
+        // so the selection arrives as an index into the parallel ids model. Sending the
+        // description was the original bug here: `target.object` matches names only, so
+        // a description in the config made PipeWire silently bind some other microphone
+        // while the status line echoed the configured string as if it were live.
         let tx = tx.clone();
         let ui_weak = ui.as_weak();
-        ui.on_set_microphone(move |label| {
-            // Microphones are listed by description, so map back through the model to the
-            // PipeWire node.name, which is what config stores.
+        ui.on_set_microphone(move |index| {
             let Some(ui) = ui_weak.upgrade() else { return };
             use slint::Model;
-            let names = ui.get_microphone_names();
-            if let Some(i) = names.iter().position(|n| n.as_str() == label.as_str()) {
-                ui.set_microphone_index(i as i32);
-            }
+            let Some(id) = usize::try_from(index)
+                .ok()
+                .and_then(|i| ui.get_microphone_ids().row_data(i))
+            else {
+                return;
+            };
             let _ = tx.send(SetRequest {
                 key: "audio.device",
-                value: label.to_string(),
+                value: id.to_string(),
             });
         });
     }
@@ -796,6 +822,18 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     ui.on_set_matting_backend(move |i| s("video.matting_backend", backend_name(i).to_string()));
 }
 
+/// Which row of the microphone picker the configured device id occupies, or -1 for none.
+///
+/// -1 is the honest answer for `(unset)` and for a device that is not currently plugged
+/// in; highlighting row 0 instead is exactly the "shows A50 Mono while capturing the
+/// Scarlett" confusion this exists to prevent.
+fn mic_index(ids: impl Iterator<Item = String>, device: &str) -> i32 {
+    ids.enumerate()
+        .find(|(_, id)| id == device)
+        .map(|(i, _)| i as i32)
+        .unwrap_or(-1)
+}
+
 /// Combo index to the config value. Order matches the `model` in `app.slint`.
 fn backend_name(i: i32) -> &'static str {
     match i {
@@ -895,6 +933,31 @@ mod tests {
             off.contains("cleanroom-ctl status"),
             "the hint must say where to look next, got {off}"
         );
+    }
+
+    /// The picker highlight must track the *configured id*, and only the configured id.
+    /// It was previously never set at all, so the ComboBox sat on row 0 — showing
+    /// "A50 Mono" while the daemon captured a different device entirely.
+    #[test]
+    fn the_microphone_highlight_follows_the_configured_id_or_nothing() {
+        let ids = || {
+            [
+                "alsa_input.usb-Logitech_A50-00.mono-fallback".to_string(),
+                "alsa_input.usb-Focusrite_Scarlett-00.HiFi__Mic1__source".to_string(),
+            ]
+            .into_iter()
+        };
+        assert_eq!(
+            mic_index(ids(), "alsa_input.usb-Focusrite_Scarlett-00.HiFi__Mic1__source"),
+            1
+        );
+        assert_eq!(mic_index(ids(), "(unset)"), -1, "no device means no highlight");
+        assert_eq!(
+            mic_index(ids(), "alsa_input.unplugged"),
+            -1,
+            "an absent device must not fall back to row 0"
+        );
+        assert_eq!(mic_index([].into_iter(), "anything"), -1);
     }
 
     /// The count is authoritative and the names are best-effort, so the banner has to read
