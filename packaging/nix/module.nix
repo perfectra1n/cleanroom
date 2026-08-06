@@ -16,10 +16,15 @@ let
   # One label per provisioned device, comma-separated as v4l2loopback's card_label
   # parameter expects. The first is the label the daemon selects by exact match; the
   # rest are visibly spares. Generated from loopbackDevices so the two never drift.
-  loopbackLabels = lib.concatStringsSep "," (
-    [ cfg.cardLabel ]
-    ++ lib.genList (i: "Cleanroom Spare ${toString (i + 1)}") (cfg.loopbackDevices - 1)
-  );
+  # A comma inside the label would silently desync this list from devices=N — the
+  # kernel would read it as two shorter labels — so refuse it at eval time.
+  loopbackLabels =
+    assert lib.assertMsg (!lib.hasInfix "," cfg.cardLabel)
+      "services.cleanroom.cardLabel must not contain a comma: v4l2loopback's card_label is comma-delimited, one label per device.";
+    lib.concatStringsSep "," (
+      [ cfg.cardLabel ]
+      ++ lib.genList (i: "Cleanroom Spare ${toString (i + 1)}") (cfg.loopbackDevices - 1)
+    );
 in
 {
   options.services.cleanroom = {

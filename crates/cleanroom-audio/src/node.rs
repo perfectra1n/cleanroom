@@ -147,23 +147,55 @@ pub fn to_dbfs(linear: f32) -> f32 {
 /// scale of link churn and well under anyone's patience.
 const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The denoise worker thread with its rings, split into the ends each party keeps: the
-/// capture callback takes `cap_tx` and `waker`, the playback callback takes `out_rx`,
-/// and shutdown takes `handle` and `stop`.
+/// A join guard for the denoise worker thread. Dropping it stops and joins the worker.
+///
+/// The `Drop` is the load-bearing part, not a convenience: `VirtualMic::run` has a
+/// dozen fallible steps between spawning the worker and reaching its shutdown code, and
+/// an early `?` — most plausibly `connect_rc` failing because PipeWire is down, the
+/// exact case the daemon retries every five seconds — must not orphan a thread that has
+/// loaded a whole DeepFilterNet session and parks every 10 ms forever. It also closes a
+/// health race by ordering: the worker's own health report cannot land after the
+/// caller's failure report, because the join here happens while the error is still
+/// propagating.
 struct DenoiseWorker {
-    handle: std::thread::JoinHandle<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    cap_tx: rtrb::Producer<f32>,
-    out_rx: crate::ringbuf::CycleReader,
     waker: std::thread::Thread,
 }
 
-/// Spawn the worker and wire its rings. See [`crate::ringbuf::run_worker`] for what
-/// runs on it, and [`VirtualMic::run`] for why `make_process` is a factory.
+impl DenoiseWorker {
+    /// The handle the capture callback uses to wake the worker after a push.
+    fn waker(&self) -> std::thread::Thread {
+        self.waker.clone()
+    }
+}
+
+impl Drop for DenoiseWorker {
+    fn drop(&mut self) {
+        // The worker parks with a timeout, so this join is bounded even if the unpark
+        // races the park. Worst case it waits out a model load that was still running.
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.thread().unpark();
+            let _ = h.join();
+        }
+    }
+}
+
+/// Spawn the worker and wire its rings, returning the guard plus the ring ends the two
+/// RT callbacks keep. See [`crate::ringbuf::run_worker`] for what runs on the thread,
+/// and [`VirtualMic::run`] for why `make_process` is a factory.
 fn spawn_denoise_worker<F, M>(
     shared: Arc<SharedAudio>,
     make_process: M,
-) -> Result<DenoiseWorker, AudioError>
+) -> Result<
+    (
+        DenoiseWorker,
+        rtrb::Producer<f32>,
+        crate::ringbuf::CycleReader,
+    ),
+    AudioError,
+>
 where
     F: FnMut(&[f32; HOP], &mut [f32; HOP]) + 'static,
     M: FnOnce() -> F + Send + 'static,
@@ -182,13 +214,15 @@ where
         })
         .map_err(AudioError::Worker)?;
     let waker = handle.thread().clone();
-    Ok(DenoiseWorker {
-        handle,
-        stop,
+    Ok((
+        DenoiseWorker {
+            handle: Some(handle),
+            stop,
+            waker,
+        },
         cap_tx,
-        out_rx: crate::ringbuf::CycleReader::new(out_rx),
-        waker,
-    })
+        crate::ringbuf::CycleReader::new(out_rx),
+    ))
 }
 
 /// Feed every registry event about links and nodes into the tracker, so the timer tick
@@ -267,14 +301,10 @@ impl VirtualMic {
 
         // The worker and its rings exist before either stream does, because the capture
         // callback needs the producer end and the worker's wake handle at registration
-        // time.
-        let DenoiseWorker {
-            handle: worker,
-            stop: worker_stop,
-            cap_tx,
-            out_rx,
-            waker,
-        } = spawn_denoise_worker(shared.clone(), make_process)?;
+        // time. The guard stays a named local for the whole function: every `?` below
+        // must stop and join the worker on its way out (see `DenoiseWorker`).
+        let (worker, cap_tx, out_rx) = spawn_denoise_worker(shared.clone(), make_process)?;
+        let waker = worker.waker();
 
         // The 0.10 bindings hand out reference-counted handles rather than plain owned
         // ones; the Rc variants are what `Stream::new` expects.
@@ -528,13 +558,10 @@ impl VirtualMic {
 
         mainloop.run();
 
-        // The worker parks with a timeout, so this join is bounded even if the unpark
-        // races the park. Leaking the thread instead would leak a denoiser (and its
-        // model) per pipeline restart — the exact leak-per-restart bug the video side
-        // had with its Matter.
-        worker_stop.store(true, Ordering::Relaxed);
-        worker.thread().unpark();
-        let _ = worker.join();
+        // Deterministically before the log line rather than at scope end. Leaking the
+        // thread instead would leak a denoiser (and its model) per pipeline restart —
+        // the exact leak-per-restart bug the video side had with its Matter.
+        drop(worker);
 
         tracing::info!("virtual microphone stopped");
         Ok(())
@@ -573,5 +600,30 @@ mod tests {
     fn rate_matches_deepfilternet() {
         assert_eq!(SAMPLE_RATE, 48_000);
         assert_eq!(CHANNELS, 1);
+    }
+
+    /// Dropping the worker guard must stop and join the thread — the guard's whole
+    /// reason to exist. `VirtualMic::run` has a dozen fallible steps after the spawn
+    /// (most plausibly `connect_rc` failing because PipeWire is down, which the daemon
+    /// retries every five seconds), and before the guard each early `?` orphaned an
+    /// immortal thread holding a loaded DeepFilterNet session — one more per retry —
+    /// whose late health report then overwrote the failure report with "nominal".
+    #[test]
+    fn dropping_the_worker_guard_stops_and_joins_the_thread() {
+        let shared = SharedAudio::new();
+        let (worker, _cap_tx, _out_rx) = spawn_denoise_worker(shared.clone(), || {
+            |_: &[f32; HOP], out: &mut [f32; HOP]| out.fill(0.0)
+        })
+        .expect("spawning the worker");
+
+        drop(worker);
+
+        // The join inside Drop is what makes this deterministic: once drop returns,
+        // the thread has exited and released its clone of `shared`.
+        assert_eq!(
+            Arc::strong_count(&shared),
+            1,
+            "the worker thread must be gone, not parked forever"
+        );
     }
 }
