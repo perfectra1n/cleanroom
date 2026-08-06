@@ -45,9 +45,9 @@ panics        = 0
 [[over]]
 key  = "cleanroom_audio::node::VirtualMic::run"
 file = "crates/cleanroom-audio/src/node.rs"
-cognitive  = 47
-cyclomatic = 36
-lines      = 211
+cognitive  = 32
+cyclomatic = 29
+lines      = 189
 note = "Owns a dedicated thread and drives the PipeWire main loop, which is not async and expects to drive itself: capture stream, source stream, format negotiation and the process callback all share one scope. The second-worst cognitive score in the workspace, and unlike the frame.rs entries the score is real branching rather than length. Lifting stream setup out of the loop body is the obvious first cut."
 
 [[over]]
@@ -129,10 +129,10 @@ note = "Nesting only: the supervisor loop around run_once, carrying the restart-
 [[over]]
 key  = "cleanroomd::video_pipeline::run_once"
 file = "crates/cleanroomd/src/video_pipeline.rs"
-cognitive  = 98
-cyclomatic = 62
-nesting    = 6
-lines      = 298
+cognitive  = 88
+cyclomatic = 60
+nesting    = 4
+lines      = 267
 note = "By a wide margin the worst function in the workspace — cognitive 104 against 47 for the next one, and the only function to reach nesting 6. It does camera open, v4l2loopback sink, the PipeWire publisher thread, GPU pipeline construction and matting init, and then the entire per-frame hot loop: decode timing, matte inference, error-run detection and reset, background-plate sync, stats and live-settings reconciliation. The matting-error block and the suspend/resume region are the two self-contained pieces and the obvious first extractions."
 
 # Code this tool cannot see into: syn keeps macro bodies as raw tokens.
