@@ -72,18 +72,38 @@ impl Drop for AudioPipeline {
     }
 }
 
+/// Why `run_once` returned without an error.
+///
+/// The same distinction the video pipeline had to learn the hard way: "asked to stop" and
+/// "config changed, come straight back" are different answers, and collapsing them into
+/// one return value is how a routine `set audio.device` ends the audio thread for good.
+/// Worse, the old shape here reported a device *change* as `Err("config changed")`, so
+/// switching microphones published a Failed health state and sat in the failure backoff
+/// for five seconds — a dead mic and a red banner for doing exactly what the user asked.
+#[must_use]
+enum Outcome {
+    /// The stop flag was set. The thread should end.
+    Stopped,
+    /// A setting changed that cannot be applied in place. Re-enter `run_once` now.
+    Restart,
+}
+
 fn run(shared: Arc<Shared>, audio: Arc<SharedAudio>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = run_once(&shared, &audio, &stop) {
-            shared.set_audio_health(HealthState::failed(e.to_string()));
-            for _ in 0..20 {
-                if stop.load(Ordering::Relaxed) {
-                    return;
+        match run_once(&shared, &audio, &stop) {
+            Ok(Outcome::Stopped) => return,
+            Ok(Outcome::Restart) => continue,
+            Err(e) => {
+                shared.set_audio_health(HealthState::failed(e.to_string()));
+                // Back off before retrying: a PipeWire daemon that is restarting will
+                // come back, and hammering it at full speed would just spam the log.
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
                 }
-                std::thread::sleep(Duration::from_millis(250));
             }
-        } else {
-            return;
         }
     }
 }
@@ -92,7 +112,13 @@ fn run_once(
     shared: &Arc<Shared>,
     audio: &Arc<SharedAudio>,
     stop: &Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    // On a restart this thread is still SCHED_RR from the previous run, and the model
+    // load below is exactly the sustained CPU burn RLIMIT_RTTIME exists to kill. Drop
+    // back to normal scheduling first; the promotion is re-requested below once the
+    // heavy lifting is done. See `demote_current_thread` for the observed failure.
+    crate::realtime::demote_current_thread();
+
     let cfg = shared.config();
 
     if !cfg.audio.enabled {
@@ -100,7 +126,13 @@ fn run_once(
         while !stop.load(Ordering::Relaxed) && !shared.config().audio.enabled {
             std::thread::sleep(Duration::from_millis(250));
         }
-        return Ok(());
+        // Two ways out of that wait, and they must not read the same: leaving because the
+        // user re-enabled audio has to restart the pipeline, not end the thread.
+        return Ok(if stop.load(Ordering::Relaxed) {
+            Outcome::Stopped
+        } else {
+            Outcome::Restart
+        });
     }
 
     // Load the denoiser up front so a missing model is reported as a clear health state
@@ -130,18 +162,29 @@ fn run_once(
     let denoise_active = denoiser.is_some();
     let target = cfg.audio.device.clone();
 
-    if denoise_active {
-        // Deliberately does NOT include the attenuation value. That is applied live via
-        // set_atten_lim without restarting the node, so embedding it here would leave a
-        // stale number on screen the moment the user moves the slider — the UI shows the
-        // live value next to the slider instead.
+    // Nominal both when the denoiser is running and when it is off *by choice* — a
+    // passthrough the user asked for is healthy, and leaving the previous health in place
+    // here meant a device switch could leave "failed: config changed" on screen while the
+    // mic worked fine. The one case that keeps its earlier detail is denoise requested but
+    // unavailable, which set Degraded above.
+    //
+    // Deliberately does NOT include the attenuation value. That is applied live via
+    // set_atten_lim without restarting the node, so embedding it here would leave a
+    // stale number on screen the moment the user moves the slider — the UI shows the
+    // live value next to the slider instead.
+    if denoise_active == cfg.audio.denoise.enabled {
         shared.set_audio_health(HealthState::nominal(format!(
-            "{} -> {} (DeepFilterNet)",
+            "{} -> {} ({})",
             target
                 .as_ref()
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "system default".into()),
             VIRTUAL_MIC_NODE,
+            if denoise_active {
+                "DeepFilterNet"
+            } else {
+                "passthrough"
+            },
         )));
     }
 
@@ -213,10 +256,11 @@ fn run_once(
         shared.audio_registry.clone(),
     )?;
 
-    // Distinguish "asked to stop" from "restart for a config change": returning Ok on a
-    // config change would exit the loop and leave the mic gone until a daemon restart.
-    if !stop.load(Ordering::Relaxed) {
-        return Err("config changed".into());
-    }
-    Ok(())
+    // The main loop only quits for the stop flag or for a config change the watch closure
+    // noticed; which one it was decides whether the thread ends or comes straight back.
+    Ok(if stop.load(Ordering::Relaxed) {
+        Outcome::Stopped
+    } else {
+        Outcome::Restart
+    })
 }
