@@ -31,6 +31,14 @@ const IDLE_POLL: Duration = Duration::from_millis(250);
 /// so there is little reason to persevere with one that is producing errors.
 const MATTE_ERROR_RESET: u32 = 30;
 
+/// Consecutive undecodable frames before the camera is reopened.
+///
+/// About one second at 30 fps. Below this the failures are weather — a truncated MJPG
+/// payload is a routine USB event, bandwidth contention on a hub is enough — and the
+/// response is to skip the frame. At this many in a row the *stream* is broken, not
+/// unlucky, and renegotiating the device is the medicine rather than the poison.
+const DECODE_ERROR_LIMIT: u32 = 30;
+
 pub struct VideoPipeline {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -116,12 +124,23 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     // three seconds forever.
     let mut matting_demoted = false;
 
+    // Whether any run_once iteration has ever successfully published a GPU adapter name.
+    // The failure path below needs it to keep the GPU status honest about *where* a run
+    // died; see `publish_failure`.
+    let mut gpu_ready = false;
+
     while !stop.load(Ordering::Relaxed) {
-        match run_once(&shared, &stop, &mut matter, &mut matting_demoted) {
+        match run_once(
+            &shared,
+            &stop,
+            &mut matter,
+            &mut matting_demoted,
+            &mut gpu_ready,
+        ) {
             Ok(Outcome::Stopped) => return,
             Ok(Outcome::Restart) => continue,
             Err(e) => {
-                shared.set_video_health(HealthState::failed(e.to_string()));
+                publish_failure(&shared, e.to_string(), gpu_ready);
                 // Back off before retrying. A camera that was unplugged, or a loopback
                 // device another app grabbed first, will usually come back — retrying
                 // forever at full speed would just spam the log.
@@ -141,6 +160,7 @@ fn run_once(
     stop: &AtomicBool,
     matter: &mut Option<Matter>,
     matting_demoted: &mut bool,
+    gpu_ready: &mut bool,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let cfg = shared.config();
 
@@ -193,25 +213,8 @@ fn run_once(
     let mut decoder = FrameDecoder::new(mode.width, mode.height)?;
     let mut frame = Yuy2Frame::new(mode.width, mode.height);
 
-    // The GPU. A failure here is reported and the pipeline continues as a CPU
-    // passthrough — the *only* place a CPU path is acceptable, because a camera that
-    // still works without effects beats a camera that does not work. It is reported as
-    // Degraded rather than Nominal so it can never be mistaken for the real thing.
-    let gpu = match Gpu::new(cfg.gpu.render_node.as_deref()) {
-        Ok(g) => {
-            let name = g.choice.to_string();
-            shared.set_gpu_adapter(name);
-            Some(FramePipeline::new(g, mode.width, mode.height))
-        }
-        Err(e) => {
-            shared.set_gpu_adapter(format!("unavailable: {e}"));
-            shared.set_video_health(HealthState::degraded(format!(
-                "no GPU — passing the camera through unmodified: {e}"
-            )));
-            None
-        }
-    };
-    let mut gpu = gpu;
+    // The GPU. Extracted to `init_gpu`; a failure there is Degraded, never fatal.
+    let mut gpu = init_gpu(shared, &cfg, (mode.width, mode.height), gpu_ready);
     let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
 
     // Seeded from the config this run opened against, then re-checked every frame in the
@@ -331,6 +334,7 @@ fn run_once(
     // Consecutive `infer` failures. A single one is a frame not worth crashing over; a run
     // of them means the recurrent state is wedged and needs clearing.
     let mut infer_errors: u32 = 0;
+    let mut decode_errors: u32 = 0;
     // The decoded replacement plate, and whether its current failure has been reported.
     // The flag stops a broken path re-logging thirty times a second.
     let mut plate: Option<crate::background::Plate> = None;
@@ -456,6 +460,7 @@ fn run_once(
             }
             last_sequence = None;
             infer_errors = 0;
+            decode_errors = 0;
             shared.set_video_health(HealthState::nominal(format!(
                 "{} -> {} ({})",
                 cam_path, sink.path, mode
@@ -502,9 +507,13 @@ fn run_once(
         });
         last_sequence = Some(raw.sequence);
 
-        let t0 = Instant::now();
-        decoder.to_yuy2(raw.data, raw.format, raw.width, raw.height, &mut frame)?;
-        let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let Some(decode_ms) = decode_or_skip(&mut decoder, &raw, &mut frame, &mut decode_errors)?
+        else {
+            // No output frame this iteration. The skip counts as a drop — from a
+            // consumer's seat that is exactly what it is — on top of any driver gap.
+            stats.dropped += dropped_now + 1;
+            continue;
+        };
 
         // Effects. Read the live config each frame so a blur-strength change takes effect
         // on the very next frame rather than at the next restart.
@@ -529,9 +538,6 @@ fn run_once(
                 // composite already blocked on a readback and the downscale blocked on a
                 // second, for three queue submissions a frame against two now.
                 if let Some(m) = matter.as_mut().filter(|_| matting_active) {
-                    // Read before inferring: `alpha` borrows `m`, so the geometry has to be
-                    // out before the match arm needs it.
-                    let (matte_w, matte_h) = (m.infer_w(), m.infer_h());
                     if pipe.begin_frame(&frame.data, Some(&mut matte_rgba)) {
                         let t2 = Instant::now();
                         // Read live, like blur strength: these are pure arithmetic on the
@@ -542,33 +548,7 @@ fn run_once(
                             fall: now_cfg.video.matte_fade_fall,
                             motion_release: now_cfg.video.matte_motion_release,
                         };
-                        match m.infer(&matte_rgba, smoothing) {
-                            Ok(alpha) => {
-                                pipe.set_matte(alpha, matte_w, matte_h);
-                                infer_errors = 0;
-                            }
-                            Err(e) => {
-                                // One failure is a frame, not an outage — the previous
-                                // matte stays up and nobody notices. A *run* of them is
-                                // different: the most likely cause is recurrent state the
-                                // session will keep choking on, and re-feeding it every
-                                // frame forever is how a transient becomes permanent.
-                                infer_errors += 1;
-                                tracing::warn!(
-                                    error = %e,
-                                    consecutive = infer_errors,
-                                    "matting failed for one frame"
-                                );
-                                if infer_errors >= MATTE_ERROR_RESET {
-                                    tracing::warn!(
-                                        "resetting matting state after {infer_errors} \
-                                         consecutive failures"
-                                    );
-                                    m.reset();
-                                    infer_errors = 0;
-                                }
-                            }
-                        }
+                        infer_and_apply_matte(m, pipe, &matte_rgba, smoothing, &mut infer_errors);
                         matting_ms = t2.elapsed().as_secs_f64() * 1000.0;
                     }
                     matte_rejected = m.rejected;
@@ -623,6 +603,154 @@ fn run_once(
 
     // The only way out of that loop is the stop flag.
     Ok(Outcome::Stopped)
+}
+
+/// What `status` shows for the GPU when a run died before reaching GPU init.
+///
+/// One of exactly three GPU states, and the wording keeps them distinct: this string
+/// (never attempted), "unavailable: <err>" (attempted and failed), or the adapter name
+/// (working). The seed in `Shared::new` is phrased the same way for the same reason.
+const GPU_NOT_ATTEMPTED: &str = "not attempted — the video pipeline failed before GPU init";
+
+/// Report a failed run, and keep the GPU status honest about *where* it failed.
+///
+/// `run_once` opens the camera before it touches the GPU, so an error can arrive with
+/// the "not attempted" seed still published — and a placeholder sitting next to a red
+/// health banner reads like a GPU fault. Observed live: a mis-set video.device
+/// crash-looped the pipeline and sent the user diagnosing a healthy RTX 5090.
+///
+/// The rule: "not attempted" is only claimed while no run has ever successfully
+/// published an adapter name. Once one has, a later failure — a camera unplug mid-call —
+/// leaves it alone, because the adapter the last run used is still the truth about the
+/// GPU. A previous run's "unavailable: <err>" is *not* preserved: it described a GPU
+/// attempt that this failure never reached, and the next successful camera open
+/// re-derives it within seconds anyway.
+fn publish_failure(shared: &Shared, error: String, gpu_ready: bool) {
+    shared.set_video_health(HealthState::failed(error));
+    if !gpu_ready {
+        shared.set_gpu_adapter(GPU_NOT_ATTEMPTED);
+    }
+}
+
+/// Build the GPU pipeline, or explain why the run continues without one.
+///
+/// A failure here is reported and the pipeline continues as a CPU passthrough — the
+/// *only* place a CPU path is acceptable, because a camera that still works without
+/// effects beats a camera that does not work. It is reported as Degraded rather than
+/// Nominal so it can never be mistaken for the real thing.
+///
+/// `gpu_ready` records, for the life of the process, that an adapter name was
+/// successfully published at least once; [`publish_failure`] consults it to tell "the
+/// GPU was never reached" from "the GPU is fine and something upstream broke".
+fn init_gpu(
+    shared: &Arc<Shared>,
+    cfg: &Config,
+    (width, height): (u32, u32),
+    gpu_ready: &mut bool,
+) -> Option<FramePipeline> {
+    match Gpu::new(cfg.gpu.render_node.as_deref()) {
+        Ok(g) => {
+            shared.set_gpu_adapter(g.choice.to_string());
+            *gpu_ready = true;
+            Some(FramePipeline::new(g, width, height))
+        }
+        Err(e) => {
+            shared.set_gpu_adapter(format!("unavailable: {e}"));
+            shared.set_video_health(HealthState::degraded(format!(
+                "no GPU — passing the camera through unmodified: {e}"
+            )));
+            None
+        }
+    }
+}
+
+/// One matte inference, with the error-run policy.
+///
+/// One failure is a frame, not an outage — the previous matte stays up and nobody
+/// notices. A *run* of them is different: the most likely cause is recurrent state the
+/// session will keep choking on, and re-feeding it every frame forever is how a
+/// transient becomes permanent, so after [`MATTE_ERROR_RESET`] in a row the state is
+/// cleared.
+fn infer_and_apply_matte(
+    m: &mut Matter,
+    pipe: &mut FramePipeline,
+    matte_rgba: &[u8],
+    smoothing: cleanroom_matting::Smoothing,
+    infer_errors: &mut u32,
+) {
+    // Read before inferring: `alpha` borrows `m`, so the geometry has to be out first.
+    let (matte_w, matte_h) = (m.infer_w(), m.infer_h());
+    match m.infer(matte_rgba, smoothing) {
+        Ok(alpha) => {
+            pipe.set_matte(alpha, matte_w, matte_h);
+            *infer_errors = 0;
+        }
+        Err(e) => {
+            *infer_errors += 1;
+            tracing::warn!(
+                error = %e,
+                consecutive = *infer_errors,
+                "matting failed for one frame"
+            );
+            if *infer_errors >= MATTE_ERROR_RESET {
+                tracing::warn!("resetting matting state after {infer_errors} consecutive failures");
+                m.reset();
+                *infer_errors = 0;
+            }
+        }
+    }
+}
+
+/// Convert one camera frame, tolerating isolated corruption.
+///
+/// A truncated MJPG payload is a routine USB event — bandwidth contention on a hub is
+/// enough — and it used to end in `?`: one bad frame published a Failed health state,
+/// sat out the five-second backoff, and then tore the camera down and reopened it,
+/// renegotiating the very USB link that was already struggling. On a machine where
+/// truncation recurs, that is a pipeline that flaps forever with a red banner while 29
+/// of every 30 frames were fine.
+///
+/// So a bad frame is now the same non-event a failed matte is: skip it, keep the last
+/// good picture on the virtual camera, and count. Corruption arrives two ways — the
+/// driver may confess with `V4L2_BUF_FLAG_ERROR` (checked before wasting a decode on
+/// it), or the decoder finds out the hard way — and both feed one counter. Returns
+/// `Some(decode_ms)` for a delivered frame, `None` for a skipped one, and an error only
+/// after [`DECODE_ERROR_LIMIT`] consecutive failures, where reopening the device is
+/// genuinely the next thing to try.
+fn decode_or_skip(
+    decoder: &mut FrameDecoder,
+    raw: &cleanroom_video::RawFrame,
+    frame: &mut Yuy2Frame,
+    errors: &mut u32,
+) -> Result<Option<f64>, Box<dyn std::error::Error>> {
+    let t0 = Instant::now();
+    let outcome = if raw.corrupt {
+        Err("the driver flagged the frame as corrupt (V4L2_BUF_FLAG_ERROR)".to_string())
+    } else {
+        decoder
+            .to_yuy2(raw.data, raw.format, raw.width, raw.height, frame)
+            .map_err(|e| e.to_string())
+    };
+    match outcome {
+        Ok(()) => {
+            *errors = 0;
+            Ok(Some(t0.elapsed().as_secs_f64() * 1000.0))
+        }
+        Err(e) if *errors + 1 >= DECODE_ERROR_LIMIT => Err(format!(
+            "{e} — {DECODE_ERROR_LIMIT} consecutive frames were undecodable; \
+             reopening the camera"
+        )
+        .into()),
+        Err(e) => {
+            *errors += 1;
+            tracing::warn!(
+                error = %e,
+                consecutive = *errors,
+                "skipping an undecodable camera frame"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Release the devices, wait out the suspend, and say what to do on the other side.
@@ -1386,6 +1514,148 @@ mod tests {
         assert!(
             !matches!(Outcome::Restart, Outcome::Stopped),
             "a restart must never be readable as a stop"
+        );
+    }
+
+    fn shared() -> Arc<Shared> {
+        let dir = std::env::temp_dir().join(format!("cleanroom-vp-test-{}", std::process::id()));
+        Shared::new(
+            Config::default(),
+            cleanroom_core::ConfigPaths::at(dir.join("config.toml")),
+        )
+    }
+
+    /// The GPU-status confusion that sent a user diagnosing a healthy RTX 5090: the
+    /// pipeline crash-looped on a bad video.device — an error *before* GPU init — while
+    /// the GPU field went on showing its startup placeholder, which read as a GPU fault.
+    /// A failure upstream of GPU init must say so in the GPU field itself.
+    #[test]
+    fn a_failure_before_gpu_init_reports_the_gpu_as_not_attempted() {
+        let s = shared();
+        publish_failure(&s, "cannot open /dev/video0: busy".into(), false);
+
+        let st = s.status();
+        assert_eq!(st.video_health, cleanroom_ipc::Health::Failed);
+        assert_eq!(
+            st.gpu_adapter, GPU_NOT_ATTEMPTED,
+            "the GPU field must point upstream, not read as a GPU fault"
+        );
+    }
+
+    /// The other half of the rule: once a run has published a working adapter, a later
+    /// failure — a camera unplugged mid-call — is not news about the GPU, and
+    /// overwriting the adapter name would turn every unplug into a phantom GPU outage.
+    #[test]
+    fn a_camera_unplug_must_not_erase_a_working_gpu_adapter() {
+        let s = shared();
+        s.set_gpu_adapter("NVIDIA GeForce RTX 5090 (Vulkan)");
+        publish_failure(&s, "camera unplugged".into(), true);
+
+        let st = s.status();
+        assert_eq!(st.video_health, cleanroom_ipc::Health::Failed);
+        assert_eq!(
+            st.gpu_adapter, "NVIDIA GeForce RTX 5090 (Vulkan)",
+            "the adapter the last run used is still the truth about the GPU"
+        );
+    }
+
+    use cleanroom_video::{PixelFormat, RawFrame};
+
+    fn garbage_mjpeg(corrupt: bool) -> RawFrame<'static> {
+        RawFrame {
+            // Not a JPEG: the decoder must reject it, which stands in for a payload the
+            // USB link truncated.
+            data: &[0xDE, 0xAD, 0xBE, 0xEF],
+            format: PixelFormat::Mjpeg,
+            width: 64,
+            height: 32,
+            sequence: 0,
+            corrupt,
+        }
+    }
+
+    /// A truncated MJPG frame used to end the whole pipeline: `?` out of the frame loop,
+    /// Failed health, five seconds of backoff, then a device reopen that renegotiates
+    /// the very USB link that was struggling. Observed live as "JPEG decode failed:
+    /// Corrupt JPEG data: premature end of data segment" flapping forever on a
+    /// bandwidth-starved C920. One bad frame is weather, not an outage.
+    #[test]
+    fn an_undecodable_frame_is_skipped_not_fatal() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = 0u32;
+
+        let got = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+            .expect("one bad frame must not be an error");
+        assert!(got.is_none(), "the frame must be skipped, not delivered");
+        assert_eq!(errors, 1);
+    }
+
+    /// The driver's own verdict must be believed without paying for a decode — and for
+    /// raw formats it is the only warning there is, since a truncated YUYV payload
+    /// "decodes" into a torn picture.
+    #[test]
+    fn a_driver_flagged_frame_is_skipped_before_decoding() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = 0u32;
+
+        // Valid-length YUYV payload, but the driver says it is damaged.
+        let data = vec![0x80u8; 64 * 32 * 2];
+        let raw = RawFrame {
+            data: &data,
+            format: PixelFormat::Yuyv,
+            width: 64,
+            height: 32,
+            sequence: 0,
+            corrupt: true,
+        };
+        let got = decode_or_skip(&mut decoder, &raw, &mut frame, &mut errors).unwrap();
+        assert!(got.is_none(), "a corrupt-flagged frame must not be trusted");
+        assert_eq!(errors, 1);
+    }
+
+    /// A good frame ends the error run — 29 failures, one success, 29 more failures must
+    /// never add up to a restart.
+    #[test]
+    fn a_good_frame_resets_the_error_run() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = DECODE_ERROR_LIMIT - 1;
+
+        let data = vec![0x80u8; 64 * 32 * 2];
+        let raw = RawFrame {
+            data: &data,
+            format: PixelFormat::Yuyv,
+            width: 64,
+            height: 32,
+            sequence: 0,
+            corrupt: false,
+        };
+        let got = decode_or_skip(&mut decoder, &raw, &mut frame, &mut errors).unwrap();
+        assert!(got.is_some(), "a clean YUYV frame must be delivered");
+        assert_eq!(errors, 0, "success must clear the run");
+    }
+
+    /// A *run* of undecodable frames is a different animal: the stream itself is broken
+    /// (wrong negotiated mode, half-dead cable) and reopening the device is the right
+    /// medicine — but only then.
+    #[test]
+    fn a_run_of_bad_frames_escalates_to_a_restart() {
+        let mut decoder = FrameDecoder::new(64, 32).unwrap();
+        let mut frame = Yuy2Frame::new(64, 32);
+        let mut errors = 0u32;
+
+        for _ in 0..DECODE_ERROR_LIMIT - 1 {
+            let got = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+                .expect("below the limit every failure is a skip");
+            assert!(got.is_none());
+        }
+        let err = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+            .expect_err("the frame at the limit must escalate");
+        assert!(
+            err.to_string().contains("consecutive"),
+            "the error must say it was a run, not one frame: {err}"
         );
     }
 }

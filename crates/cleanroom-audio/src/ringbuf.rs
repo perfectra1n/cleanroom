@@ -1,6 +1,6 @@
-//! The ring buffer between PipeWire and the denoiser.
+//! The lock-free bridge between PipeWire's realtime callbacks and the denoise worker.
 //!
-//! These two have incompatible, non-negotiable block sizes:
+//! Three parties, three block sizes, and a hard rule about who may wait:
 //!
 //! * **PipeWire's quantum is variable.** On the reference machine it is 1024, but it is
 //!   negotiated across the whole graph and changes when any other client asks for
@@ -8,187 +8,210 @@
 //! * **DeepFilterNet's hop is exactly 480 samples** at 48 kHz — 10 ms. Feeding it
 //!   anything else is not "slightly wrong": upstream guards it with a `debug_assert`,
 //!   which means a *release* build silently produces garbage rather than failing.
+//! * **The RT callbacks may not block, allocate, or run inference.** An earlier shape of
+//!   this module documented a worker thread and then never spawned one: the denoiser ran
+//!   inside the playback stream's `RT_PROCESS` callback, behind a `Mutex`, with a config
+//!   snapshot (a lock *and* a heap allocation) taken per hop. Every cycle where the
+//!   forward pass overran the quantum budget became silence padding — audibly choppy,
+//!   only with denoise enabled, and invisible to any "is the audio silent" test because
+//!   the gaps are sub-hop and scattered.
 //!
-//! So every block that arrives is chopped into 480-sample hops, whatever length it came
-//! in at, and whatever is left over waits for the next block.
+//! So the shape is now actually built: two wait-free SPSC rings ([`rtrb`]) with a
+//! normal-priority worker between them. The capture callback pushes raw samples and wakes
+//! the worker; the worker chops them into hops, runs the denoiser, and pushes the result;
+//! the playback callback pops. Nothing on the RT path does more than a bounded memcpy and
+//! an atomic.
 //!
-//! ## Why it is primed with silence
+//! ## The intra-cycle race, and why the output pops whole cycles or nothing
 //!
-//! Without priming, the very first `collect` would come up short: 1024 samples in yields
-//! two hops and 64 left over, so only 960 are available where 1024 were asked for. Every
-//! shortfall is an audible click.
+//! Within one graph cycle the capture callback and the playback callback run
+//! microseconds apart on the same RT thread. A normal-priority worker cannot win that
+//! race, must not be asked to, and so the playback side can never count on *this*
+//! cycle's audio — only on a standing lead of processed samples from previous cycles.
 //!
-//! Priming the output with one hop of silence bounds the problem permanently. The deficit
-//! at any moment is `samples_in mod 480`, which is strictly less than one hop, so one hop
-//! of slack is exactly enough — for any quantum, forever. The cost is 10 ms of latency,
-//! which is inaudible and far cheaper than dropping or stretching.
+//! That lead has to be built, and partial pops would prevent it: popping whatever is
+//! available and padding the rest yields a sub-hop shortfall every cycle — precisely the
+//! choppiness this module exists to end, delivered by other means. Instead
+//! [`CycleReader`] fills whole cycles or answers with pure silence while the ring keeps
+//! accumulating, and holds delivery back until a full quantum-plus-hop lead exists (see
+//! its docs for why the hysteresis is load-bearing). The deficit is repaid in a couple
+//! of settling cycles at the start of the stream and after a quantum increase, rather
+//! than bled out forever. The steady-state cost is one quantum plus up to two hops of
+//! latency: around 30 ms at a 1024 quantum, unremarkable next to the latency every
+//! denoising mic adds anyway.
+//!
+//! A quantum *decrease* leaves that lead oversized, which is pure latency;
+//! [`CycleReader`] trims it back by discarding the excess once — a single skip-ahead
+//! blip at the moment the graph renegotiates, in exchange for not wearing the old
+//! quantum's latency forever.
+
+use crate::node::SharedAudio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// DeepFilterNet's hop size at 48 kHz. Not a tunable.
 pub const HOP: usize = 480;
 
-/// A single-producer, single-consumer sample queue with a fixed capacity.
+/// Ring capacity, in hops. 320 ms — enough to ride out a scheduling hiccup, small
+/// enough that the latency ceiling stays sane if something goes badly wrong.
+pub const RING_HOPS: usize = 32;
+
+/// How much processed lead beyond the current quantum is tolerated before
+/// [`CycleReader`] trims it, in samples. Two hops: one is the legitimate remainder bound
+/// (the deficit at any moment is `samples mod HOP`), the second is slack so the trim
+/// only fires on a genuine quantum decrease, never oscillates against normal jitter,
+/// and always leaves more than the hysteresis target so trimming cannot re-prime.
+const TRIM_SLACK: usize = 2 * HOP;
+
+/// Append samples, dropping the *newest* on overflow and counting what was lost.
 ///
-/// Deliberately not `VecDeque`: this is touched from the PipeWire realtime callback, and
-/// a growable container can reallocate, which is exactly the kind of unbounded operation
-/// an RT thread must never perform. Capacity is fixed and overrun is explicit.
-pub struct SampleRing {
-    buf: Vec<f32>,
-    read: usize,
-    write: usize,
-    len: usize,
+/// Dropping the newest rather than the oldest is deliberate: a full ring means the
+/// consumer has stalled, and the older audio is what is about to be played. Discarding
+/// that would leave a gap; discarding the newest just means a shorter delay once the
+/// consumer catches up. The count lands in an atomic so the RT side never waits to
+/// report it.
+pub fn push_or_drop(tx: &mut rtrb::Producer<f32>, samples: &[f32], overruns: &AtomicU64) {
+    let take = samples.len().min(tx.slots());
+    if let Ok(chunk) = tx.write_chunk_uninit(take) {
+        chunk.fill_from_iter(samples[..take].iter().copied());
+    }
+    if take < samples.len() {
+        overruns.fetch_add((samples.len() - take) as u64, Ordering::Relaxed);
+    }
 }
 
-impl SampleRing {
-    /// Create a ring holding `hops` hops' worth of samples.
-    pub fn with_hops(hops: usize) -> Self {
+/// The playback callback's end of the processed ring: fills whole cycles or answers
+/// with silence, never partially — and rebuilds a deliberate lead after any shortfall.
+///
+/// The hysteresis is the load-bearing part. Delivery does not resume the moment the
+/// ring merely covers one quantum; after a shortfall it waits for a full
+/// `quantum + HOP`. Without that cushion, resuming at the bare minimum leaves the
+/// remainder walk (`floor(k·quantum / HOP)` versus `k·quantum`) free to dip below zero
+/// a few cycles later — delivered, delivered, pad, in a loop. With it, delivery resumes
+/// only when the worker's long-run rate can never be pierced again, so silence is
+/// confined to the settling cycles after a stream start or a quantum increase.
+pub struct CycleReader {
+    rx: rtrb::Consumer<f32>,
+    /// Whether we are rebuilding the lead. Starts true: a fresh stream has no lead.
+    priming: bool,
+    /// The previous cycle's size. A quantum *increase* must trigger priming even when
+    /// the old lead still technically covers the new quantum — an entering lead without
+    /// the `+ HOP` cushion delivers for a few cycles and then starves, which is the
+    /// deliver-deliver-pad oscillation the hysteresis exists to forbid. Observed as a
+    /// pad on cycle 3 after a 96 → 1024 renegotiation, exactly the walk predicted.
+    last_want: usize,
+}
+
+impl CycleReader {
+    pub fn new(rx: rtrb::Consumer<f32>) -> Self {
         Self {
-            buf: vec![0.0; hops * HOP],
-            read: 0,
-            write: 0,
-            len: 0,
+            rx,
+            priming: true,
+            last_want: 0,
         }
     }
 
-    pub fn capacity(&self) -> usize {
-        self.buf.len()
+    /// Samples currently buffered — the lead. For tests and diagnostics.
+    pub fn available(&self) -> usize {
+        self.rx.slots()
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Number of whole hops available.
-    pub fn hops_available(&self) -> usize {
-        self.len / HOP
-    }
-
-    /// Append samples. Returns how many were dropped because the ring was full.
+    /// Fill `out` completely from the ring, or fill it with silence and keep building.
     ///
-    /// Dropping the *newest* samples on overrun rather than the oldest is deliberate: a
-    /// full ring means the consumer has stalled, and the older audio is what is about to
-    /// be played. Discarding that would leave a gap; discarding the newest just means a
-    /// shorter delay once the consumer catches up.
-    pub fn push(&mut self, samples: &[f32]) -> usize {
-        let space = self.capacity() - self.len;
-        let take = samples.len().min(space);
-        for &s in &samples[..take] {
-            self.buf[self.write] = s;
-            self.write = (self.write + 1) % self.buf.len();
+    /// Returns whether real audio was delivered. After a successful pop, a lead
+    /// exceeding the quantum by more than [`TRIM_SLACK`] (a quantum decrease just
+    /// happened) is discarded to cap latency — a single skip-ahead blip against
+    /// carrying the old quantum's delay forever. The trim leaves more than the
+    /// hysteresis target, so trimming can never itself trigger re-priming.
+    pub fn pop_cycle(&mut self, out: &mut [f32]) -> bool {
+        if out.len() > self.last_want {
+            self.priming = true;
         }
-        self.len += take;
-        samples.len() - take
-    }
+        self.last_want = out.len();
 
-    /// Fill `out` from the ring. Returns how many samples were written; any shortfall is
-    /// left untouched so the caller decides what to do about it.
-    pub fn pop(&mut self, out: &mut [f32]) -> usize {
-        let take = out.len().min(self.len);
-        for slot in out.iter_mut().take(take) {
-            *slot = self.buf[self.read];
-            self.read = (self.read + 1) % self.buf.len();
-        }
-        self.len -= take;
-        take
-    }
-
-    /// Remove exactly one hop, or return false if a whole hop is not ready.
-    pub fn pop_hop(&mut self, out: &mut [f32; HOP]) -> bool {
-        if self.len < HOP {
+        let target = if self.priming {
+            out.len() + HOP
+        } else {
+            out.len()
+        };
+        if self.rx.slots() < target {
+            self.priming = true;
+            out.fill(0.0);
             return false;
         }
-        self.pop(out.as_mut_slice());
+        self.priming = false;
+
+        if let Ok(chunk) = self.rx.read_chunk(out.len()) {
+            let (a, b) = chunk.as_slices();
+            out[..a.len()].copy_from_slice(a);
+            out[a.len()..].copy_from_slice(b);
+            chunk.commit_all();
+        }
+        let excess = self.rx.slots().saturating_sub(out.len() + TRIM_SLACK);
+        if excess > 0
+            && let Ok(chunk) = self.rx.read_chunk(excess)
+        {
+            chunk.commit_all();
+        }
         true
     }
-
-    /// Append `n` samples of silence.
-    pub fn push_silence(&mut self, n: usize) {
-        let silence = [0.0f32; HOP];
-        let mut remaining = n;
-        while remaining > 0 {
-            let chunk = remaining.min(HOP);
-            self.push(&silence[..chunk]);
-            remaining -= chunk;
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.read = 0;
-        self.write = 0;
-        self.len = 0;
-    }
 }
 
-/// Input and output rings plus scratch, sized and primed correctly.
-pub struct HopBridge {
-    pub input: SampleRing,
-    pub output: SampleRing,
-    /// Total samples dropped to overrun. Non-zero means the denoiser could not keep up,
-    /// which the daemon reports rather than hides.
-    pub overruns: u64,
+/// Run `process` over every whole hop waiting in `input`. Returns whether any hop was
+/// processed, so the worker knows whether to park.
+///
+/// `process` receives exactly one hop and writes exactly one hop — non-negotiable, see
+/// the module docs on DeepFilterNet's `debug_assert`.
+pub fn drain_hops<F>(
+    input: &mut rtrb::Consumer<f32>,
+    output: &mut rtrb::Producer<f32>,
+    process: &mut F,
+    overruns: &AtomicU64,
+) -> bool
+where
+    F: FnMut(&[f32; HOP], &mut [f32; HOP]),
+{
+    let mut inp = [0.0f32; HOP];
+    let mut outp = [0.0f32; HOP];
+    let mut any = false;
+    while input.slots() >= HOP {
+        let Ok(chunk) = input.read_chunk(HOP) else {
+            break;
+        };
+        let (a, b) = chunk.as_slices();
+        inp[..a.len()].copy_from_slice(a);
+        inp[a.len()..].copy_from_slice(b);
+        chunk.commit_all();
+
+        outp.fill(0.0);
+        process(&inp, &mut outp);
+        push_or_drop(output, &outp, overruns);
+        any = true;
+    }
+    any
 }
 
-impl HopBridge {
-    /// `capacity_hops` bounds how much jitter can be absorbed. 32 hops is 320 ms —
-    /// enough to ride out a scheduling hiccup, small enough that the latency ceiling
-    /// stays sane if something goes badly wrong.
-    pub fn new(capacity_hops: usize) -> Self {
-        let mut output = SampleRing::with_hops(capacity_hops);
-
-        // The priming that makes every subsequent collect succeed. See the module docs:
-        // the deficit is bounded by one hop, so one hop of slack covers it for any quantum.
-        output.push_silence(HOP);
-
-        Self {
-            input: SampleRing::with_hops(capacity_hops),
-            output,
-            overruns: 0,
+/// The denoise worker: the normal-priority thread the RT callbacks hand their work to.
+///
+/// Parked rather than polled: the capture callback unparks it after every push (an
+/// `unpark` is a futex wake — RT-safe), and the timeout is only a safety net so shutdown
+/// and a silently-stopped capture stream cannot leave it parked forever. Inference,
+/// config snapshots and their allocations all happen here, where a lock or a slow hop
+/// costs latency the rings absorb rather than a missed RT deadline.
+pub fn run_worker<F>(
+    mut input: rtrb::Consumer<f32>,
+    mut output: rtrb::Producer<f32>,
+    mut process: F,
+    stop: Arc<AtomicBool>,
+    shared: Arc<SharedAudio>,
+) where
+    F: FnMut(&[f32; HOP], &mut [f32; HOP]),
+{
+    while !stop.load(Ordering::Relaxed) {
+        if !drain_hops(&mut input, &mut output, &mut process, &shared.overruns) {
+            std::thread::park_timeout(Duration::from_millis(10));
         }
-    }
-
-    /// Feed captured audio in.
-    pub fn submit(&mut self, samples: &[f32]) {
-        let dropped = self.input.push(samples);
-        if dropped > 0 {
-            self.overruns += dropped as u64;
-        }
-    }
-
-    /// Run `process` over every whole hop currently available.
-    ///
-    /// `process` receives one hop and writes one hop. It runs on a worker thread, never
-    /// in the PipeWire realtime callback — DeepFilterNet evaluates a neural network per
-    /// hop, and doing that in an RT callback is how you get xruns.
-    pub fn drain<F>(&mut self, mut process: F)
-    where
-        F: FnMut(&[f32; HOP], &mut [f32; HOP]),
-    {
-        let mut inp = [0.0f32; HOP];
-        let mut outp = [0.0f32; HOP];
-        while self.input.pop_hop(&mut inp) {
-            outp.fill(0.0);
-            process(&inp, &mut outp);
-            let dropped = self.output.push(&outp);
-            if dropped > 0 {
-                self.overruns += dropped as u64;
-            }
-        }
-    }
-
-    /// Take processed audio out, filling any shortfall with silence.
-    ///
-    /// A shortfall should be impossible given the priming, but silence is a far better
-    /// failure mode than leaving the caller's buffer untouched — that would replay the
-    /// previous block, which is a very audible stutter.
-    pub fn collect(&mut self, out: &mut [f32]) -> usize {
-        let got = self.output.pop(out);
-        if got < out.len() {
-            out[got..].fill(0.0);
-        }
-        got
     }
 }
 
@@ -206,177 +229,242 @@ mod tests {
         );
     }
 
-    #[test]
-    fn push_and_pop_round_trip() {
-        let mut r = SampleRing::with_hops(4);
-        let input: Vec<f32> = (0..100).map(|i| i as f32).collect();
-        assert_eq!(r.push(&input), 0);
-        assert_eq!(r.len(), 100);
+    fn rings() -> (
+        rtrb::Producer<f32>,
+        rtrb::Consumer<f32>,
+        rtrb::Producer<f32>,
+        CycleReader,
+        AtomicU64,
+    ) {
+        let (cap_tx, cap_rx) = rtrb::RingBuffer::new(RING_HOPS * HOP);
+        let (out_tx, out_rx) = rtrb::RingBuffer::new(RING_HOPS * HOP);
+        (
+            cap_tx,
+            cap_rx,
+            out_tx,
+            CycleReader::new(out_rx),
+            AtomicU64::new(0),
+        )
+    }
 
-        let mut out = vec![0.0; 100];
-        assert_eq!(r.pop(&mut out), 100);
-        assert_eq!(out, input);
-        assert!(r.is_empty());
+    /// One simulated graph cycle in the WORST-CASE event order: capture push, playback
+    /// pop, and only then the worker running. Within a real cycle the two callbacks are
+    /// microseconds apart on the RT thread, so a normal-priority worker genuinely
+    /// cannot land its output in between — a test using the friendly order would pass
+    /// against an implementation that chops in production.
+    fn cycle(
+        cap_tx: &mut rtrb::Producer<f32>,
+        cap_rx: &mut rtrb::Consumer<f32>,
+        out_tx: &mut rtrb::Producer<f32>,
+        reader: &mut CycleReader,
+        overruns: &AtomicU64,
+        block: &[f32],
+        out: &mut [f32],
+    ) -> bool {
+        push_or_drop(cap_tx, block, overruns);
+        let delivered = reader.pop_cycle(out);
+        drain_hops(cap_rx, out_tx, &mut |i, o| o.copy_from_slice(i), overruns);
+        delivered
     }
 
     #[test]
-    fn wraps_around_without_losing_order() {
-        // The classic ring bug: samples come back reordered or duplicated after a wrap.
-        let mut r = SampleRing::with_hops(1);
-        let mut seen = Vec::new();
-        let mut out = vec![0.0; 300];
-
-        for round in 0..5 {
-            let chunk: Vec<f32> = (0..300).map(|i| (round * 300 + i) as f32).collect();
-            r.push(&chunk);
-            let n = r.pop(&mut out);
-            seen.extend_from_slice(&out[..n]);
-        }
-        for w in seen.windows(2) {
-            assert!(w[1] > w[0], "samples came back out of order: {w:?}");
-        }
-    }
-
-    #[test]
-    fn overrun_is_reported_rather_than_silently_swallowed() {
-        let mut r = SampleRing::with_hops(1);
-        let dropped = r.push(&vec![1.0f32; 1000]);
-        assert_eq!(dropped, 1000 - 480, "must report exactly what did not fit");
-        assert_eq!(r.len(), 480);
-    }
-
-    #[test]
-    fn the_bridge_is_primed_so_the_first_block_never_runs_short() {
-        // The whole reason priming exists. Without it the first output block is 960
-        // samples where 1024 were asked for, and that shortfall is an audible click.
-        let mut b = HopBridge::new(32);
-        assert_eq!(
-            b.output.len(),
-            HOP,
-            "must start with exactly one hop of slack"
-        );
-
-        b.submit(&vec![0.5f32; 1024]);
-        b.drain(|inp, outp| outp.copy_from_slice(inp));
-
-        let mut out = vec![0.0f32; 1024];
-        assert_eq!(
-            b.collect(&mut out),
-            1024,
-            "the first block must fill completely"
-        );
-    }
-
-    #[test]
-    fn survives_a_quantum_that_is_not_a_multiple_of_the_hop() {
-        // 1024 is not a multiple of 480, which is the entire difficulty. Run enough
-        // blocks that the remainder cycles through every phase.
-        let mut b = HopBridge::new(32);
+    fn the_lead_is_paid_for_at_startup_not_bled_out_every_cycle() {
+        // The whole design in one assertion: with the worker always a full cycle late,
+        // the lead costs at most two padded cycles at the start (two, not one, because
+        // the worker's first cycle yields only floor(Q/HOP) hops — the remainder arrives
+        // a cycle later) and then never pads again. 1024 is not a multiple of 480, so
+        // 200 cycles walk the remainder through every phase.
+        let (mut ct, mut cr, mut ot, mut or_, ov) = rings();
         let block = vec![0.25f32; 1024];
         let mut out = vec![0.0f32; 1024];
 
+        let mut silent = 0;
         for i in 0..200 {
-            b.submit(&block);
-            b.drain(|inp, outp| outp.copy_from_slice(inp));
-            assert_eq!(
-                b.collect(&mut out),
-                1024,
-                "block {i} came up short — a click"
-            );
+            if !cycle(&mut ct, &mut cr, &mut ot, &mut or_, &ov, &block, &mut out) {
+                silent += 1;
+                assert!(
+                    i < 2,
+                    "a silent cycle after the lead is built is a chop: cycle {i}"
+                );
+            }
         }
-        assert_eq!(b.overruns, 0, "no overruns should occur in steady state");
+        assert!(
+            silent <= 2,
+            "the lead must cost at most two startup cycles, cost {silent}"
+        );
+        assert_eq!(
+            ov.load(Ordering::Relaxed),
+            0,
+            "steady state must not overrun"
+        );
+    }
+
+    #[test]
+    fn a_failed_pop_is_pure_silence_and_leaves_the_ring_building() {
+        let (_ct, _cr, mut ot, mut or_, ov) = rings();
+        push_or_drop(&mut ot, &[1.0f32; 100], &ov);
+
+        let mut out = vec![7.0f32; 1024];
+        assert!(!or_.pop_cycle(&mut out), "100 samples cannot fill 1024");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "a shortfall must be silence, not stale buffer contents"
+        );
+        assert_eq!(
+            or_.available(),
+            100,
+            "the ring must keep accumulating toward the lead, not be part-drained"
+        );
     }
 
     #[test]
     fn survives_a_quantum_that_changes_mid_stream() {
-        // PipeWire renegotiates the quantum whenever another client joins the graph, so
-        // a fixed-quantum assumption breaks the moment someone opens a browser tab.
-        let mut b = HopBridge::new(32);
+        // PipeWire renegotiates the quantum whenever another client joins the graph. An
+        // increase legitimately needs the lead rebuilt (a couple of settling cycles);
+        // after those, every block must be delivered again — the hysteresis exists
+        // precisely so settling cannot smear into deliver-pad oscillation.
+        let (mut ct, mut cr, mut ot, mut or_, ov) = rings();
         for quantum in [1024usize, 512, 2048, 256, 480, 96, 1024] {
             let block = vec![0.1f32; quantum];
             let mut out = vec![0.0f32; quantum];
-            for _ in 0..30 {
-                b.submit(&block);
-                b.drain(|inp, outp| outp.copy_from_slice(inp));
-                assert_eq!(
-                    b.collect(&mut out),
-                    quantum,
-                    "short block after switching to quantum {quantum}"
+            for i in 0..30 {
+                let delivered = cycle(&mut ct, &mut cr, &mut ot, &mut or_, &ov, &block, &mut out);
+                assert!(
+                    delivered || i < 2,
+                    "only the settling cycles after a quantum change may pad (quantum \
+                     {quantum}, cycle {i})"
                 );
             }
         }
-        assert_eq!(b.overruns, 0);
+        assert_eq!(ov.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_quantum_decrease_does_not_leave_its_latency_behind() {
+        // The lead built for a 2048 quantum is pure delay once the graph drops to 256.
+        // pop_cycle must trim it instead of carrying ~40 ms of stale latency forever.
+        let (mut ct, mut cr, mut ot, mut or_, ov) = rings();
+        let big = vec![0.1f32; 2048];
+        let mut out_big = vec![0.0f32; 2048];
+        for _ in 0..10 {
+            cycle(&mut ct, &mut cr, &mut ot, &mut or_, &ov, &big, &mut out_big);
+        }
+
+        let small = vec![0.1f32; 256];
+        let mut out_small = vec![0.0f32; 256];
+        for _ in 0..5 {
+            cycle(
+                &mut ct,
+                &mut cr,
+                &mut ot,
+                &mut or_,
+                &ov,
+                &small,
+                &mut out_small,
+            );
+        }
+        // The bound: the trim leaves at most want + TRIM_SLACK, and up to one more hop
+        // can land between the trim and this observation.
+        assert!(
+            or_.available() <= 256 + TRIM_SLACK + HOP,
+            "the lead must be trimmed to the new quantum's scale, found {} samples",
+            or_.available()
+        );
     }
 
     #[test]
     fn drain_always_hands_the_denoiser_exactly_one_hop() {
         // Non-negotiable: DeepFilterNet only debug_asserts this, so a release build
         // would silently misbehave rather than fail.
-        let mut b = HopBridge::new(32);
-        b.submit(&vec![1.0f32; 3000]);
+        let (mut ct, mut cr, mut ot, _or, ov) = rings();
+        push_or_drop(&mut ct, &vec![1.0f32; 3000], &ov);
         let mut calls = 0;
-        b.drain(|inp, outp| {
-            assert_eq!(inp.len(), HOP);
-            assert_eq!(outp.len(), HOP);
-            calls += 1;
-            outp.copy_from_slice(inp);
-        });
+        drain_hops(
+            &mut cr,
+            &mut ot,
+            &mut |inp, outp| {
+                assert_eq!(inp.len(), HOP);
+                assert_eq!(outp.len(), HOP);
+                calls += 1;
+                outp.copy_from_slice(inp);
+            },
+            &ov,
+        );
         assert_eq!(calls, 3000 / HOP, "every whole hop, and no partial one");
     }
 
     #[test]
-    fn a_stalled_consumer_produces_overruns_not_a_panic() {
-        // If the denoiser thread wedges, the RT callback must keep working regardless.
-        let mut b = HopBridge::new(2);
+    fn a_stalled_worker_produces_overruns_not_a_panic() {
+        // If the worker wedges, the RT callback must keep working and the loss must be
+        // visible rather than silent.
+        let (mut ct, _cr, _ot, _or, ov) = rings();
         for _ in 0..50 {
-            b.submit(&vec![1.0f32; 1024]);
+            push_or_drop(&mut ct, &vec![1.0f32; 1024], &ov);
         }
         assert!(
-            b.overruns > 0,
+            ov.load(Ordering::Relaxed) > 0,
             "a stalled consumer must be visible as overruns"
         );
     }
 
     #[test]
-    fn collect_pads_with_silence_rather_than_stale_audio() {
-        // A shortfall must not leave the caller's previous contents in place — that
-        // replays the last block, which is a very audible stutter.
-        let mut b = HopBridge::new(32);
-        let mut out = vec![7.0f32; 1024];
-        let got = b.collect(&mut out);
-        assert_eq!(got, HOP, "only the primed hop is available yet");
-        assert!(
-            out[got..].iter().all(|&s| s == 0.0),
-            "the shortfall must be silence, not whatever was in the buffer"
-        );
-    }
-
-    #[test]
     fn audio_is_preserved_exactly_through_a_passthrough_bridge() {
-        // End-to-end sample fidelity: what goes in must come out, offset only by the
-        // one hop of priming latency.
-        let mut b = HopBridge::new(64);
-        let signal: Vec<f32> = (0..4800).map(|i| (i as f32 * 0.01).sin()).collect();
+        // End-to-end sample fidelity: what goes in must come out — delayed by the lead,
+        // never reordered, resampled or dropped. The signal starts at 1.0 so the
+        // boundary between lead silence and real audio is unambiguous.
+        let (mut ct, mut cr, mut ot, mut or_, ov) = rings();
+        let signal: Vec<f32> = (0..8192).map(|i| 1.0 + (i as f32 * 0.01).sin()).collect();
         let mut collected = Vec::new();
         let mut out = vec![0.0f32; 1024];
 
         for chunk in signal.chunks(1024) {
-            b.submit(chunk);
-            b.drain(|inp, outp| outp.copy_from_slice(inp));
-            let n = b.collect(&mut out);
-            collected.extend_from_slice(&out[..n]);
+            cycle(&mut ct, &mut cr, &mut ot, &mut or_, &ov, chunk, &mut out);
+            collected.extend_from_slice(&out);
         }
 
-        // Skip the primed hop of silence; the rest must match the input sample for sample.
-        let recovered = &collected[HOP..];
-        let compare = recovered.len().min(signal.len());
-        for i in 0..compare {
+        let start = collected
+            .iter()
+            .position(|&s| s != 0.0)
+            .expect("real audio must eventually arrive");
+        for (i, (got, want)) in collected[start..].iter().zip(signal.iter()).enumerate() {
             assert!(
-                (recovered[i] - signal[i]).abs() < 1e-6,
-                "sample {i} changed: {} != {}",
-                recovered[i],
-                signal[i]
+                (got - want).abs() < 1e-6,
+                "sample {i} after the lead changed: {got} != {want}"
             );
         }
+    }
+
+    #[test]
+    fn the_worker_thread_delivers_audio_and_stops_on_request() {
+        // The one threaded test: the worker must move samples end to end and must exit
+        // promptly when told, or the daemon hangs on shutdown.
+        let (mut ct, cr, ot, mut or_, _ov) = rings();
+        let shared = SharedAudio::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::spawn({
+            let stop = stop.clone();
+            let shared = shared.clone();
+            move || run_worker(cr, ot, |i, o| o.copy_from_slice(i), stop, shared)
+        });
+
+        // Two hops: the reader's hysteresis holds back `out.len() + HOP`, so one hop
+        // alone would (correctly) never be released.
+        push_or_drop(&mut ct, &vec![0.5f32; 2 * HOP], &shared.overruns);
+        worker.thread().unpark();
+
+        let mut out = vec![0.0f32; HOP];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !or_.pop_cycle(&mut out) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker never delivered a hop"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(out.iter().all(|&s| s == 0.5));
+
+        stop.store(true, Ordering::Relaxed);
+        worker.thread().unpark();
+        worker.join().expect("the worker must exit cleanly");
     }
 }

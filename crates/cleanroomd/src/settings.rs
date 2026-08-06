@@ -66,6 +66,13 @@ fn is_optional(key: &str) -> bool {
     OPTIONAL_KEYS.contains(&key)
 }
 
+/// Whether this value means "clear the optional" rather than being a value in its own
+/// right. Public within the crate so the D-Bus layer can avoid "resolving" a clearing
+/// word against a device list before it ever reaches `set`.
+pub(crate) fn is_clearing_word(value: &str) -> bool {
+    CLEARING_WORDS.contains(&value.trim().to_ascii_lowercase().as_str())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
     #[error("no such setting '{0}' (try `cleanroom-ctl keys`)")]

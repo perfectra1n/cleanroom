@@ -31,6 +31,7 @@ deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6
 ] }
 # Must match the version deep_filter uses — ArrayView2 is in its public call path.
 ndarray = "0.15"
+rtrb = "0.3.4"
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

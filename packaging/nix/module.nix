@@ -13,6 +13,18 @@
 # `nofail`. Cleanroom is a PipeWire *client*, so that entire failure mode is gone.
 let
   cfg = config.services.cleanroom;
+  # One label per provisioned device, comma-separated as v4l2loopback's card_label
+  # parameter expects. The first is the label the daemon selects by exact match; the
+  # rest are visibly spares. Generated from loopbackDevices so the two never drift.
+  # A comma inside the label would silently desync this list from devices=N — the
+  # kernel would read it as two shorter labels — so refuse it at eval time.
+  loopbackLabels =
+    assert lib.assertMsg (!lib.hasInfix "," cfg.cardLabel)
+      "services.cleanroom.cardLabel must not contain a comma: v4l2loopback's card_label is comma-delimited, one label per device.";
+    lib.concatStringsSep "," (
+      [ cfg.cardLabel ]
+      ++ lib.genList (i: "Cleanroom Spare ${toString (i + 1)}") (cfg.loopbackDevices - 1)
+    );
 in
 {
   options.services.cleanroom = {
@@ -46,6 +58,20 @@ in
         Two by default so Cleanroom and OBS can each own one. Cleanroom selects a free
         device at runtime rather than claiming a fixed number, so it will not fight another
         producer for a node — but there does have to be a spare one to select.
+      '';
+    };
+
+    cardLabel = lib.mkOption {
+      type = lib.types.str;
+      default = "Cleanroom Camera";
+      description = ''
+        V4L2 card label for the loopback device Cleanroom produces into.
+
+        Must stay in sync with the daemon's `video.card_label` config (default
+        "Cleanroom Camera"): the daemon prefers the free loopback whose label matches
+        this exactly, and it is also the name apps browsing raw V4L2 show in their
+        camera picker. Devices beyond the first are labelled "Cleanroom Spare N" so
+        nothing mistakes a producerless spare for the live camera.
       '';
     };
 
@@ -106,7 +132,14 @@ in
       #
       # No video_nr: Cleanroom picks a free device at runtime, which is what keeps it from
       # colliding with OBS's virtual camera.
-      options v4l2loopback devices=${toString cfg.loopbackDevices} exclusive_caps=1 max_buffers=4
+      #
+      # card_label is load-bearing too: without it every loopback enumerates as
+      # "Dummy video device (0x000N)" to anything browsing raw V4L2 — the daemon's
+      # `video.card_label` only names its PipeWire node, not the device — so apps cannot
+      # recognise the camera, and WirePlumber has been observed electing the producerless
+      # spare as the system default video source. First label is the one the daemon
+      # selects by exact match; the rest are visibly spares.
+      options v4l2loopback devices=${toString cfg.loopbackDevices} exclusive_caps=1 max_buffers=4 card_label="${loopbackLabels}"
     '';
 
     # --- audio ------------------------------------------------------------------------
@@ -121,6 +154,20 @@ in
         # the device fd open continuously.
         "50-cleanroom-disable-libcamera" = {
           "wireplumber.profiles".main."monitor.libcamera" = "disabled";
+        };
+      }
+      {
+        # The spare loopbacks have no producer, so anything following the default video
+        # source into one gets a dead device — and WirePlumber has been observed picking
+        # exactly that. Sink their priority well below any real camera. Matched on
+        # `node.nick` for the same create-node-hook reason as `cameraNick` below.
+        "52-cleanroom-spare-priority" = {
+          "monitor.v4l2.rules" = [
+            {
+              matches = [ { "node.nick" = "~Cleanroom Spare.*"; } ];
+              actions.update-props."priority.session" = 100;
+            }
+          ];
         };
       }
       (lib.mkIf cfg.releaseCamera.enable {
