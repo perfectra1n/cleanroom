@@ -124,12 +124,23 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     // three seconds forever.
     let mut matting_demoted = false;
 
+    // Whether any run_once iteration has ever successfully published a GPU adapter name.
+    // The failure path below needs it to keep the GPU status honest about *where* a run
+    // died; see `publish_failure`.
+    let mut gpu_ready = false;
+
     while !stop.load(Ordering::Relaxed) {
-        match run_once(&shared, &stop, &mut matter, &mut matting_demoted) {
+        match run_once(
+            &shared,
+            &stop,
+            &mut matter,
+            &mut matting_demoted,
+            &mut gpu_ready,
+        ) {
             Ok(Outcome::Stopped) => return,
             Ok(Outcome::Restart) => continue,
             Err(e) => {
-                shared.set_video_health(HealthState::failed(e.to_string()));
+                publish_failure(&shared, e.to_string(), gpu_ready);
                 // Back off before retrying. A camera that was unplugged, or a loopback
                 // device another app grabbed first, will usually come back — retrying
                 // forever at full speed would just spam the log.
@@ -149,6 +160,7 @@ fn run_once(
     stop: &AtomicBool,
     matter: &mut Option<Matter>,
     matting_demoted: &mut bool,
+    gpu_ready: &mut bool,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let cfg = shared.config();
 
@@ -201,25 +213,8 @@ fn run_once(
     let mut decoder = FrameDecoder::new(mode.width, mode.height)?;
     let mut frame = Yuy2Frame::new(mode.width, mode.height);
 
-    // The GPU. A failure here is reported and the pipeline continues as a CPU
-    // passthrough — the *only* place a CPU path is acceptable, because a camera that
-    // still works without effects beats a camera that does not work. It is reported as
-    // Degraded rather than Nominal so it can never be mistaken for the real thing.
-    let gpu = match Gpu::new(cfg.gpu.render_node.as_deref()) {
-        Ok(g) => {
-            let name = g.choice.to_string();
-            shared.set_gpu_adapter(name);
-            Some(FramePipeline::new(g, mode.width, mode.height))
-        }
-        Err(e) => {
-            shared.set_gpu_adapter(format!("unavailable: {e}"));
-            shared.set_video_health(HealthState::degraded(format!(
-                "no GPU — passing the camera through unmodified: {e}"
-            )));
-            None
-        }
-    };
-    let mut gpu = gpu;
+    // The GPU. Extracted to `init_gpu`; a failure there is Degraded, never fatal.
+    let mut gpu = init_gpu(shared, &cfg, (mode.width, mode.height), gpu_ready);
     let mut processed = vec![0u8; (mode.width * mode.height * 2) as usize];
 
     // Seeded from the config this run opened against, then re-checked every frame in the
@@ -608,6 +603,65 @@ fn run_once(
 
     // The only way out of that loop is the stop flag.
     Ok(Outcome::Stopped)
+}
+
+/// What `status` shows for the GPU when a run died before reaching GPU init.
+///
+/// One of exactly three GPU states, and the wording keeps them distinct: this string
+/// (never attempted), "unavailable: <err>" (attempted and failed), or the adapter name
+/// (working). The seed in `Shared::new` is phrased the same way for the same reason.
+const GPU_NOT_ATTEMPTED: &str = "not attempted — the video pipeline failed before GPU init";
+
+/// Report a failed run, and keep the GPU status honest about *where* it failed.
+///
+/// `run_once` opens the camera before it touches the GPU, so an error can arrive with
+/// the "not attempted" seed still published — and a placeholder sitting next to a red
+/// health banner reads like a GPU fault. Observed live: a mis-set video.device
+/// crash-looped the pipeline and sent the user diagnosing a healthy RTX 5090.
+///
+/// The rule: "not attempted" is only claimed while no run has ever successfully
+/// published an adapter name. Once one has, a later failure — a camera unplug mid-call —
+/// leaves it alone, because the adapter the last run used is still the truth about the
+/// GPU. A previous run's "unavailable: <err>" is *not* preserved: it described a GPU
+/// attempt that this failure never reached, and the next successful camera open
+/// re-derives it within seconds anyway.
+fn publish_failure(shared: &Shared, error: String, gpu_ready: bool) {
+    shared.set_video_health(HealthState::failed(error));
+    if !gpu_ready {
+        shared.set_gpu_adapter(GPU_NOT_ATTEMPTED);
+    }
+}
+
+/// Build the GPU pipeline, or explain why the run continues without one.
+///
+/// A failure here is reported and the pipeline continues as a CPU passthrough — the
+/// *only* place a CPU path is acceptable, because a camera that still works without
+/// effects beats a camera that does not work. It is reported as Degraded rather than
+/// Nominal so it can never be mistaken for the real thing.
+///
+/// `gpu_ready` records, for the life of the process, that an adapter name was
+/// successfully published at least once; [`publish_failure`] consults it to tell "the
+/// GPU was never reached" from "the GPU is fine and something upstream broke".
+fn init_gpu(
+    shared: &Arc<Shared>,
+    cfg: &Config,
+    (width, height): (u32, u32),
+    gpu_ready: &mut bool,
+) -> Option<FramePipeline> {
+    match Gpu::new(cfg.gpu.render_node.as_deref()) {
+        Ok(g) => {
+            shared.set_gpu_adapter(g.choice.to_string());
+            *gpu_ready = true;
+            Some(FramePipeline::new(g, width, height))
+        }
+        Err(e) => {
+            shared.set_gpu_adapter(format!("unavailable: {e}"));
+            shared.set_video_health(HealthState::degraded(format!(
+                "no GPU — passing the camera through unmodified: {e}"
+            )));
+            None
+        }
+    }
 }
 
 /// One matte inference, with the error-run policy.
@@ -1463,6 +1517,48 @@ mod tests {
         );
     }
 
+    fn shared() -> Arc<Shared> {
+        let dir = std::env::temp_dir().join(format!("cleanroom-vp-test-{}", std::process::id()));
+        Shared::new(
+            Config::default(),
+            cleanroom_core::ConfigPaths::at(dir.join("config.toml")),
+        )
+    }
+
+    /// The GPU-status confusion that sent a user diagnosing a healthy RTX 5090: the
+    /// pipeline crash-looped on a bad video.device — an error *before* GPU init — while
+    /// the GPU field went on showing its startup placeholder, which read as a GPU fault.
+    /// A failure upstream of GPU init must say so in the GPU field itself.
+    #[test]
+    fn a_failure_before_gpu_init_reports_the_gpu_as_not_attempted() {
+        let s = shared();
+        publish_failure(&s, "cannot open /dev/video0: busy".into(), false);
+
+        let st = s.status();
+        assert_eq!(st.video_health, cleanroom_ipc::Health::Failed);
+        assert_eq!(
+            st.gpu_adapter, GPU_NOT_ATTEMPTED,
+            "the GPU field must point upstream, not read as a GPU fault"
+        );
+    }
+
+    /// The other half of the rule: once a run has published a working adapter, a later
+    /// failure — a camera unplugged mid-call — is not news about the GPU, and
+    /// overwriting the adapter name would turn every unplug into a phantom GPU outage.
+    #[test]
+    fn a_camera_unplug_must_not_erase_a_working_gpu_adapter() {
+        let s = shared();
+        s.set_gpu_adapter("NVIDIA GeForce RTX 5090 (Vulkan)");
+        publish_failure(&s, "camera unplugged".into(), true);
+
+        let st = s.status();
+        assert_eq!(st.video_health, cleanroom_ipc::Health::Failed);
+        assert_eq!(
+            st.gpu_adapter, "NVIDIA GeForce RTX 5090 (Vulkan)",
+            "the adapter the last run used is still the truth about the GPU"
+        );
+    }
+
     use cleanroom_video::{PixelFormat, RawFrame};
 
     fn garbage_mjpeg(corrupt: bool) -> RawFrame<'static> {
@@ -1551,9 +1647,8 @@ mod tests {
         let mut errors = 0u32;
 
         for _ in 0..DECODE_ERROR_LIMIT - 1 {
-            let got =
-                decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
-                    .expect("below the limit every failure is a skip");
+            let got = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)
+                .expect("below the limit every failure is a skip");
             assert!(got.is_none());
         }
         let err = decode_or_skip(&mut decoder, &garbage_mjpeg(false), &mut frame, &mut errors)

@@ -108,7 +108,15 @@ impl Shared {
             video: RwLock::new(HealthState::default()),
             audio: RwLock::new(HealthState::default()),
             stats: RwLock::new(PipelineStats::default()),
-            gpu_adapter: RwLock::new("not initialised".into()),
+            // "not attempted", never "not initialised": this text lingers whenever the
+            // video pipeline fails before reaching GPU init (bad video.device, camera
+            // unplugged), and "not initialised" read as a GPU fault — it sent a user
+            // diagnosing a healthy RTX 5090 over a mis-set camera path. The three GPU
+            // states must stay distinct: this seed / "unavailable: <err>" / the adapter
+            // name. See `video_pipeline::publish_failure` for who keeps it honest.
+            gpu_adapter: RwLock::new(
+                "not attempted — the video pipeline has not reached GPU init".into(),
+            ),
             vcam_path: RwLock::new(String::new()),
             vcam_holders: RwLock::new(Vec::new()),
             pw_node: RwLock::new(String::new()),
@@ -371,6 +379,20 @@ mod tests {
         assert!(
             s.status().vcam_holders.is_empty(),
             "a restart allocates a new node, and the old readers are not on it"
+        );
+    }
+
+    /// The seed is what `status` shows for the GPU whenever the pipeline fails before
+    /// GPU init — a bad video.device, an unplugged camera. "not initialised" read as a
+    /// GPU fault and sent a user diagnosing a healthy RTX 5090 over a camera problem,
+    /// so the text must say the GPU was never *attempted*, not that it failed.
+    #[test]
+    fn the_gpu_seed_reads_as_not_attempted_rather_than_as_a_fault() {
+        let s = shared();
+        let adapter = s.status().gpu_adapter;
+        assert!(
+            adapter.contains("not attempted"),
+            "the seed must be impossible to misread as a GPU failure: {adapter}"
         );
     }
 

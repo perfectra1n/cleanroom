@@ -29,6 +29,24 @@ pub enum CaptureError {
     NoUsableFormat { path: String },
 
     #[error(
+        "{path} is a virtual camera ({label}), not a capture device — it advertises no \
+         capturable format because nothing is producing video into it. Point video.device \
+         at a real camera (`cleanroom-ctl devices` lists them)."
+    )]
+    VirtualDevice { path: String, label: String },
+
+    #[error(
+        "{path} was re-formatted underneath us while idle: we negotiated {negotiated}, \
+         the driver now grants {granted}. Another process issued S_FMT on the shared \
+         node; reopening to renegotiate."
+    )]
+    Reformatted {
+        path: String,
+        negotiated: String,
+        granted: String,
+    },
+
+    #[error(
         "every capture mode was refused by {path}. Tried: {tried}. \
          The camera may be held by another process — check `cleanroom-ctl doctor`."
     )]
@@ -78,9 +96,7 @@ impl Camera {
 
         let available = enumerate_modes(&device);
         if available.is_empty() {
-            return Err(CaptureError::NoUsableFormat {
-                path: path.to_string(),
-            });
+            return Err(no_usable_format(path));
         }
 
         let ladder = mode_ladder(&available, want_w, want_h, want_fps);
@@ -164,6 +180,7 @@ impl Camera {
         if self.stream.is_some() {
             return Ok(());
         }
+        self.reassert_format()?;
         // 4 buffers: enough to absorb a scheduling hiccup without adding latency. More
         // buffers on a live path only means older frames waiting to be shown.
         let stream = MmapStream::with_buffers(&self.device, Type::VideoCapture, 4)?;
@@ -174,6 +191,51 @@ impl Camera {
         self.stream = Some(stream);
         tracing::debug!(path = %self.path, "capture streaming");
         Ok(())
+    }
+
+    /// Re-apply the negotiated format immediately before STREAMON, and believe the
+    /// read-back.
+    ///
+    /// V4L2 streams whatever the *last* `S_FMT` on the device was, not the one we
+    /// negotiated at open — and `open` and `start` can be far apart. The power-save path
+    /// calls `stop`/`start` repeatedly, and while we hold the fd without streaming,
+    /// other processes can issue their own `S_FMT` on the shared node (WirePlumber's
+    /// v4l2 monitor probing devices is the usual suspect). When that happens `self.mode`
+    /// lies about what frames will contain: observed live as a C920 negotiated to MJPG
+    /// delivering YUYV, which the MJPEG decoder rejected with "Not a JPEG file: starts
+    /// with 0x00 0x0a" — raw luma, not a JPEG header.
+    ///
+    /// Same trust-nothing pattern as `open`: ask, then verify what the driver *returned*
+    /// rather than assuming `S_FMT` honoured the request. The policy for a mismatch
+    /// lives in [`reconcile_streamon_format`].
+    fn reassert_format(&mut self) -> Result<(), CaptureError> {
+        let want = Format::new(self.mode.width, self.mode.height, self.mode.format.fourcc());
+        let granted = CaptureTrait::set_format(&self.device, &want)?;
+        match reconcile_streamon_format(self.mode, &granted) {
+            Reassertion::Unchanged => Ok(()),
+            Reassertion::Adopt(format) => {
+                tracing::warn!(
+                    path = %self.path,
+                    negotiated = %self.mode,
+                    granted = %fourcc_str(granted.fourcc),
+                    "another process re-formatted the device while it was idle \
+                     (WirePlumber's v4l2 monitor probing is the usual suspect); \
+                     adopting the granted format"
+                );
+                self.mode.format = format;
+                Ok(())
+            }
+            Reassertion::Renegotiate => Err(CaptureError::Reformatted {
+                path: self.path.clone(),
+                negotiated: self.mode.to_string(),
+                granted: format!(
+                    "{}@{}x{}",
+                    fourcc_str(granted.fourcc),
+                    granted.width,
+                    granted.height
+                ),
+            }),
+        }
     }
 
     /// Stop streaming but keep the device open and configured.
@@ -218,6 +280,73 @@ impl Drop for Camera {
         // Explicit, and before the device: v4l2 wants STREAMOFF while the fd is still
         // open, and relying on field drop order for that is too subtle to leave implicit.
         self.stop();
+    }
+}
+
+/// What to do about the format the driver granted at stream start.
+///
+/// See [`reconcile_streamon_format`] for how one is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reassertion {
+    /// The driver still holds what we negotiated. Proceed.
+    Unchanged,
+    /// Same geometry, different but decodable fourcc. Update `Camera::mode` and proceed:
+    /// the decoder dispatches per-frame on `RawFrame::format`, so nothing downstream
+    /// cares which of our formats arrives — only that the mode tells the truth.
+    Adopt(PixelFormat),
+    /// The geometry moved, or the fourcc is one we cannot decode. Fail the start so the
+    /// pipeline restarts and renegotiates *everything* — the sink and every buffer
+    /// between here and it were sized from the negotiated geometry, so adapting in
+    /// place would just move the corruption downstream.
+    Renegotiate,
+}
+
+/// Decide what to do given the mode negotiated at open and the format `S_FMT` granted
+/// at stream start.
+///
+/// A pure function so the policy is testable without hardware; the driver interaction
+/// lives in [`Camera::reassert_format`].
+fn reconcile_streamon_format(negotiated: CaptureMode, granted: &Format) -> Reassertion {
+    if (granted.width, granted.height) != (negotiated.width, negotiated.height) {
+        return Reassertion::Renegotiate;
+    }
+    match PixelFormat::from_fourcc(granted.fourcc) {
+        Some(f) if f == negotiated.format => Reassertion::Unchanged,
+        Some(f) => Reassertion::Adopt(f),
+        None => Reassertion::Renegotiate,
+    }
+}
+
+/// The error for a device that advertises nothing we can decode, enriched by what the
+/// node actually *is*.
+fn no_usable_format(path: &str) -> CaptureError {
+    let dev = crate::device::probe(std::path::Path::new(path));
+    classify_no_format(path, &dev)
+}
+
+/// Turn "no usable format" into an error that names the real mistake when there is one.
+///
+/// The bare message earned this the hard way: pointed at a v4l2loopback node, `open`
+/// failed with "reports no pixel format we can use" — true, and useless. The actionable
+/// fact is that the node is a *virtual camera*, so the config points Cleanroom at an
+/// output (possibly its own) rather than at hardware. Split from [`no_usable_format`]
+/// so the classification policy is testable without a device to probe.
+fn classify_no_format(path: &str, dev: &crate::device::VideoDevice) -> CaptureError {
+    if dev.is_virtual {
+        // The driver name ("v4l2 loopback") identifies the mechanism; the card label is
+        // the fallback because the virtual classification can come from either.
+        let label = if dev.driver.is_empty() {
+            dev.card.clone()
+        } else {
+            dev.driver.clone()
+        };
+        return CaptureError::VirtualDevice {
+            path: path.to_string(),
+            label,
+        };
+    }
+    CaptureError::NoUsableFormat {
+        path: path.to_string(),
     }
 }
 
@@ -272,6 +401,136 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("/dev/video-does-not-exist"), "got: {msg}");
+    }
+
+    /// The negotiated mode is what `start` asked for, so the common case must be
+    /// completely silent — no mode rewrite, no warning, no restart.
+    #[test]
+    fn an_identical_grant_at_stream_start_proceeds_unchanged() {
+        let negotiated = CaptureMode {
+            format: PixelFormat::Mjpeg,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let granted = Format::new(1920, 1080, FourCC::new(b"MJPG"));
+        assert_eq!(
+            reconcile_streamon_format(negotiated, &granted),
+            Reassertion::Unchanged
+        );
+    }
+
+    /// The live failure this whole re-assertion exists for: a C920 negotiated MJPG at
+    /// open, WirePlumber's monitor issued its own S_FMT while we held the fd idle, and
+    /// STREAMON delivered YUYV frames into the MJPEG decode path ("Not a JPEG file:
+    /// starts with 0x00 0x0a" — raw luma). Same geometry, decodable format: the decoder
+    /// dispatches per-frame on `RawFrame::format`, so adopting it keeps streaming
+    /// rather than tearing down the sink over a fourcc.
+    #[test]
+    fn a_decodable_format_swap_at_the_same_size_is_adopted() {
+        let negotiated = CaptureMode {
+            format: PixelFormat::Mjpeg,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let granted = Format::new(1920, 1080, FourCC::new(b"YUYV"));
+        assert_eq!(
+            reconcile_streamon_format(negotiated, &granted),
+            Reassertion::Adopt(PixelFormat::Yuyv),
+            "the mode must be corrected to what the frames will actually contain"
+        );
+    }
+
+    /// Drivers disagree on spelling (YUY2 vs YUYV). An alias of the format we already
+    /// negotiated is the same format, and treating it as a change would warn about a
+    /// re-format that never happened on every single stream start.
+    #[test]
+    fn an_aliased_spelling_of_the_negotiated_format_is_not_a_change() {
+        let negotiated = CaptureMode {
+            format: PixelFormat::Yuyv,
+            width: 1280,
+            height: 720,
+            fps: 30,
+        };
+        let granted = Format::new(1280, 720, FourCC::new(b"YUY2"));
+        assert_eq!(
+            reconcile_streamon_format(negotiated, &granted),
+            Reassertion::Unchanged
+        );
+    }
+
+    /// The sink and every buffer between the camera and it were sized from the
+    /// negotiated geometry. Adapting a size change in place would only move the
+    /// corruption downstream, so it must fail the start and renegotiate everything.
+    #[test]
+    fn a_size_change_at_stream_start_forces_a_renegotiation() {
+        let negotiated = CaptureMode {
+            format: PixelFormat::Mjpeg,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let granted = Format::new(640, 480, FourCC::new(b"MJPG"));
+        assert_eq!(
+            reconcile_streamon_format(negotiated, &granted),
+            Reassertion::Renegotiate
+        );
+    }
+
+    /// A fourcc we cannot decode must never be adopted — every frame would fail the
+    /// decoder and thirty of those in a row is a reopen anyway, minus the diagnosis.
+    #[test]
+    fn an_undecodable_fourcc_at_stream_start_forces_a_renegotiation() {
+        let negotiated = CaptureMode {
+            format: PixelFormat::Mjpeg,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+        };
+        let granted = Format::new(1920, 1080, FourCC::new(b"H264"));
+        assert_eq!(
+            reconcile_streamon_format(negotiated, &granted),
+            Reassertion::Renegotiate
+        );
+    }
+
+    fn loopback_node(path: &str) -> crate::device::VideoDevice {
+        crate::device::VideoDevice {
+            path: path.into(),
+            card: "Cleanroom Camera".into(),
+            driver: "v4l2 loopback".into(),
+            kind: crate::device::NodeKind::Output,
+            is_virtual: true,
+            accessible: true,
+        }
+    }
+
+    /// The unhelpful error that cost a debugging session: video.device pointed at a
+    /// v4l2loopback node, and "reports no pixel format we can use" sent the user
+    /// everywhere but at the config. The error must name what the node *is*.
+    #[test]
+    fn a_virtual_node_with_no_formats_is_named_as_virtual() {
+        let err = classify_no_format("/dev/video0", &loopback_node("/dev/video0"));
+        let msg = err.to_string();
+        assert!(msg.contains("virtual camera"), "got: {msg}");
+        assert!(msg.contains("v4l2 loopback"), "got: {msg}");
+        assert!(msg.contains("/dev/video0"), "got: {msg}");
+    }
+
+    /// A real camera with no decodable format is a different problem (exotic hardware,
+    /// missing formats) and must keep the plain message rather than accuse it of being
+    /// virtual.
+    #[test]
+    fn a_real_camera_with_no_formats_keeps_the_plain_message() {
+        let mut dev = loopback_node("/dev/video2");
+        dev.card = "Weird Industrial Cam".into();
+        dev.driver = "uvcvideo".into();
+        dev.kind = crate::device::NodeKind::Capture;
+        dev.is_virtual = false;
+        let msg = classify_no_format("/dev/video2", &dev).to_string();
+        assert!(msg.contains("no pixel format we can use"), "got: {msg}");
+        assert!(!msg.contains("virtual"), "got: {msg}");
     }
 
     #[test]

@@ -83,6 +83,21 @@ impl Service {
     }
 
     async fn set(&self, key: &str, value: &str) -> zbus::fdo::Result<()> {
+        // A virtual camera stored as the *input* is a config the pipeline can never
+        // satisfy: `Camera::open` fails, the daemon crash-loops on its 5-second backoff,
+        // and nothing along that path names the actual mistake. Refuse here, where the
+        // error reaches the person who typed the value — `ctl set` prints it and the GUI
+        // surfaces it — rather than store a trap whose failure appears later and
+        // elsewhere. The probe is a cheap non-blocking ioctl; see
+        // [`refuse_virtual_camera`] for what passes through untouched.
+        if key == "video.device"
+            && !settings::is_clearing_word(value)
+            && let Some(reason) =
+                refuse_virtual_camera(&cleanroom_video::probe(std::path::Path::new(value)))
+        {
+            return Err(zbus::fdo::Error::InvalidArgs(reason));
+        }
+
         // The config stores a PipeWire `node.name`, but what people see — in the GUI
         // picker, in `list-microphones` output — is the `node.description`. Accept either
         // here and store the name, because a description written into the config is a trap
@@ -175,6 +190,35 @@ fn resolve_microphone(value: &str, sources: &[cleanroom_audio::Source]) -> Optio
     }
 }
 
+/// Why a `video.device` value must be refused outright, or `None` to store it as given.
+///
+/// Deliberately as restrained as [`resolve_microphone`]: only a node that *positively*
+/// classifies as a virtual camera is refused. An unknown, unplugged or unopenable path
+/// probes as not-virtual and passes through — rewriting or refusing it would destroy a
+/// setting that becomes valid the moment the camera is plugged back in, the same
+/// reasoning as storing an unknown microphone as given. Enumeration already refuses to
+/// *offer* virtual nodes ([`Service::list_cameras`]); this closes the other door, a path
+/// typed by hand — which is exactly how a v4l2loopback node at `/dev/video0` got stored
+/// and cost a debugging session that ended at a healthy GPU.
+fn refuse_virtual_camera(dev: &cleanroom_video::VideoDevice) -> Option<String> {
+    if !dev.is_virtual {
+        return None;
+    }
+    // Name the mechanism (driver, e.g. "v4l2 loopback") when the kernel reports one;
+    // the card label is the fallback because the classification can come from either.
+    let label = if dev.driver.is_empty() {
+        dev.card.as_str()
+    } else {
+        dev.driver.as_str()
+    };
+    Some(format!(
+        "{} is a virtual camera ({label}), not a capture device — Cleanroom would be \
+         capturing its own (or another app's) output. Pick a real camera from \
+         `cleanroom-ctl devices`.",
+        dev.path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +277,71 @@ mod tests {
             description: "A50 Mono".into(),
         });
         assert_eq!(resolve_microphone("A50 Mono", &s), None);
+    }
+
+    use cleanroom_video::{NodeKind, VideoDevice};
+
+    fn loopback() -> VideoDevice {
+        VideoDevice {
+            path: "/dev/video0".into(),
+            card: "Cleanroom Camera".into(),
+            driver: "v4l2 loopback".into(),
+            kind: NodeKind::Output,
+            is_virtual: true,
+            accessible: true,
+        }
+    }
+
+    /// The bug this exists for: video.device = /dev/video0 was a v4l2loopback node, the
+    /// daemon crash-looped every 5 seconds on "reports no pixel format we can use", and
+    /// the trail led to a healthy RTX 5090 instead of the config. The refusal must name
+    /// what the device actually is, so the fix is obvious from the error alone.
+    #[test]
+    fn a_virtual_camera_is_refused_with_its_identity_named() {
+        let reason = refuse_virtual_camera(&loopback()).expect("a loopback node must be refused");
+        assert!(reason.contains("virtual camera"), "got: {reason}");
+        assert!(reason.contains("v4l2 loopback"), "got: {reason}");
+        assert!(reason.contains("/dev/video0"), "got: {reason}");
+    }
+
+    /// Our own sink is the worst value of all — storing it points the pipeline at its
+    /// own output — and it must be refused even when a fork's driver string is
+    /// unrecognised and only the card label gives it away.
+    #[test]
+    fn our_own_sink_is_refused_even_when_only_the_label_identifies_it() {
+        let mut dev = loopback();
+        dev.driver = String::new();
+        let reason = refuse_virtual_camera(&dev).expect("our own sink must be refused");
+        assert!(reason.contains("Cleanroom Camera"), "got: {reason}");
+    }
+
+    /// Same reasoning as `an_unknown_value_is_stored_as_given` for microphones: an
+    /// unplugged camera probes as nothing in particular, and refusing it would destroy a
+    /// setting that becomes valid again the moment it is plugged back in.
+    #[test]
+    fn an_unplugged_or_unknown_video_device_is_stored_as_given() {
+        let dev = VideoDevice {
+            path: "/dev/video-not-plugged-in".into(),
+            card: String::new(),
+            driver: String::new(),
+            kind: NodeKind::Other,
+            is_virtual: false,
+            accessible: false,
+        };
+        assert_eq!(refuse_virtual_camera(&dev), None);
+    }
+
+    /// A real capture node is the value this setting exists for.
+    #[test]
+    fn a_real_capture_device_passes_the_virtual_guard() {
+        let dev = VideoDevice {
+            path: "/dev/video2".into(),
+            card: "C922 Pro Stream Webcam".into(),
+            driver: "uvcvideo".into(),
+            kind: NodeKind::Capture,
+            is_virtual: false,
+            accessible: true,
+        };
+        assert_eq!(refuse_virtual_camera(&dev), None);
     }
 }
