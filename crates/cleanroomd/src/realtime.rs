@@ -125,6 +125,36 @@ pub fn request_for_current_thread() -> RtStatus {
     }
 }
 
+/// Return the calling thread to ordinary scheduling.
+///
+/// Called at the top of every pipeline (re)start: the thread keeps its SCHED_RR policy
+/// from the previous run, and restart-time work — config reads, D-Bus, PipeWire graph
+/// setup — has no business running under a realtime policy while the `RLIMIT_RTTIME`
+/// budget is armed. The kernel's answer to a thread that burns past that budget without
+/// blocking is SIGKILL to the whole process — no signal handler, no log line, exit code
+/// 137. Observed on every microphone switch in a debug build, back when the
+/// DeepFilterNet model load still ran on this thread; that load has since moved to the
+/// never-realtime denoise worker, which removed the big burst, but the
+/// demote-then-repromote symmetry stays: every pass through `run_once` does its setup
+/// at normal priority and is promoted afterwards.
+///
+/// First start is a no-op (the thread is not real-time yet).
+pub fn demote_current_thread() {
+    // The SCHED_RESET_ON_FORK flag rtkit set must be passed back, not dropped: the
+    // kernel reads a policy without it as a request to *clear* the flag, which needs
+    // CAP_SYS_NICE — so a plain SCHED_OTHER demotion fails with EPERM precisely on the
+    // rtkit-promoted thread it exists for. Observed: the warning below fired and the
+    // process was still RTTIME-killed a moment later.
+    let keep_flag = current_policy() & SCHED_RESET_ON_FORK;
+    if let Err(e) = set_policy(libc::SCHED_OTHER | keep_flag, 0) {
+        // Worst case the model load runs against the RT budget, which is where we were.
+        tracing::warn!(
+            error = %std::io::Error::from_raw_os_error(e),
+            "could not return the audio thread to normal scheduling before reload"
+        );
+    }
+}
+
 fn set_rttime_limit() -> std::io::Result<()> {
     let lim = libc::rlimit {
         rlim_cur: RT_TIME_LIMIT_US,
@@ -141,11 +171,18 @@ fn set_rttime_limit() -> std::io::Result<()> {
 
 /// Returns the raw errno on failure, since `EPERM` is a normal outcome we branch on.
 fn set_scheduler_directly() -> Result<(), i32> {
+    set_policy(libc::SCHED_RR, RT_PRIORITY)
+}
+
+/// The one `sched_setscheduler` call site — promotion and demotion both go through it,
+/// so the workspace carries a single unsafe block for the syscall. Returns the raw errno
+/// on failure.
+fn set_policy(policy: i32, priority: i32) -> Result<(), i32> {
     let param = libc::sched_param {
-        sched_priority: RT_PRIORITY,
+        sched_priority: priority,
     };
     // SAFETY: pid 0 means the calling thread; `param` is valid for the call.
-    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &param) };
+    let rc = unsafe { libc::sched_setscheduler(0, policy, &param) };
     if rc == 0 {
         Ok(())
     } else {

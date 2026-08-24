@@ -70,6 +70,11 @@ export component AppWindow inherits Window {
     // Device pickers. Populated from ListCameras / ListMicrophones.
     in property <[string]> camera-names: [];
     in property <[string]> microphone-names: [];
+    // The PipeWire node.name behind each microphone entry, same order as the names.
+    // Kept separate rather than baked into the label: ALSA node names are long enough
+    // to make the picker unreadable, but they are what the config stores — a selection
+    // must send the name, never the description it displays.
+    in property <[string]> microphone-ids: [];
     in-out property <int> camera-index: -1;
     in-out property <int> microphone-index: -1;
 
@@ -113,7 +118,9 @@ export component AppWindow inherits Window {
     in property <string> matting-detail: "";
 
     callback set-camera(string);
-    callback set-microphone(string);
+    // Carries the picked row's index, not its label: descriptions are not unique (two
+    // identical microphones), so the label cannot be mapped back to a node reliably.
+    callback set-microphone(int);
     callback choose-background-image();
     callback clear-background-image();
     callback set-autostart(bool);
@@ -257,10 +264,14 @@ export component AppWindow inherits Window {
                     Text { text: "Microphone"; width: 96px; vertical-alignment: center; }
                     ComboBox {
                         model: root.microphone-names;
-                        current-index: root.microphone-index;
+                        // Two-way: the poll loop pushes the index derived from the
+                        // daemon's config, and a user pick must survive until that
+                        // round-trips. A one-way binding would be severed by the
+                        // ComboBox's own write on first use.
+                        current-index <=> root.microphone-index;
                         enabled: root.microphone-names.length > 0;
                         horizontal-stretch: 1;
-                        selected(value) => { root.set-microphone(value); }
+                        selected => { root.set-microphone(self.current-index); }
                     }
                 }
             }
