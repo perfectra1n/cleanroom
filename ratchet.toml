@@ -47,7 +47,7 @@ key  = "cleanroom_audio::node::VirtualMic::run"
 file = "crates/cleanroom-audio/src/node.rs"
 cognitive  = 32
 cyclomatic = 29
-lines      = 189
+lines      = 182
 note = "Owns a dedicated thread and drives the PipeWire main loop, which is not async and expects to drive itself: capture stream, source stream, format negotiation and the process callback all share one scope. The second-worst cognitive score in the workspace, and unlike the frame.rs entries the score is real branching rather than length. Lifting stream setup out of the loop body is the obvious first cut."
 
 [[over]]
@@ -76,17 +76,11 @@ lines      = 910
 note = "The whole wgpu pipeline in one file: the 32-field FramePipeline, eight compute pipelines, the blur pyramid and the guided filter. 910 effective production lines — the file is 1796 raw, the rest being comments and its inline test module. Splitting it means separating the bind-group layouts from the passes that consume them."
 
 [[over]]
-key  = "cleanroom_gui::poll"
-file = "crates/cleanroom-gui/src/main.rs"
-lines      = 111
-note = "Length only. Flattens a D-Bus Status into the GUI Snapshot field by field, reconnecting fresh each cycle so a daemon started after the GUI is picked up automatically. Long because Snapshot has 18 fields, not because it branches."
-
-[[over]]
 key  = "cleanroom_gui::wire_controls"
 file = "crates/cleanroom-gui/src/main.rs"
 cognitive  = 18
 nesting    = 4
-lines      = 140
+lines      = 108
 note = "Registers every Slint callback in one place. The nesting is closures inside closures — on_foo(move || ... upgrade_in_event_loop(move |h| ...)) — rather than conditional logic, which is why the cognitive score sits far below what the raw indentation (40 columns) would suggest."
 
 [[over]]

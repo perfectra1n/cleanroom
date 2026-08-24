@@ -313,6 +313,31 @@ pub struct DenoiseConfig {
     /// DeepFilterNet post-filter beta. Slightly more aggressive on residual noise at
     /// some cost in naturalness. 0.0 disables it.
     pub post_filter_beta: f32,
+
+    /// Local-SNR (dB) below which a frame is treated as pure noise and zero-masked
+    /// (the attenuation limit is then all that keeps any audio).
+    ///
+    /// The model's SNR estimate never goes below −15, so −15 or lower switches the
+    /// zero-mask stage off entirely — deliberate in the default: on real captures the
+    /// estimate flaps across upstream's −10 mid-speech and gates syllables, heard as
+    /// the voice pumping louder and quieter.
+    ///
+    /// Adding these three keys means an **older** cleanroom binary will refuse the
+    /// config once a newer one has written it — see docs/pitfalls.md, "Adding a config
+    /// field is not a safe downgrade".
+    pub snr_gate_db: f32,
+
+    /// Local-SNR (dB) above which audio passes through untouched.
+    ///
+    /// Upstream's 30 is rarely reached on real captures, so speech kept being
+    /// half-processed; 20 lets clean speech through. Measured on a real capture:
+    /// speech attenuation −5.4 dB mean under upstream's thresholds vs −1.9 dB here,
+    /// with noise suppression essentially unchanged (−7.9 vs −7.4 dB).
+    pub snr_passthrough_db: f32,
+
+    /// Local-SNR (dB) above which the second (deep-filter) stage is skipped and only
+    /// ERB gains are applied. Sits between the gate and the passthrough line.
+    pub snr_df_db: f32,
 }
 
 impl Default for DenoiseConfig {
@@ -323,6 +348,11 @@ impl Default for DenoiseConfig {
             // enough to kill keyboard and fan noise while leaving speech natural.
             attenuation_db: 40.0,
             post_filter_beta: 0.02,
+            // Calibrated on a real capture (2026-08-24), not upstream's CLI defaults
+            // (-10/30/20) — those pump speech; see the field docs.
+            snr_gate_db: -15.0,
+            snr_passthrough_db: 20.0,
+            snr_df_db: 15.0,
         }
     }
 }
@@ -390,6 +420,28 @@ mod tests {
         assert!(
             d.attenuation_db > 0.01,
             "below 0.01 short-circuits to passthrough"
+        );
+    }
+
+    /// Regression guard for the mic-pumping bug: upstream's zero-mask gate fires at
+    /// −10 dB local SNR, but the estimator flaps across that line mid-speech. The
+    /// estimate's floor is exactly −15, so a default at or below −15 keeps the gate
+    /// permanently off.
+    #[test]
+    fn default_snr_gate_is_at_or_below_the_estimator_floor() {
+        let d = DenoiseConfig::default();
+        assert!(
+            d.snr_gate_db <= -15.0,
+            "gate must not re-enable zero-masking"
+        );
+        assert!(
+            d.snr_gate_db < d.snr_df_db && d.snr_df_db < d.snr_passthrough_db,
+            "stage boundaries must be ordered gate < df < passthrough"
+        );
+        assert!(
+            d.snr_passthrough_db < 30.0,
+            "upstream's 30 is rarely reached on real captures; speech would keep \
+             being half-processed"
         );
     }
 

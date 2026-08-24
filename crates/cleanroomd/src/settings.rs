@@ -217,10 +217,15 @@ fn coerce(value: &str, existing: &toml::Value) -> toml::Value {
             .parse::<i64>()
             .map(toml::Value::Integer)
             .unwrap_or_else(|_| toml::Value::String(v.to_string())),
+        // Non-finite floats are refused by falling through to the string path: "nan"
+        // parses as a float, round-trips through TOML, silently defeats every `!=`
+        // change-check downstream (NaN != NaN), and renders as "NaN%" in the GUI.
         toml::Value::Float(_) => v
             .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
             .map(toml::Value::Float)
-            .unwrap_or_else(|_| toml::Value::String(v.to_string())),
+            .unwrap_or_else(|| toml::Value::String(v.to_string())),
         _ => toml::Value::String(v.to_string()),
     }
 }
@@ -470,6 +475,47 @@ mod tests {
             assert!(
                 keys(&base).unwrap().iter().any(|(k, _)| k == key),
                 "{key} is missing from `cleanroom-ctl keys`"
+            );
+        }
+    }
+
+    /// Same contract as the matte knobs: plain-float config fields must be reachable
+    /// through the generic settings walk with zero per-key code. Guards the SNR
+    /// threshold knobs added for the mic-pumping fix.
+    #[test]
+    fn the_snr_threshold_knobs_round_trip() {
+        let base = Config::default();
+        for (key, value, read) in [
+            ("audio.denoise.snr_gate_db", "-12.5", {
+                (|c: &Config| c.audio.denoise.snr_gate_db) as fn(&Config) -> f32
+            }),
+            ("audio.denoise.snr_passthrough_db", "25", |c: &Config| {
+                c.audio.denoise.snr_passthrough_db
+            }),
+            ("audio.denoise.snr_df_db", "17.5", |c: &Config| {
+                c.audio.denoise.snr_df_db
+            }),
+        ] {
+            let c = set(&base, key, value).unwrap_or_else(|e| panic!("set {key}: {e}"));
+            assert_eq!(read(&c).to_string(), value, "{key} did not take");
+            assert_eq!(get(&c, key).unwrap(), value, "{key} did not read back");
+            assert!(
+                keys(&base).unwrap().iter().any(|(k, _)| k == key),
+                "{key} is missing from `cleanroom-ctl keys`"
+            );
+        }
+    }
+
+    /// "nan" parses as a float and TOML round-trips it, but NaN defeats every `!=`
+    /// change-check downstream (hop_processor would re-apply forever) and renders as
+    /// "NaN%" on the GUI slider — so `coerce` refuses non-finite floats at the door.
+    #[test]
+    fn non_finite_floats_are_rejected() {
+        let base = Config::default();
+        for v in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            assert!(
+                set(&base, "audio.denoise.snr_passthrough_db", v).is_err(),
+                "{v} must be rejected, not stored"
             );
         }
     }

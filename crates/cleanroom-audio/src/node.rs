@@ -536,8 +536,10 @@ impl VirtualMic {
                         tracing::info!(
                             listeners,
                             capturing = want,
-                            "microphone {} because nothing is listening",
-                            if want { "resumed" } else { "released" }
+                            // Not one message with a fixed reason: this used to log
+                            // "resumed because nothing is listening".
+                            "microphone {}",
+                            if want { "resumed" } else { "released (idle)" }
                         );
                     }
                     Err(e) => {

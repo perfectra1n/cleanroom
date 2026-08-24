@@ -79,6 +79,9 @@ struct Snapshot {
     mirror: bool,
     denoise: bool,
     attenuation: f32,
+    /// 0..1 position of the "Voice hold" slider, derived from the passthrough
+    /// threshold — see `voice_hold_position`.
+    voice_hold: f32,
     desaturate: f32,
     dim: f32,
     tighten: f32,
@@ -320,77 +323,69 @@ async fn poll(p: CleanroomProxy<'static>, with_devices: bool) -> Option<Snapshot
             "remove" => 3,
             _ => 1,
         },
-        blur: p
-            .get("video.blur_strength")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.6),
+        blur: get_f32(&p, "video.blur_strength", 0.6).await?,
         mirror: p.get("video.mirror").await.ok()? == "true",
         denoise: p.get("audio.denoise.enabled").await.ok()? == "true",
-        attenuation: p
-            .get("audio.denoise.attenuation_db")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(40.0),
-        desaturate: p
-            .get("video.background_desaturate")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.0),
-        dim: p
-            .get("video.background_dim")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.0),
+        attenuation: get_f32(&p, "audio.denoise.attenuation_db", 40.0).await?,
+        voice_hold: voice_hold_position(
+            get_f32(&p, "audio.denoise.snr_passthrough_db", 20.0).await?,
+        ),
+        desaturate: get_f32(&p, "video.background_desaturate", 0.0).await?,
+        dim: get_f32(&p, "video.background_dim", 0.0).await?,
         // `(unset)` is the honest answer for an optional that is deriving its value per
         // mode, and it must read as 0 on the slider rather than as a parse failure.
-        tighten: p
-            .get("video.matte_tighten")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.0),
-        feather: p
-            .get("video.matte_feather")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.0),
-        fade_rise: p
-            .get("video.matte_fade_rise")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.55),
-        fade_fall: p
-            .get("video.matte_fade_fall")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.22),
-        motion_release: p
-            .get("video.matte_motion_release")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(0.25),
+        tighten: get_f32(&p, "video.matte_tighten", 0.0).await?,
+        feather: get_f32(&p, "video.matte_feather", 0.0).await?,
+        fade_rise: get_f32(&p, "video.matte_fade_rise", 0.55).await?,
+        fade_fall: get_f32(&p, "video.matte_fade_fall", 0.22).await?,
+        motion_release: get_f32(&p, "video.matte_motion_release", 0.25).await?,
         guided_filter: p.get("video.guided_filter").await.ok()? == "true",
-        guided_radius: p
-            .get("video.guided_radius")
-            .await
-            .ok()?
-            .parse()
-            .unwrap_or(3.0),
+        guided_radius: get_f32(&p, "video.guided_radius", 3.0).await?,
         matting_backend: match p.get("video.matting_backend").await.ok()?.as_str() {
             "gpu" => 1,
             "cpu" => 2,
             _ => 0,
         },
     })
+}
+
+/// Fetch one float setting. The split matters: a transport failure returns `None` and
+/// aborts the whole poll (the daemon is gone, a partial snapshot would zero half the
+/// sliders), while a value that merely fails to parse falls back per key.
+async fn get_f32(p: &CleanroomProxy<'static>, key: &str, fallback: f32) -> Option<f32> {
+    // Non-finite is treated like a parse failure: "nan" parses, but it would poison
+    // every downstream comparison and render as "NaN%" on a slider readout.
+    Some(
+        p.get(key)
+            .await
+            .ok()?
+            .parse()
+            .ok()
+            .filter(|v: &f32| v.is_finite())
+            .unwrap_or(fallback),
+    )
+}
+
+/// Map the "Voice hold" slider position (0..1) onto the three SNR thresholds.
+///
+/// t = 0 is upstream's aggressive (-10, 30, 20); t = 1 a gentle (-17.5, 15, 12.5) whose
+/// gate sits below the -15 estimator floor (permanently off). The calibrated defaults
+/// (-15, 20, 15) lie on this line at t = 2/3, so a fresh config shows 67%. No rounding:
+/// f32 Display prints the shortest round-tripping form, so the position derived back
+/// from the written passthrough value matches the released one to within ulps.
+fn voice_hold_thresholds(t: f32) -> (f32, f32, f32) {
+    let t = t.clamp(0.0, 1.0);
+    (-10.0 - 7.5 * t, 30.0 - 15.0 * t, 20.0 - 7.5 * t)
+}
+
+/// Recover the slider position from `snr_passthrough_db` alone.
+///
+/// The slider writes all three keys together, and passthrough is monotonic along the
+/// interpolation line; someone hand-setting the keys inconsistently gets a position
+/// reflecting passthrough only, which is the accepted trade for keeping the config
+/// fields the single source of truth.
+fn voice_hold_position(passthrough_db: f32) -> f32 {
+    ((30.0 - passthrough_db) / 15.0).clamp(0.0, 1.0)
 }
 
 async fn apply(req: &SetRequest) -> Result<()> {
@@ -645,6 +640,7 @@ fn apply_snapshot(ui: &AppWindow, s: Snapshot) {
     ui.set_mirror(s.mirror);
     ui.set_denoise(s.denoise);
     ui.set_attenuation(s.attenuation);
+    ui.set_voice_hold(s.voice_hold);
     ui.set_desaturate(s.desaturate);
     ui.set_dim(s.dim);
     ui.set_tighten(s.tighten);
@@ -780,6 +776,14 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
         });
     }
 
+    wire_setting_sliders(ui, tx);
+}
+
+/// The flat "control → settings key" bindings: every slider, switch and picker whose
+/// whole job is to send one `SetRequest` (or, for Voice hold, three). Split from
+/// `wire_controls` so the deep portal/autostart closures and this repetitive block do
+/// not share one function's complexity budget.
+fn wire_setting_sliders(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     let send = move |key: &'static str, value: String| {
         let _ = tx.send(SetRequest { key, value });
     };
@@ -794,6 +798,18 @@ fn wire_controls(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     ui.on_set_denoise(move |b| s("audio.denoise.enabled", b.to_string()));
     let s = send.clone();
     ui.on_set_attenuation(move |v| s("audio.denoise.attenuation_db", format!("{}", v.round())));
+    let s = send.clone();
+    ui.on_set_voice_hold(move |v| {
+        let (gate, passthrough, df) = voice_hold_thresholds(v);
+        // The three sets are independent D-Bus calls, so a daemon exit mid-sequence
+        // can persist a partial triple. Passthrough goes first because the slider
+        // position is derived from it alone: a tear then *shows* as a moved slider,
+        // and the next release rewrites all three — instead of hiding behind the old
+        // position with the gate already changed.
+        s("audio.denoise.snr_passthrough_db", format!("{passthrough}"));
+        s("audio.denoise.snr_gate_db", format!("{gate}"));
+        s("audio.denoise.snr_df_db", format!("{df}"));
+    });
 
     let s = send.clone();
     ui.on_set_desaturate(move |v| s("video.background_desaturate", format!("{v}")));
@@ -1003,6 +1019,80 @@ mod tests {
         assert_eq!(
             holder_banner_text(1, &[]),
             "1 app is using the virtual camera"
+        );
+    }
+
+    /// The slider endpoints are contracts: 0% must be exactly upstream's thresholds and
+    /// 100% exactly the gentle set whose gate sits below the −15 estimator floor.
+    #[test]
+    fn voice_hold_endpoints_map_to_the_anchor_threshold_sets() {
+        assert_eq!(voice_hold_thresholds(0.0), (-10.0, 30.0, 20.0));
+        assert_eq!(voice_hold_thresholds(1.0), (-17.5, 15.0, 12.5));
+        let (gate, _, _) = voice_hold_thresholds(1.0);
+        assert!(gate <= -15.0, "the gentle end must keep the gate off");
+    }
+
+    /// A fresh config (passthrough 20) must show as 67%, and the calibrated defaults
+    /// must lie on the interpolation line at t = 2/3 (within the whole-percent snap).
+    #[test]
+    fn voice_hold_default_position_is_67_percent_on_the_calibrated_line() {
+        let t = voice_hold_position(20.0);
+        assert_eq!((t * 100.0).round(), 67.0);
+        let (gate, passthrough, df) = voice_hold_thresholds(2.0 / 3.0);
+        assert!((gate - -15.0).abs() < 0.1, "gate {gate}");
+        assert!(
+            (passthrough - 20.0).abs() < 0.1,
+            "passthrough {passthrough}"
+        );
+        assert!((df - 15.0).abs() < 0.1, "df {df}");
+    }
+
+    /// Dragging must not snap back: the thresholds written for a released position must
+    /// derive back to that exact position on the next poll.
+    #[test]
+    fn voice_hold_round_trips_through_the_written_thresholds() {
+        for pct in [0, 1, 33, 50, 67, 99, 100] {
+            let t = pct as f32 / 100.0;
+            let (_, passthrough, _) = voice_hold_thresholds(t);
+            let back = voice_hold_position(passthrough);
+            assert_eq!(
+                (back * 100.0).round() as i32,
+                pct,
+                "position {pct}% did not round-trip (passthrough {passthrough})"
+            );
+        }
+    }
+
+    #[test]
+    fn voice_hold_inputs_outside_the_slider_range_are_clamped() {
+        assert_eq!(voice_hold_thresholds(-0.5), voice_hold_thresholds(0.0));
+        assert_eq!(voice_hold_thresholds(1.5), voice_hold_thresholds(1.0));
+        assert_eq!(voice_hold_position(35.0), 0.0, "above 30 dB clamps to 0%");
+        assert_eq!(voice_hold_position(0.0), 1.0, "below 15 dB clamps to 100%");
+    }
+
+    /// The interpolation anchors here are literals with no compile-time tie to the
+    /// authoritative defaults in cleanroom-core. This pins them together: recalibrate
+    /// `DenoiseConfig::default()` off the current line and this fails, instead of the
+    /// slider silently rewriting every release from the stale line.
+    #[test]
+    fn voice_hold_line_passes_through_the_config_defaults() {
+        let d = cleanroom_core::config::DenoiseConfig::default();
+        let (gate, passthrough, df) =
+            voice_hold_thresholds(voice_hold_position(d.snr_passthrough_db));
+        assert!(
+            (gate - d.snr_gate_db).abs() < 0.01,
+            "gate {gate} vs {}",
+            d.snr_gate_db
+        );
+        assert!(
+            (passthrough - d.snr_passthrough_db).abs() < 0.01,
+            "passthrough {passthrough}"
+        );
+        assert!(
+            (df - d.snr_df_db).abs() < 0.01,
+            "df {df} vs {}",
+            d.snr_df_db
         );
     }
 }

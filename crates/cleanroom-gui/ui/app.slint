@@ -97,6 +97,9 @@ export component AppWindow inherits Window {
     in-out property <bool> mirror: false;
     in-out property <bool> denoise: true;
     in-out property <float> attenuation: 40;
+    // 0..1; how strongly the suppressor holds onto the voice. Maps to the three
+    // audio.denoise.snr_* settings together — see voice_hold_thresholds in main.rs.
+    in-out property <float> voice-hold: 0.67;
 
     // --- background fine tuning ---
     in-out property <float> desaturate: 0;
@@ -129,6 +132,7 @@ export component AppWindow inherits Window {
     callback set-mirror(bool);
     callback set-denoise(bool);
     callback set-attenuation(float);
+    callback set-voice-hold(float);
     callback set-desaturate(float);
     callback set-dim(float);
     callback set-tighten(float);
@@ -554,6 +558,30 @@ export component AppWindow inherits Window {
                         width: 44px;
                         vertical-alignment: center;
                     }
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Text { text: "Voice hold"; width: 70px; vertical-alignment: center; }
+                    Slider {
+                        minimum: 0; maximum: 1;
+                        value <=> root.voice-hold;
+                        enabled: root.denoise;
+                        released(v) => { root.set-voice-hold(v); }
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: Math.round(root.voice-hold * 100) + "%";
+                        width: 44px;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: "Higher holds onto your voice (fewer volume dips mid-speech); lower "
+                        + "suppresses more aggressively. Adjusts the three audio.denoise.snr_* "
+                        + "settings together.";
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    opacity: 0.7;
                 }
                 // The gap between the two is the suppression actually being applied,
                 // which is more informative than either number alone.

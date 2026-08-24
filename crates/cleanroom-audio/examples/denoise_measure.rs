@@ -6,7 +6,7 @@
 //!
 //!     nix develop -c cargo run --release -p cleanroom-audio --example denoise_measure
 
-use cleanroom_audio::{Denoiser, HOP, find_model};
+use cleanroom_audio::{Denoiser, HOP, SnrThresholds, find_model};
 
 const SR: f32 = 48_000.0;
 
@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = find_model()?;
     println!("model: {}\n", model.display());
 
-    let mut d = Denoiser::new(&model, 40.0, 0.02)?;
+    let mut d = Denoiser::new(&model, 40.0, 0.02, SnrThresholds::default())?;
 
     // Two seconds of signal. The first half is noise only, so we can measure the floor
     // the denoiser leaves behind; the second half adds a voice-band tone complex.
