@@ -474,6 +474,33 @@ mod tests {
         }
     }
 
+    /// Same contract as the matte knobs: plain-float config fields must be reachable
+    /// through the generic settings walk with zero per-key code. Guards the SNR
+    /// threshold knobs added for the mic-pumping fix.
+    #[test]
+    fn the_snr_threshold_knobs_round_trip() {
+        let base = Config::default();
+        for (key, value, read) in [
+            ("audio.denoise.snr_gate_db", "-12.5", {
+                (|c: &Config| c.audio.denoise.snr_gate_db) as fn(&Config) -> f32
+            }),
+            ("audio.denoise.snr_passthrough_db", "25", |c: &Config| {
+                c.audio.denoise.snr_passthrough_db
+            }),
+            ("audio.denoise.snr_df_db", "17.5", |c: &Config| {
+                c.audio.denoise.snr_df_db
+            }),
+        ] {
+            let c = set(&base, key, value).unwrap_or_else(|e| panic!("set {key}: {e}"));
+            assert_eq!(read(&c).to_string(), value, "{key} did not take");
+            assert_eq!(get(&c, key).unwrap(), value, "{key} did not read back");
+            assert!(
+                keys(&base).unwrap().iter().any(|(k, _)| k == key),
+                "{key} is missing from `cleanroom-ctl keys`"
+            );
+        }
+    }
+
     /// A config written before these fields existed must still load.
     ///
     /// Every one of them carries a serde default for exactly this reason: the alternative

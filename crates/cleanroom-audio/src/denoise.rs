@@ -102,6 +102,50 @@ pub fn find_model() -> Result<PathBuf, DenoiseError> {
     })
 }
 
+/// The local-SNR boundaries that decide which of DeepFilterNet's stages run.
+///
+/// `apply_stages` classifies every hop by the model's local-SNR estimate: below
+/// `gate_db` the frame is zero-masked (treated as pure noise), above `passthrough_db`
+/// it is passed through untouched, above `df_db` only the ERB gains run. The estimate
+/// itself never goes below −15 dB, so `gate_db <= -15.0` switches the zero-mask stage
+/// off entirely.
+///
+/// The defaults are **not** upstream's CLI values (−10/30/20). Those flap mid-speech
+/// on real captures — the estimate crosses −10 between syllables, the gate slams the
+/// attenuation limit on and off, and the voice audibly pumps. Calibrated on a real
+/// 30 s capture (2026-08-24): upstream's thresholds attenuated speech −5.4 dB mean
+/// (sd 5.1) vs −1.9 dB with these, with noise suppression essentially unchanged
+/// (−7.9 → −7.4 dB). `examples/envelope_probe.rs` reproduces the measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SnrThresholds {
+    /// Below this local SNR (dB): zero-mask the frame.
+    pub gate_db: f32,
+    /// Above this local SNR (dB): pass audio through untouched.
+    pub passthrough_db: f32,
+    /// Above this local SNR (dB): skip the deep-filter stage, ERB gains only.
+    pub df_db: f32,
+}
+
+impl Default for SnrThresholds {
+    fn default() -> Self {
+        Self {
+            gate_db: -15.0,
+            passthrough_db: 20.0,
+            df_db: 15.0,
+        }
+    }
+}
+
+impl From<&cleanroom_core::config::DenoiseConfig> for SnrThresholds {
+    fn from(c: &cleanroom_core::config::DenoiseConfig) -> Self {
+        Self {
+            gate_db: c.snr_gate_db,
+            passthrough_db: c.snr_passthrough_db,
+            df_db: c.snr_df_db,
+        }
+    }
+}
+
 /// A DeepFilterNet instance processing one hop at a time.
 pub struct Denoiser {
     df: DfTract,
@@ -122,6 +166,7 @@ impl Denoiser {
         model: &Path,
         attenuation_db: f32,
         post_filter_beta: f32,
+        thresholds: SnrThresholds,
     ) -> Result<Self, DenoiseError> {
         let params = DfParams::new(model.to_path_buf()).map_err(|source| DenoiseError::Load {
             path: model.to_path_buf(),
@@ -131,9 +176,12 @@ impl Denoiser {
         let rp = RuntimeParams::default_with_ch(1)
             .with_atten_lim(clamp_attenuation(attenuation_db))
             .with_post_filter(post_filter_beta)
-            // Defaults from upstream's own CLI: below -10 dB SNR treat as noise, above
-            // 30 dB as clean speech, and gate anything under 20 dB of local SNR.
-            .with_thresholds(-10.0, 30.0, 20.0)
+            // NOT upstream's CLI defaults — see [`SnrThresholds`] for why.
+            .with_thresholds(
+                thresholds.gate_db,
+                thresholds.passthrough_db,
+                thresholds.df_db,
+            )
             .with_mask_reduce(ReduceMask::MEAN);
 
         let df = DfTract::new(params, &rp).map_err(|source| DenoiseError::Load {
@@ -201,6 +249,18 @@ impl Denoiser {
     pub fn set_post_filter(&mut self, beta: f32) {
         self.df.set_pf_beta(beta);
     }
+
+    /// Change the stage thresholds without reloading the model.
+    ///
+    /// Assigning the fields directly is the whole job: upstream exposes them as `pub`
+    /// with no setter, `apply_stages` reads them fresh on every hop, and there is no
+    /// derived state to maintain — unlike `set_atten_lim`, which converts dB to a
+    /// linear gain, or `set_pf_beta`, which also flips the post-filter flag.
+    pub fn set_thresholds(&mut self, t: SnrThresholds) {
+        self.df.min_db_thresh = t.gate_db;
+        self.df.max_db_erb_thresh = t.passthrough_db;
+        self.df.max_db_df_thresh = t.df_db;
+    }
 }
 
 /// Keep the attenuation limit inside the range where it means what it says.
@@ -215,6 +275,32 @@ fn clamp_attenuation(db: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the calibrated defaults: the estimator's floor is −15, so a
+    /// gate at or below it can never fire, and the passthrough line must be reachable
+    /// by real speech (upstream's 30 was not).
+    #[test]
+    fn default_thresholds_keep_the_gate_off_and_passthrough_reachable() {
+        let t = SnrThresholds::default();
+        assert!(
+            t.gate_db <= -15.0,
+            "gate must sit at or below the lsnr floor"
+        );
+        assert!(t.passthrough_db < 30.0);
+        assert!(
+            t.gate_db < t.df_db && t.df_db < t.passthrough_db,
+            "stage order"
+        );
+    }
+
+    /// The config layer and this crate each state the defaults; they must agree, or a
+    /// daemon built from config defaults behaves differently from the examples and
+    /// tests built from `SnrThresholds::default()`.
+    #[test]
+    fn config_defaults_match_the_denoiser_defaults() {
+        let from_config = SnrThresholds::from(&cleanroom_core::config::DenoiseConfig::default());
+        assert_eq!(from_config, SnrThresholds::default());
+    }
 
     #[test]
     fn attenuation_is_clamped_below_the_no_limit_sentinel() {
@@ -259,6 +345,35 @@ mod tests {
     }
 
     #[test]
+    fn set_thresholds_lands_in_the_model_fields() {
+        // Only runs where the weights are present; skips cleanly otherwise so CI and a
+        // fresh clone both stay green.
+        let Ok(model) = find_model() else {
+            eprintln!("DeepFilterNet weights not installed; skipping");
+            return;
+        };
+        let mut d = match Denoiser::new(&model, 40.0, 0.02, SnrThresholds::default()) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("could not load model ({e}); skipping");
+                return;
+            }
+        };
+
+        // `set_thresholds` assigns pub fields with no setter upstream; verify the
+        // assignment actually lands where `apply_stages` reads.
+        let t = SnrThresholds {
+            gate_db: -12.0,
+            passthrough_db: 25.0,
+            df_db: 18.0,
+        };
+        d.set_thresholds(t);
+        assert_eq!(d.df.min_db_thresh, -12.0);
+        assert_eq!(d.df.max_db_erb_thresh, 25.0);
+        assert_eq!(d.df.max_db_df_thresh, 18.0);
+    }
+
+    #[test]
     fn denoising_real_audio_preserves_length_and_changes_the_signal() {
         // Only runs where the weights are present; skips cleanly otherwise so CI and a
         // fresh clone both stay green.
@@ -266,7 +381,7 @@ mod tests {
             eprintln!("DeepFilterNet weights not installed; skipping");
             return;
         };
-        let mut d = match Denoiser::new(&model, 40.0, 0.02) {
+        let mut d = match Denoiser::new(&model, 40.0, 0.02, SnrThresholds::default()) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("could not load model ({e}); skipping");

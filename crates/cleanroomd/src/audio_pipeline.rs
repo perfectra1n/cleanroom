@@ -9,7 +9,7 @@
 //! without contending for anything.
 
 use crate::state::{HealthState, Shared};
-use cleanroom_audio::{Denoiser, SharedAudio, VirtualMic, to_dbfs};
+use cleanroom_audio::{Denoiser, SharedAudio, SnrThresholds, VirtualMic, to_dbfs};
 use cleanroom_core::{Config, VIRTUAL_MIC_NODE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,6 +171,7 @@ fn hop_processor(
 ) -> impl FnMut(&[f32; cleanroom_audio::HOP], &mut [f32; cleanroom_audio::HOP]) {
     let mut applied_atten = cfg.audio.denoise.attenuation_db;
     let mut applied_pf = cfg.audio.denoise.post_filter_beta;
+    let mut applied_thresholds = SnrThresholds::from(&cfg.audio.denoise);
     move |inp, outp| match denoiser.as_mut() {
         Some(d) => {
             let c = live.config();
@@ -181,6 +182,11 @@ fn hop_processor(
             if c.audio.denoise.post_filter_beta != applied_pf {
                 applied_pf = c.audio.denoise.post_filter_beta;
                 d.set_post_filter(applied_pf);
+            }
+            let t = SnrThresholds::from(&c.audio.denoise);
+            if t != applied_thresholds {
+                applied_thresholds = t;
+                d.set_thresholds(t);
             }
             d.process(inp, outp)
         }
@@ -205,6 +211,7 @@ fn load_denoiser(shared: &Arc<Shared>, cfg: &Config) -> Option<Denoiser> {
             &m,
             cfg.audio.denoise.attenuation_db,
             cfg.audio.denoise.post_filter_beta,
+            SnrThresholds::from(&cfg.audio.denoise),
         )
     }) {
         Ok(d) => Some(d),
