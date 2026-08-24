@@ -38,21 +38,38 @@ struct Args {
     render_to: Option<String>,
 }
 
+const USAGE: &str =
+    "usage: envelope_probe <capture.raw> [atten] [pf] [gate] [passthrough] [df] [out.raw]";
+
 fn parse_args() -> Args {
     let mut a = std::env::args().skip(1);
-    let path = a.next().expect(
-        "usage: envelope_probe <capture.raw> [atten] [pf] [gate] [passthrough] [df] [out.raw]",
-    );
+    let path = a.next().expect(USAGE);
     let d = SnrThresholds::default();
-    let mut f = |fallback: f32| a.next().and_then(|s| s.parse().ok()).unwrap_or(fallback);
+    // A numeric slot that fails to parse is an error, never a silent fallback: this
+    // tool's numbers set production defaults, and its worst failure mode is measuring
+    // a config the user did not ask for. (An output path given before all five numbers
+    // would otherwise be eaten as a threshold and the render silently skipped.)
+    let mut f = |name: &str, fallback: f32| -> f32 {
+        let Some(s) = a.next() else { return fallback };
+        s.parse().unwrap_or_else(|_| {
+            eprintln!("argument '{name}': expected a number, got {s:?}\n{USAGE}");
+            std::process::exit(2);
+        })
+    };
     Args {
         path,
-        atten_db: f(cleanroom_core::config::DenoiseConfig::default().attenuation_db),
-        pf_beta: f(cleanroom_core::config::DenoiseConfig::default().post_filter_beta),
+        atten_db: f(
+            "atten",
+            cleanroom_core::config::DenoiseConfig::default().attenuation_db,
+        ),
+        pf_beta: f(
+            "pf",
+            cleanroom_core::config::DenoiseConfig::default().post_filter_beta,
+        ),
         thresholds: SnrThresholds {
-            gate_db: f(d.gate_db),
-            passthrough_db: f(d.passthrough_db),
-            df_db: f(d.df_db),
+            gate_db: f("gate", d.gate_db),
+            passthrough_db: f("passthrough", d.passthrough_db),
+            df_db: f("df", d.df_db),
         },
         render_to: a.next(),
     }

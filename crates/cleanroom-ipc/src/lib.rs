@@ -32,7 +32,11 @@ pub const INTERFACE: &str = "io.github.perfectra1n.Cleanroom1";
 /// 4: `Status` gained `vcam_holders`, inserted after `vcam_path`, which changes the
 ///    D-Bus signature — struct fields are positional, so an older GUI cannot decode a
 ///    newer `Status` at all and needs to be told to update rather than left guessing.
-pub const INTERFACE_VERSION: u32 = 4;
+/// 5: the GUI polls `audio.denoise.snr_passthrough_db`, a settings key an older daemon
+///    does not have. No signature changed, but the failure mode is the same one this
+///    constant exists to prevent: the missing key aborts the poll and the GUI would
+///    report a healthy daemon as not running.
+pub const INTERFACE_VERSION: u32 = 5;
 
 /// The "update me" message the version property exists to enable.
 ///

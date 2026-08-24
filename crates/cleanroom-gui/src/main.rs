@@ -353,18 +353,28 @@ async fn poll(p: CleanroomProxy<'static>, with_devices: bool) -> Option<Snapshot
 /// aborts the whole poll (the daemon is gone, a partial snapshot would zero half the
 /// sliders), while a value that merely fails to parse falls back per key.
 async fn get_f32(p: &CleanroomProxy<'static>, key: &str, fallback: f32) -> Option<f32> {
-    Some(p.get(key).await.ok()?.parse().unwrap_or(fallback))
+    // Non-finite is treated like a parse failure: "nan" parses, but it would poison
+    // every downstream comparison and render as "NaN%" on a slider readout.
+    Some(
+        p.get(key)
+            .await
+            .ok()?
+            .parse()
+            .ok()
+            .filter(|v: &f32| v.is_finite())
+            .unwrap_or(fallback),
+    )
 }
 
 /// Map the "Voice hold" slider position (0..1) onto the three SNR thresholds.
 ///
 /// t = 0 is upstream's aggressive (-10, 30, 20); t = 1 a gentle (-17.5, 15, 12.5) whose
 /// gate sits below the -15 estimator floor (permanently off). The calibrated defaults
-/// (-15, 20, 15) lie on this line at t = 2/3, so a fresh config shows 67%. The position
-/// is snapped to whole percent first, so the value derived back from the config on the
-/// next poll reproduces the position the readout displayed (no post-release snap-back).
+/// (-15, 20, 15) lie on this line at t = 2/3, so a fresh config shows 67%. No rounding:
+/// f32 Display prints the shortest round-tripping form, so the position derived back
+/// from the written passthrough value matches the released one to within ulps.
 fn voice_hold_thresholds(t: f32) -> (f32, f32, f32) {
-    let t = (t.clamp(0.0, 1.0) * 100.0).round() / 100.0;
+    let t = t.clamp(0.0, 1.0);
     (-10.0 - 7.5 * t, 30.0 - 15.0 * t, 20.0 - 7.5 * t)
 }
 
@@ -791,8 +801,13 @@ fn wire_setting_sliders(ui: &AppWindow, tx: mpsc::UnboundedSender<SetRequest>) {
     let s = send.clone();
     ui.on_set_voice_hold(move |v| {
         let (gate, passthrough, df) = voice_hold_thresholds(v);
-        s("audio.denoise.snr_gate_db", format!("{gate}"));
+        // The three sets are independent D-Bus calls, so a daemon exit mid-sequence
+        // can persist a partial triple. Passthrough goes first because the slider
+        // position is derived from it alone: a tear then *shows* as a moved slider,
+        // and the next release rewrites all three — instead of hiding behind the old
+        // position with the gate already changed.
         s("audio.denoise.snr_passthrough_db", format!("{passthrough}"));
+        s("audio.denoise.snr_gate_db", format!("{gate}"));
         s("audio.denoise.snr_df_db", format!("{df}"));
     });
 
@@ -1054,5 +1069,30 @@ mod tests {
         assert_eq!(voice_hold_thresholds(1.5), voice_hold_thresholds(1.0));
         assert_eq!(voice_hold_position(35.0), 0.0, "above 30 dB clamps to 0%");
         assert_eq!(voice_hold_position(0.0), 1.0, "below 15 dB clamps to 100%");
+    }
+
+    /// The interpolation anchors here are literals with no compile-time tie to the
+    /// authoritative defaults in cleanroom-core. This pins them together: recalibrate
+    /// `DenoiseConfig::default()` off the current line and this fails, instead of the
+    /// slider silently rewriting every release from the stale line.
+    #[test]
+    fn voice_hold_line_passes_through_the_config_defaults() {
+        let d = cleanroom_core::config::DenoiseConfig::default();
+        let (gate, passthrough, df) =
+            voice_hold_thresholds(voice_hold_position(d.snr_passthrough_db));
+        assert!(
+            (gate - d.snr_gate_db).abs() < 0.01,
+            "gate {gate} vs {}",
+            d.snr_gate_db
+        );
+        assert!(
+            (passthrough - d.snr_passthrough_db).abs() < 0.01,
+            "passthrough {passthrough}"
+        );
+        assert!(
+            (df - d.snr_df_db).abs() < 0.01,
+            "df {df} vs {}",
+            d.snr_df_db
+        );
     }
 }

@@ -173,6 +173,7 @@ impl Denoiser {
             source,
         })?;
 
+        let thresholds = clamp_thresholds(thresholds);
         let rp = RuntimeParams::default_with_ch(1)
             .with_atten_lim(clamp_attenuation(attenuation_db))
             .with_post_filter(post_filter_beta)
@@ -257,9 +258,35 @@ impl Denoiser {
     /// derived state to maintain — unlike `set_atten_lim`, which converts dB to a
     /// linear gain, or `set_pf_beta`, which also flips the post-filter flag.
     pub fn set_thresholds(&mut self, t: SnrThresholds) {
+        let t = clamp_thresholds(t);
         self.df.min_db_thresh = t.gate_db;
         self.df.max_db_erb_thresh = t.passthrough_db;
         self.df.max_db_df_thresh = t.df_db;
+    }
+}
+
+/// Keep the stage thresholds inside the range where they mean what they say — the same
+/// contract as [`clamp_attenuation`], for values arriving from a hand-edited config.
+///
+/// The lsnr estimate lives in roughly −15..=35, so boundaries are clamped into that
+/// band (−15 is the estimate's floor, where the gate is simply off). The gate is
+/// further capped at 10 dB: above that it zero-masks ordinary speech, so a dropped
+/// minus sign would near-silence the microphone while health still reads nominal.
+/// A non-finite value falls back to that field's default — NaN compares false against
+/// everything, which would silently pin `apply_stages` to one branch.
+fn clamp_thresholds(t: SnrThresholds) -> SnrThresholds {
+    let d = SnrThresholds::default();
+    let f = |v: f32, fallback: f32, max: f32| {
+        if v.is_finite() {
+            v.clamp(-15.0, max)
+        } else {
+            fallback
+        }
+    };
+    SnrThresholds {
+        gate_db: f(t.gate_db, d.gate_db, 10.0),
+        passthrough_db: f(t.passthrough_db, d.passthrough_db, 35.0),
+        df_db: f(t.df_db, d.df_db, 35.0),
     }
 }
 
@@ -344,33 +371,30 @@ mod tests {
         unsafe { std::env::remove_var("CLEANROOM_DFN_MODEL") };
     }
 
+    /// A dropped minus sign in a hand-edited config must not near-silence the mic:
+    /// a gate above ordinary speech's lsnr zero-masks every frame while health still
+    /// reads nominal. NaN is worse — it compares false against everything, pinning
+    /// `apply_stages` to one branch — so non-finite falls back to the defaults.
     #[test]
-    fn set_thresholds_lands_in_the_model_fields() {
-        // Only runs where the weights are present; skips cleanly otherwise so CI and a
-        // fresh clone both stay green.
-        let Ok(model) = find_model() else {
-            eprintln!("DeepFilterNet weights not installed; skipping");
-            return;
-        };
-        let mut d = match Denoiser::new(&model, 40.0, 0.02, SnrThresholds::default()) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("could not load model ({e}); skipping");
-                return;
-            }
-        };
+    fn thresholds_are_clamped_into_the_meaningful_band() {
+        let c = clamp_thresholds(SnrThresholds {
+            gate_db: 15.0, // "-15" minus the minus sign
+            passthrough_db: 90.0,
+            df_db: -40.0,
+        });
+        assert_eq!(c.gate_db, 10.0, "gate capped below speech levels");
+        assert_eq!(c.passthrough_db, 35.0, "clamped to the estimate ceiling");
+        assert_eq!(c.df_db, -15.0, "clamped to the estimate floor");
 
-        // `set_thresholds` assigns pub fields with no setter upstream; verify the
-        // assignment actually lands where `apply_stages` reads.
-        let t = SnrThresholds {
-            gate_db: -12.0,
-            passthrough_db: 25.0,
-            df_db: 18.0,
-        };
-        d.set_thresholds(t);
-        assert_eq!(d.df.min_db_thresh, -12.0);
-        assert_eq!(d.df.max_db_erb_thresh, 25.0);
-        assert_eq!(d.df.max_db_df_thresh, 18.0);
+        let n = clamp_thresholds(SnrThresholds {
+            gate_db: f32::NAN,
+            passthrough_db: f32::INFINITY,
+            df_db: f32::NEG_INFINITY,
+        });
+        assert_eq!(n, SnrThresholds::default(), "non-finite falls back");
+
+        let d = clamp_thresholds(SnrThresholds::default());
+        assert_eq!(d, SnrThresholds::default(), "defaults pass unchanged");
     }
 
     #[test]
@@ -418,5 +442,18 @@ mod tests {
             "denoised 10 hops, last local SNR estimate {:.1} dB",
             d.last_lsnr
         );
+
+        // Piggybacked on the same model load: `set_thresholds` assigns pub fields with
+        // no setter upstream — verify the (clamped) assignment actually lands where
+        // `apply_stages` reads.
+        let t = SnrThresholds {
+            gate_db: -12.0,
+            passthrough_db: 25.0,
+            df_db: 18.0,
+        };
+        d.set_thresholds(t);
+        assert_eq!(d.df.min_db_thresh, -12.0);
+        assert_eq!(d.df.max_db_erb_thresh, 25.0);
+        assert_eq!(d.df.max_db_df_thresh, 18.0);
     }
 }

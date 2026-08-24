@@ -217,10 +217,15 @@ fn coerce(value: &str, existing: &toml::Value) -> toml::Value {
             .parse::<i64>()
             .map(toml::Value::Integer)
             .unwrap_or_else(|_| toml::Value::String(v.to_string())),
+        // Non-finite floats are refused by falling through to the string path: "nan"
+        // parses as a float, round-trips through TOML, silently defeats every `!=`
+        // change-check downstream (NaN != NaN), and renders as "NaN%" in the GUI.
         toml::Value::Float(_) => v
             .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
             .map(toml::Value::Float)
-            .unwrap_or_else(|_| toml::Value::String(v.to_string())),
+            .unwrap_or_else(|| toml::Value::String(v.to_string())),
         _ => toml::Value::String(v.to_string()),
     }
 }
@@ -497,6 +502,20 @@ mod tests {
             assert!(
                 keys(&base).unwrap().iter().any(|(k, _)| k == key),
                 "{key} is missing from `cleanroom-ctl keys`"
+            );
+        }
+    }
+
+    /// "nan" parses as a float and TOML round-trips it, but NaN defeats every `!=`
+    /// change-check downstream (hop_processor would re-apply forever) and renders as
+    /// "NaN%" on the GUI slider — so `coerce` refuses non-finite floats at the door.
+    #[test]
+    fn non_finite_floats_are_rejected() {
+        let base = Config::default();
+        for v in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            assert!(
+                set(&base, "audio.denoise.snr_passthrough_db", v).is_err(),
+                "{v} must be rejected, not stored"
             );
         }
     }
