@@ -17,10 +17,29 @@
 [tools]
 # Rust comes from the nix flake, not from mise, so there is exactly one toolchain and it
 # matches what CI and the Nix build use. Listed tools are things the flake does not own.
+#
+# The block below exists for the pre-commit hooks (.lefthook.toml, shared config from
+# home-operations/.github). Versions match kopiur's pins.
+lefthook = "2.1.11"
+# `oxfmt` is distributed only via the npm backend, which needs a node/npm to install.
+# Pin node explicitly so the npm backend uses mise's own node+npm and never falls
+# through to a system `npm` on PATH, which silently breaks `mise install`.
+node = "24.19.0"
+oxfmt = "0.63.0"
+actionlint = "1.7.12"
+# The shared hooks run shellcheck on staged *.sh files; pinned so the hook resolves a
+# binary even though the repo has no shell scripts today.
+shellcheck = "0.11.0"
+zizmor = "1.29.0"
 
-[settings]
+[hooks]
+# Anyone who runs `mise install` (required anyway, for the tools above) gets the git
+# hook installed as a side effect — no separate setup step to forget.
+postinstall = "lefthook install"
+
 # Task output stays readable when several run under `check`.
-task_output = "prefix"
+[settings.task]
+output = "prefix"
 
 [env]
 # Belt and braces for anyone invoking a binary directly rather than through a task.

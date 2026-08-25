@@ -1,0 +1,30 @@
+# Pre-commit hooks. The command set is shared and pulled at install time from
+# home-operations/.github (lefthook.common.toml): formatters for Rust/JSON/Markdown/YAML,
+# a mise lockfile refresh, and actionlint + zizmor + shellcheck. `mise install` wires the
+# hook via the postinstall hook in .mise/config.toml.
+#
+# Merge order matters and is easy to get backwards: the REMOTE config overrides this
+# file on any key both define. A local section can therefore only add keys a shared
+# command leaves unset (`exclude`, `skip`) or define whole new commands — editing a
+# shared command's `run` or `glob` here is silently discarded, which looks exactly like
+# it worked. `lefthook dump` prints the truth. This is also why the workflow and the
+# composite action use the .yaml extension: the shared actionlint/zizmor globs match
+# only *.yaml, and a glob miss looks exactly like a pass.
+
+[[remotes]]
+git_url = "https://github.com/home-operations/.github"
+ref = "main"
+configs = ["lefthook.common.toml"]
+
+# The shared command runs bare `cargo fmt --all`, i.e. whatever toolchain is on PATH.
+# Rust in this repo comes from the nix flake and nowhere else (see the header of
+# .mise/config.toml), and CI's rustfmt job checks with the flake's toolchain — a hook
+# formatting with some other rustfmt could stage output that job then rejects. So the
+# shared command is skipped and replaced with the same thing run through the dev shell.
+[pre-commit.commands.format-rust]
+skip = true
+
+[pre-commit.commands.format-rust-flake]
+glob = ["*.rs"]
+run = "nix develop -c cargo fmt --all"
+stage_fixed = true
